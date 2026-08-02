@@ -1,8 +1,9 @@
+import json
 from datetime import datetime
 
 from bson import ObjectId
 
-from app.db.introspect import _example, _type_name, profile_collection
+from app.db.introspect import _example, _type_name, load_existing_summary, profile_collection
 
 
 def test_type_name_for_bson_and_python_types():
@@ -52,3 +53,24 @@ def test_profile_collection_aggregates_types_and_examples():
     assert result["sampled_documents"] == 2
     assert set(result["fields"]["amount"]["types"]) == {"int", "float"}
     assert "shipped" in result["fields"]["status"]["examples"]
+
+
+def test_load_existing_summary_missing_file_returns_empty(tmp_path):
+    assert load_existing_summary(str(tmp_path / "missing.json")) == {}
+
+
+def test_load_existing_summary_keys_by_collection_name(tmp_path):
+    path = tmp_path / "schema_summary.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"collection": "orders", "sampled_documents": 5, "fields": {}},
+                {"collection": "customers", "sampled_documents": 3, "fields": {}},
+            ]
+        )
+    )
+
+    result = load_existing_summary(str(path))
+
+    assert set(result) == {"orders", "customers"}
+    assert result["orders"]["sampled_documents"] == 5

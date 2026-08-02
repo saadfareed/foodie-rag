@@ -2,10 +2,12 @@
 
 Usage:
     python -m app.db.introspect [--sample-size 25] [--out schema_summary.json]
+    python -m app.db.introspect --collections orders,customers
 """
 
 import argparse
 import json
+import os
 from collections import defaultdict
 from datetime import datetime
 from typing import Any
@@ -62,16 +64,38 @@ def profile_collection(db, name: str, sample_size: int) -> dict:
     }
 
 
+def load_existing_summary(path: str) -> dict[str, dict]:
+    """Load a prior schema_summary.json (if any) keyed by collection name, for merging."""
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    return {entry["collection"]: entry for entry in data}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample-size", type=int, default=25)
     parser.add_argument("--out", default="schema_summary.json")
+    parser.add_argument(
+        "--collections",
+        help="comma-separated subset of collections to (re-)profile; "
+        "defaults to all of MONGODB_ALLOWED_COLLECTIONS",
+    )
     args = parser.parse_args()
 
     db = get_db()
-    collections = settings.mongodb_allowed_collections or db.list_collection_names()
+    if args.collections:
+        collections = [c.strip() for c in args.collections.split(",") if c.strip()]
+    else:
+        collections = settings.mongodb_allowed_collections or db.list_collection_names()
 
-    summary = [profile_collection(db, name, args.sample_size) for name in collections]
+    # Merge into any existing summary so profiling a subset doesn't drop other collections.
+    merged = load_existing_summary(args.out)
+    for name in collections:
+        merged[name] = profile_collection(db, name, args.sample_size)
+
+    summary = list(merged.values())
 
     with open(args.out, "w") as f:
         json.dump(summary, f, indent=2, default=str)

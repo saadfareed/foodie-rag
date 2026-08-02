@@ -1,12 +1,21 @@
 """Thin wrapper around Gemini for query generation and answer formatting."""
 
 import json
+import random
 import re
+import time
+from collections.abc import Callable
+from typing import TypeVar
 
 from google import genai
+from google.genai import errors
 
 from app.config import settings
+from app.llm.quota import quota_tracker
 from app.rag.query_spec import QueryError, QuerySpec
+
+T = TypeVar("T")
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 _QUERY_PROMPT = """You translate questions about a MongoDB database into a single structured query.
 
@@ -51,14 +60,36 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
+def _is_retryable(exc: Exception) -> bool:
+    return isinstance(exc, errors.APIError) and exc.code in _RETRYABLE_STATUS_CODES
+
+
 class GeminiClient:
     def __init__(self, model_name: str | None = None) -> None:
         self.client = genai.Client(api_key=settings.gemini_api_key)
         self.model_name = model_name or settings.gemini_model
+        self.max_retries = settings.gemini_max_retries
+        self.retry_base_delay_seconds = settings.gemini_retry_base_delay_seconds
+
+    def _call_with_retry(self, fn: Callable[[], T]) -> T:
+        quota_tracker.record_call()
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except Exception as exc:
+                if attempt >= self.max_retries or not _is_retryable(exc):
+                    raise
+                jitter = random.uniform(0, 0.5)  # nosec B311 - retry backoff jitter, not security-sensitive
+                delay = self.retry_base_delay_seconds * (2**attempt) + jitter
+                time.sleep(delay)
+                attempt += 1
 
     def generate_query_spec(self, question: str, schema_context: str) -> QuerySpec | QueryError:
         prompt = _QUERY_PROMPT.format(schema_context=schema_context, question=question)
-        response = self.client.models.generate_content(model=self.model_name, contents=prompt)
+        response = self._call_with_retry(
+            lambda: self.client.models.generate_content(model=self.model_name, contents=prompt)
+        )
         data = _extract_json(response.text)
         if "error" in data:
             return QueryError(**data)
@@ -66,5 +97,7 @@ class GeminiClient:
 
     def generate_answer(self, question: str, rows: list[dict]) -> str:
         prompt = _ANSWER_PROMPT.format(question=question, rows=json.dumps(rows, default=str))
-        response = self.client.models.generate_content(model=self.model_name, contents=prompt)
+        response = self._call_with_retry(
+            lambda: self.client.models.generate_content(model=self.model_name, contents=prompt)
+        )
         return response.text.strip()

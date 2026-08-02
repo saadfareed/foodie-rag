@@ -1,0 +1,15 @@
+.venv/
+venv/
+.git/
+tests/
+.env
+.env.example
+schema_summary.json
+schema_annotations.json
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.claude/
+docs/
+*.md
