@@ -9,12 +9,16 @@ Ask questions in Slack, get answers computed from your MongoDB data via Google's
    returns a structured query (`{collection, operation, filter/pipeline, ...}`) — not raw code.
 3. The query is validated (allowed collection only, no destructive/JS operators, result limit
    capped) before it ever touches the database, then run read-only against MongoDB.
-4. Any math (totals, averages, etc.) is either pushed into the MongoDB aggregation pipeline or
-   computed in Python over the small result set.
+4. Any math (totals, averages, etc.) is pushed into the MongoDB aggregation pipeline as part of
+   the generated query, or reasoned over directly by Gemini when writing the final answer.
 5. Gemini turns the result rows into a concise natural-language reply, posted back to Slack.
 
 If a question can't be answered from the available data, Gemini is instructed to say so instead
 of guessing.
+
+See [docs/architecture.md](docs/architecture.md) for the full function-by-function call graph and
+sequence diagrams of both entry points (`/ask` and `@mention`/DM), and
+[docs/onboarding-a-collection.md](docs/onboarding-a-collection.md) for adding new data.
 
 ## Project layout
 
