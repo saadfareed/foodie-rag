@@ -99,6 +99,51 @@ cross-collection checks, limit clamping), the calculation helpers, schema-contex
 schema introspection's type/example logic, and the end-to-end pipeline orchestration — all with
 mocked Gemini/MongoDB, so `pytest` never makes network calls or needs real credentials.
 
+## CI/CD
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every push/PR to `main`:
+
+| Job | Tool | Checks |
+|---|---|---|
+| Tests | pytest | full test suite |
+| Lint & format | ruff | lint rules + formatting |
+| SAST | bandit | Python security anti-patterns |
+| Dependency audit | pip-audit | known CVEs in dependencies |
+| Secret scan | gitleaks | hardcoded keys/tokens in git history |
+
+All five are separate jobs so they can each be set as a required status check in the repo's
+branch protection settings (GitHub setting, not part of the workflow file itself).
+
+## Pre-commit hooks
+
+The same checks run locally before you can even push, so issues are caught before CI:
+
+1. Install gitleaks (one-time, used by the secret-scan hook):
+
+   ```bash
+   curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+     | tar -xz gitleaks
+   mkdir -p ~/.local/bin && mv gitleaks ~/.local/bin/
+   ```
+
+2. Install and register the hooks (uses `requirements-dev.txt`, already installed in step 1 of
+   Setup):
+
+   ```bash
+   pre-commit install --install-hooks -t pre-commit -t pre-push
+   ```
+
+**On every `git commit`** (fast, local-scope checks): trailing whitespace / EOF / merge-conflict
+markers / large-file guard, JSON/TOML/YAML syntax, private-key detection, ruff lint+format
+(auto-fixes when possible), bandit, and gitleaks against the staged diff.
+
+**On every `git push`** (heavier, broader-scope checks): the full pytest suite and pip-audit —
+kept out of the commit path since pip-audit needs a network call and both are better suited to
+running once per push than once per commit.
+
+Run everything manually at any time with `pre-commit run --all-files` (add
+`--hook-stage pre-push` for the push-stage hooks).
+
 ## Safety notes
 
 - The database user in `MONGODB_URI` should be **read-only**; the app also blocks

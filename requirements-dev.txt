@@ -1,2 +1,6 @@
 -r requirements.txt
 pytest>=8.0
+pre-commit>=3.7
+ruff>=0.16
+bandit>=1.9
+pip-audit>=2.10
