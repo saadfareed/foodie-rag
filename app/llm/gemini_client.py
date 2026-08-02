@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import TypeVar
 
 from google import genai
-from google.genai import errors
+from google.genai import errors, types
 
 from app.config import settings
 from app.llm.quota import quota_tracker
@@ -64,16 +64,31 @@ def _is_retryable(exc: Exception) -> bool:
     return isinstance(exc, errors.APIError) and exc.code in _RETRYABLE_STATUS_CODES
 
 
+def _rows_for_prompt(rows: list[dict], max_rows: int) -> str:
+    """Cap the rows serialized into the answer prompt so payload size (and Gemini latency)
+    stays bounded regardless of how many rows the query returned."""
+    if len(rows) <= max_rows:
+        return json.dumps(rows, default=str)
+    kept = json.dumps(rows[:max_rows], default=str)
+    return f"{kept}\n(...{len(rows) - max_rows} more row(s) omitted for brevity...)"
+
+
 class GeminiClient:
     def __init__(self, model_name: str | None = None) -> None:
-        self.client = genai.Client(api_key=settings.gemini_api_key)
+        self.client = genai.Client(
+            api_key=settings.gemini_api_key,
+            http_options=types.HttpOptions(timeout=settings.gemini_request_timeout_ms),
+        )
         self.model_name = model_name or settings.gemini_model
         self.max_retries = settings.gemini_max_retries
         self.retry_base_delay_seconds = settings.gemini_retry_base_delay_seconds
+        self.max_retry_seconds = settings.gemini_max_retry_seconds
+        self.answer_max_rows = settings.gemini_answer_max_rows
 
     def _call_with_retry(self, fn: Callable[[], T]) -> T:
         quota_tracker.record_call()
         attempt = 0
+        start = time.monotonic()
         while True:
             try:
                 return fn()
@@ -82,6 +97,8 @@ class GeminiClient:
                     raise
                 jitter = random.uniform(0, 0.5)  # nosec B311 - retry backoff jitter, not security-sensitive
                 delay = self.retry_base_delay_seconds * (2**attempt) + jitter
+                if time.monotonic() - start + delay > self.max_retry_seconds:
+                    raise
                 time.sleep(delay)
                 attempt += 1
 
@@ -96,7 +113,9 @@ class GeminiClient:
         return QuerySpec(**data)
 
     def generate_answer(self, question: str, rows: list[dict]) -> str:
-        prompt = _ANSWER_PROMPT.format(question=question, rows=json.dumps(rows, default=str))
+        prompt = _ANSWER_PROMPT.format(
+            question=question, rows=_rows_for_prompt(rows, self.answer_max_rows)
+        )
         response = self._call_with_retry(
             lambda: self.client.models.generate_content(model=self.model_name, contents=prompt)
         )

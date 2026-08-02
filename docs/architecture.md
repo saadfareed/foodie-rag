@@ -8,26 +8,29 @@ import graph in `app/`, not from memory.
 
 ```mermaid
 graph TD
-    Slack[Slack: /ask, @mention, DM] --> Handlers[app/slack/handlers.py]
+    Main[app/main.py<br/>main] -->|constructs once, injects| Handlers[app/slack/handlers.py<br/>register_handlers]
+    Main -->|SIGTERM/SIGINT| Shutdown[handler.close + close_client]
+
+    Slack[Slack: /ask, @mention, DM] --> Handlers
     Handlers --> AccessControl[app/slack/access_control.py]
     Handlers --> Pipeline[app/rag/pipeline.py<br/>answer_question]
 
     Pipeline --> Quota[app/llm/quota.py<br/>quota_tracker]
-    Pipeline --> SchemaCtx[app/rag/schema_context.py<br/>build_schema_context]
-    Pipeline --> Gemini[app/llm/gemini_client.py<br/>GeminiClient]
+    Pipeline --> SchemaCtx[app/rag/schema_context.py<br/>build_schema_context<br/>mtime-cached]
+    Pipeline --> Gemini[app/llm/gemini_client.py<br/>GeminiClient<br/>shared singleton, not per-request]
     Pipeline --> Validator[app/rag/validator.py<br/>validate_query_spec]
     Pipeline --> Executor[app/db/executor.py<br/>execute_query_spec]
-    Pipeline --> Audit[app/audit/logger.py<br/>log_query_event]
+    Pipeline --> Audit[app/audit/logger.py<br/>log_query_event + timings]
 
     SchemaCtx --> SummaryFile[(schema_summary.json)]
     SchemaCtx --> AnnotationsFile[(schema_annotations.json)]
 
     Gemini --> QuotaRecord[quota_tracker.record_call]
-    Gemini --> GeminiAPI[(Google Gemini API)]
+    Gemini --> GeminiAPI[(Google Gemini API<br/>client-side HTTP timeout)]
 
     Validator --> QuerySpecModel[app/rag/query_spec.py<br/>QuerySpec / QueryError]
 
-    Executor --> Mongo[app/db/mongo.py<br/>get_db]
+    Executor --> Mongo[app/db/mongo.py<br/>get_db / close_client<br/>pooled, timeouts set]
     Mongo --> MongoDB[(MongoDB)]
 
     Audit --> Stdout[(stdout, JSON lines)]
@@ -44,6 +47,15 @@ helpers, fully unit tested) but **nothing in the live pipeline calls it**. Math 
 one of two ways: Gemini writes aggregation stages (`$sum`, `$avg`, etc.) directly into
 `QuerySpec.pipeline`, or Gemini reasons over the raw returned rows when writing the final answer.
 `calculation.py` is available for a future Python-side calculation step but isn't wired in.
+
+**Note on client lifecycle**: `GeminiClient` used to be constructed inside `answer_question` on
+every single request (`gemini or GeminiClient()`); it's now built once in `app/main.py::main()` and
+injected through `register_handlers(app, gemini)` into every handler, so all questions share one
+`google.genai.Client` (and its underlying HTTP transport) instead of paying client-init cost per
+question. `answer_question`'s `gemini=None` default is kept only so tests can omit it / pass a
+stub — production code always passes the shared instance. `MongoClient` was already a singleton
+(`app/db/mongo.py::get_client`) and now additionally has explicit connection timeouts, a bounded
+pool, and a `close_client()` used on graceful shutdown.
 
 ## Flow 1: `/ask` slash command
 
@@ -81,12 +93,15 @@ sequenceDiagram
         else under budget
             Q-->>P: False
             P->>SC: build_schema_context()
+            Note over SC: mtime-cached -- files are only re-read/parsed if they changed on disk
             SC-->>P: schema text (or "No schema information is available yet.")
+            Note over P: records schema_context_ms
             P->>G: generate_query_spec(question, schema_context)
             G->>Q: record_call()
-            G->>G: _call_with_retry(...) [retries 429/5xx w/ backoff]
-            Note over G: Gemini API call
+            G->>G: _call_with_retry(...) [retries 429/5xx w/ backoff, capped by GEMINI_MAX_RETRY_SECONDS]
+            Note over G: Gemini API call (client-side timeout: GEMINI_REQUEST_TIMEOUT_MS)
             G-->>P: QuerySpec or QueryError
+            Note over P: records query_gen_ms (even on failure)
             alt QueryError (LLM says "can't answer this")
                 P->>L: log_query_event(error=...)
                 P-->>H: the error message, verbatim
@@ -99,9 +114,11 @@ sequenceDiagram
                 else valid
                     V-->>P: validated spec (limit clamped)
                     P->>E: execute_query_spec(get_db(), spec)
+                    Note over E,M: get_db() uses the pooled MongoClient with explicit timeouts (serverSelectionTimeoutMS etc.) -- no unbounded 30s default wait
                     E->>M: find / aggregate / count
                     M-->>E: raw documents
                     E-->>P: JSON-safe rows (ObjectId/datetime -> str)
+                    Note over P: records db_ms (even on failure)
                     alt db error
                         P->>L: log_query_event(error=...)
                         P-->>H: "I ran into a database error..."
@@ -110,9 +127,11 @@ sequenceDiagram
                         P-->>H: "I didn't find any data..."
                     else rows found
                         P->>G: generate_answer(question, rows)
+                        Note over G: rows capped at GEMINI_ANSWER_MAX_ROWS before being serialized into the prompt
                         G->>Q: record_call()
                         G-->>P: natural-language answer
-                        P->>L: log_query_event(row_count=, answer=)
+                        Note over P: records answer_gen_ms
+                        P->>L: log_query_event(row_count=, answer=, timings=)
                         P-->>H: answer text
                     end
                 end
@@ -162,15 +181,16 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/main.py`
 | Function | Does |
 |---|---|
-| `main()` | Entrypoint. Calls `configure_logging`, builds the Slack `App`, calls `register_handlers`, starts `SocketModeHandler`. Logs and re-raises on fatal startup errors. |
+| `main()` | Entrypoint. Calls `configure_logging`, builds the Slack `App`, constructs **one** `GeminiClient` and passes it to `register_handlers`, registers `SIGTERM`/`SIGINT` handlers that close the Socket Mode connection and the pooled `MongoClient`, then starts `SocketModeHandler` with `concurrency=settings.slack_socket_mode_concurrency`. Logs and re-raises on fatal startup errors; `close_client()` always runs on the way out via a `finally` block. |
+| `*_shutdown(signum, frame)` | Signal handler closure: logs the signal, calls `handler.close()` and `close_client()`, then raises `SystemExit(0)` to unblock `handler.start()`'s wait loop. |
 
 ### `app/slack/handlers.py`
 | Function | Does |
 |---|---|
-| `register_handlers(app)` | Registers the three handlers below on the Bolt `app`. |
-| `handle_mention(event, say)` | `app_mention` handler. Checks `is_authorized`, strips the `<@BOTID>` mention via `_strip_mention`, calls `answer_question`, replies in-thread. |
-| `handle_dm(event, say)` | `message` handler, filtered to DMs only (`channel_type == "im"`, not bot-authored). Checks `is_authorized`, calls `answer_question`, replies. |
-| `handle_ask_command(ack, respond, command)` | `/ask` handler. Acks immediately, checks `is_authorized` (visible denial if not), validates the question isn't empty, calls `answer_question`, responds. |
+| `register_handlers(app, gemini)` | Registers the three handlers below on the Bolt `app`, closing over the injected `gemini` so every handler reuses the same client instead of constructing its own. |
+| `handle_mention(event, say)` | `app_mention` handler. Checks `is_authorized`, strips the `<@BOTID>` mention via `_strip_mention`, calls `answer_question(question, gemini, ...)`, replies in-thread. |
+| `handle_dm(event, say)` | `message` handler, filtered to DMs only (`channel_type == "im"`, not bot-authored). Checks `is_authorized`, calls `answer_question(text, gemini, ...)`, replies. |
+| `handle_ask_command(ack, respond, command)` | `/ask` handler. Acks immediately, checks `is_authorized` (visible denial if not), validates the question isn't empty, calls `answer_question(question, gemini, ...)`, responds. |
 | `*_strip_mention(text)` | Regex-strips `<@USERID>` mention markup from `@mention` event text. |
 
 ### `app/slack/access_control.py`
@@ -181,8 +201,9 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/rag/pipeline.py` — the orchestrator
 | Function | Does |
 |---|---|
-| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: budget check -> schema context -> Gemini query generation -> validation -> execution -> Gemini answer generation, with audit logging and a user-facing string return at every exit point (never raises to the caller). |
-| `*_log(**kwargs)` | Local closure inside `answer_question`; fills in `question`/`user_id`/`channel_id`/`duration_ms` and calls `log_query_event`. |
+| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: budget check -> schema context -> Gemini query generation -> validation -> execution -> Gemini answer generation, with audit logging (including per-stage timing) and a user-facing string return at every exit point (never raises to the caller). `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
+| `*_mark(name, stage_start)` | Local closure inside `answer_question`; records elapsed ms for a named stage (`schema_context_ms`, `query_gen_ms`, `db_ms`, `answer_gen_ms`) into the `timings` dict. Stages are timed with `try`/`finally` so a stage's duration is still recorded even if it raises. |
+| `*_log(**kwargs)` | Local closure inside `answer_question`; fills in `question`/`user_id`/`channel_id`/`duration_ms`/`timings` and calls `log_query_event`. |
 
 ### `app/llm/quota.py`
 | Function | Does |
@@ -197,18 +218,22 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/rag/schema_context.py`
 | Function | Does |
 |---|---|
-| `build_schema_context(summary_path, annotations_path)` | Reads `schema_summary.json` + optional `schema_annotations.json`, formats them into the prompt text Gemini sees. Returns `"No schema information is available yet."` if the summary is missing, empty, or corrupt — **this is the exact message behind the `error` field you saw in production**, meaning `schema_summary.json` doesn't exist (or is unreadable) wherever the bot process is running. |
+| `build_schema_context(summary_path, annotations_path)` | Returns cached rendered text if neither file's mtime has changed since the last call for that `(summary_path, annotations_path)` pair; otherwise re-renders via `_render` and updates the cache. Avoids re-reading/re-parsing two JSON files on every single question while still picking up edits (e.g. re-running `introspect.py`) without a restart. |
+| `*_render(summary_path, annotations_path)` | Reads `schema_summary.json` + optional `schema_annotations.json`, formats them into the prompt text Gemini sees. Returns `"No schema information is available yet."` if the summary is missing, empty, or corrupt — **this is the exact message behind the `error` field you saw in production**, meaning `schema_summary.json` doesn't exist (or is unreadable) wherever the bot process is running. |
 | `*_load_json(path)` | Loads a JSON file, returning `None` for a missing file *or* malformed/empty content (catches `JSONDecodeError` — this was a bug fixed recently; it used to raise and crash the whole pipeline). |
+| `*_mtime(path)` | Returns a file's mtime, or `None` if it doesn't exist; used as the cache-invalidation key. |
+| `_cache` | Module-level dict: `(summary_path, annotations_path) -> (summary_mtime, annotations_mtime, rendered_text)`. |
 
 ### `app/llm/gemini_client.py`
 | Function | Does |
 |---|---|
-| `GeminiClient.__init__(model_name=None)` | Builds the `google.genai.Client`, reads retry settings from `app.config.settings`. |
+| `GeminiClient.__init__(model_name=None)` | Builds the `google.genai.Client` with an explicit `http_options` timeout (`GEMINI_REQUEST_TIMEOUT_MS`), reads retry/row-cap settings from `app.config.settings`. Constructed **once** in `app.main` and shared across all requests, not per-question. |
 | `GeminiClient.generate_query_spec(question, schema_context)` | Sends `_QUERY_PROMPT` to Gemini, parses the JSON reply into a `QuerySpec` or `QueryError`. |
-| `GeminiClient.generate_answer(question, rows)` | Sends `_ANSWER_PROMPT` (question + the actual result rows as JSON) to Gemini, returns the natural-language reply text. |
-| `*GeminiClient._call_with_retry(fn)` | Wraps any Gemini API call: records a quota call, retries on 429/5xx with exponential backoff + jitter up to `max_retries`, re-raises immediately on non-retryable errors or after retries are exhausted. |
+| `GeminiClient.generate_answer(question, rows)` | Serializes `rows` via `_rows_for_prompt` (capped at `answer_max_rows`), sends `_ANSWER_PROMPT` to Gemini, returns the natural-language reply text. |
+| `*GeminiClient._call_with_retry(fn)` | Wraps any Gemini API call: records a quota call, retries on 429/5xx with exponential backoff + jitter up to `max_retries`, re-raises immediately on non-retryable errors, after retries are exhausted, **or if the next retry's delay would push total elapsed time past `max_retry_seconds`** — a hard wall-clock ceiling independent of the retry count. |
 | `*_is_retryable(exc)` | `True` if `exc` is a `google.genai.errors.APIError` with a 429/500/502/503/504 status code. |
 | `*_extract_json(text)` | Regex-extracts the first `{...}` block from Gemini's raw text response and `json.loads`s it. |
+| `*_rows_for_prompt(rows, max_rows)` | Serializes at most `max_rows` rows to JSON; if more were passed, appends an `"...N more row(s) omitted for brevity..."` note instead of the full set, so prompt size (and Gemini latency) doesn't scale unbounded with `MONGODB_MAX_RESULT_LIMIT`. |
 
 ### `app/rag/query_spec.py`
 | Model | Does |
@@ -231,14 +256,15 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/db/mongo.py`
 | Function | Does |
 |---|---|
-| `get_client()` | Lazily creates and caches a single `MongoClient` for the process. |
+| `get_client()` | Lazily creates and caches a single `MongoClient` for the process, with explicit `serverSelectionTimeoutMS`/`connectTimeoutMS`/`socketTimeoutMS`/`maxPoolSize` from settings — without these, pymongo's own default server-selection timeout is 30s, meaning an unreachable/slow Mongo could silently stall a request for up to 30s before the query even starts. |
 | `get_db()` | Returns `get_client()[settings.mongodb_db_name]`. |
+| `close_client()` | Closes the pooled `MongoClient` and clears the module-level singleton. Safe to call more than once (used both from the `SIGTERM`/`SIGINT` handler and from `main()`'s `finally` block). |
 
 ### `app/audit/logger.py`
 | Function | Does |
 |---|---|
 | `configure_logging(level="INFO")` | Attaches a JSON-formatting stdout handler to the `"audit"` logger, called once at startup in `main()`. |
-| `log_query_event(**fields)` | Logs one structured JSON record per question (question, user/channel IDs, the `QuerySpec` if any, error, row count, duration, answer). This is the exact log format you're seeing in production. |
+| `log_query_event(**fields)` | Logs one structured JSON record per question (question, user/channel IDs, the `QuerySpec` if any, error, row count, duration, per-stage `timings`, answer). This is the exact log format you're seeing in production. |
 | `*_JsonFormatter.format(record)` | Turns a `LogRecord`'s `.event` dict (plus timestamp/level) into a single JSON line. |
 
 ### Not in the live request path (CLI-only tools)

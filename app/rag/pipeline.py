@@ -22,6 +22,10 @@ def answer_question(
 ) -> str:
     gemini = gemini or GeminiClient()
     start = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def _mark(name: str, stage_start: float) -> None:
+        timings[name] = round((time.perf_counter() - stage_start) * 1000, 2)
 
     def _log(**kwargs) -> None:
         log_query_event(
@@ -29,6 +33,7 @@ def answer_question(
             user_id=user_id,
             channel_id=channel_id,
             duration_ms=(time.perf_counter() - start) * 1000,
+            timings=timings,
             **kwargs,
         )
 
@@ -37,14 +42,19 @@ def answer_question(
         _log(error="daily_budget_exceeded", answer=answer)
         return answer
 
+    stage_start = time.perf_counter()
     schema_context = build_schema_context()
+    _mark("schema_context_ms", stage_start)
 
+    stage_start = time.perf_counter()
     try:
         spec_or_error = gemini.generate_query_spec(question, schema_context)
     except Exception as exc:
         answer = f"Sorry, I couldn't process that question right now ({exc})."
         _log(error=str(exc), answer=answer)
         return answer
+    finally:
+        _mark("query_gen_ms", stage_start)
 
     if isinstance(spec_or_error, QueryError):
         _log(error=spec_or_error.error, answer=spec_or_error.error)
@@ -57,18 +67,23 @@ def answer_question(
         _log(spec=spec_or_error, error=str(exc), answer=answer)
         return answer
 
+    stage_start = time.perf_counter()
     try:
         rows = execute_query_spec(get_db(), spec, timeout_ms=settings.mongodb_query_timeout_ms)
     except Exception as exc:
         answer = f"I ran into a database error answering that: {exc}"
         _log(spec=spec, error=str(exc), answer=answer)
         return answer
+    finally:
+        _mark("db_ms", stage_start)
 
     if not rows:
         answer = "I didn't find any data matching that question."
         _log(spec=spec, row_count=0, answer=answer)
         return answer
 
+    stage_start = time.perf_counter()
     answer = gemini.generate_answer(question, rows)
+    _mark("answer_gen_ms", stage_start)
     _log(spec=spec, row_count=len(rows), answer=answer)
     return answer
