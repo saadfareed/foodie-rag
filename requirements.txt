@@ -1,0 +1,5 @@
+slack-bolt>=1.19
+pymongo>=4.7
+google-genai>=1.0
+python-dotenv>=1.0
+pydantic>=2.7

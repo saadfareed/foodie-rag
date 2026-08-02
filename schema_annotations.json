@@ -1,0 +1,12 @@
+{
+  "orders": {
+    "order_id": "human-readable order identifier",
+    "amount": "order total (demo data — no currency implied)",
+    "payment_method": "demo-only label (cash/card/wallet/hybrid_card_wallet/hybrid_wallet_cash) added for readability while seeding; may not exist in production data — do not rely on it, use onlinepaymentmethod + isWallet instead",
+    "onlinepaymentmethod": "payment method code: 1 = cash, 2 = card. For wallet-only payments this defaults to 1. For hybrid payments, the non-wallet component decides the code (card+wallet -> 2, wallet+cash -> 1)",
+    "isWallet": "true if a wallet was used as part of the payment (alone or combined with card/cash), false otherwise",
+    "payby": "breakdown of how much of `amount` was paid via each method, e.g. {\"cash\": 100} or {\"wallet\": 40, \"card\": 60}; values always sum to `amount`",
+    "status": "order status: completed, pending, or refunded (demo data)",
+    "created_at": "order creation timestamp (UTC)"
+  }
+}

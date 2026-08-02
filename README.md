@@ -1,0 +1,120 @@
+# Slack → MongoDB RAG Assistant
+
+Ask questions in Slack, get answers computed from your MongoDB data via Google's Gemini (free tier).
+
+## How it works
+
+1. A user @-mentions the bot, DMs it, or runs `/ask <question>` in Slack.
+2. The question, plus a schema summary of your MongoDB collections, is sent to Gemini, which
+   returns a structured query (`{collection, operation, filter/pipeline, ...}`) — not raw code.
+3. The query is validated (allowed collection only, no destructive/JS operators, result limit
+   capped) before it ever touches the database, then run read-only against MongoDB.
+4. Any math (totals, averages, etc.) is either pushed into the MongoDB aggregation pipeline or
+   computed in Python over the small result set.
+5. Gemini turns the result rows into a concise natural-language reply, posted back to Slack.
+
+If a question can't be answered from the available data, Gemini is instructed to say so instead
+of guessing.
+
+## Project layout
+
+```
+app/
+  config.py           # loads and validates .env settings
+  db/
+    mongo.py           # MongoDB client/connection
+    introspect.py       # samples collections -> schema_summary.json
+    executor.py          # runs a validated QuerySpec against MongoDB
+  rag/
+    query_spec.py        # QuerySpec / QueryError pydantic models
+    validator.py         # safety checks on LLM-generated queries
+    schema_context.py    # schema_summary.json (+ annotations) -> prompt text
+    calculation.py       # pure total/average/min/max/count helpers
+    pipeline.py           # orchestrates: question -> query -> validate -> execute -> answer
+  llm/
+    gemini_client.py     # Gemini query-generation and answer-generation calls
+  slack/
+    handlers.py           # app_mention / DM / `/ask` handlers
+  main.py                # Slack Socket Mode entrypoint
+tests/                   # pytest suite, fully mocked (no live Slack/Mongo/Gemini calls)
+```
+
+## Setup
+
+1. **Python environment**
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt        # runtime only
+   pip install -r requirements-dev.txt    # + pytest, for running tests
+   ```
+
+2. **Configure secrets** — copy `.env.example` to `.env` and fill in:
+   - `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` — from your Slack app
+     (api.slack.com/apps), with Socket Mode + Events API (app mentions, DMs) and the `/ask`
+     slash command enabled.
+   - `GEMINI_API_KEY` — from https://aistudio.google.com/apikey (free tier).
+   - `MONGODB_URI`, `MONGODB_DB_NAME`, `MONGODB_ALLOWED_COLLECTIONS` — connection info and the
+     collections the bot is allowed to query. Use a **read-only** database user for this.
+
+   Optional tuning (defaults shown):
+   - `GEMINI_MODEL=gemini-3-flash-preview`
+   - `MONGODB_QUERY_TIMEOUT_MS=5000`
+   - `MONGODB_MAX_RESULT_LIMIT=200`
+
+3. **Generate a schema summary** so Gemini knows your data's shape:
+
+   ```bash
+   python -m app.db.introspect
+   ```
+
+   This samples documents from each allowed collection and writes `schema_summary.json`.
+   Create an optional `schema_annotations.json` (git-ignored) alongside it to add human context
+   per field, e.g.:
+
+   ```json
+   { "orders": { "total_amount": "order total in USD, tax included" } }
+   ```
+
+   Review both files before trusting the bot's query generation — the LLM only knows what's in
+   these files plus field names/types/examples from the raw data.
+
+4. **Run the bot**
+
+   ```bash
+   python -m app.main
+   ```
+
+   Socket Mode means no public URL or tunnel is needed for local development.
+
+## Testing
+
+```bash
+pytest
+```
+
+The suite covers the query safety validator (banned operators, disallowed collections, $lookup
+cross-collection checks, limit clamping), the calculation helpers, schema-context building,
+schema introspection's type/example logic, and the end-to-end pipeline orchestration — all with
+mocked Gemini/MongoDB, so `pytest` never makes network calls or needs real credentials.
+
+## Safety notes
+
+- The database user in `MONGODB_URI` should be **read-only**; the app also blocks
+  `$where`, `$function`, `$accumulator`, `$merge`, and `$out` at the application layer, and
+  rejects any collection not listed in `MONGODB_ALLOWED_COLLECTIONS` (including `$lookup`
+  targets).
+- Every query has a result limit (`MONGODB_MAX_RESULT_LIMIT`) and a server-side timeout
+  (`MONGODB_QUERY_TIMEOUT_MS`).
+
+## Status
+
+Core pipeline, Slack handlers, and tests are implemented and verified end-to-end against live
+Gemini (`gemini-3-flash-preview`) and a seeded `orders` collection — count questions, calculations
+over the `payby` breakdown, and out-of-scope questions all produced correct/graceful answers.
+
+Remaining before production use:
+- Point `MONGODB_ALLOWED_COLLECTIONS` at real collections (currently seeded demo data in
+  `orders`) and re-run `app.db.introspect` + review `schema_annotations.json` for your actual schema.
+- Run a real end-to-end test in a Slack channel (see task checklist, task #9).
