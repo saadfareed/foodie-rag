@@ -74,3 +74,10 @@ def test_load_existing_summary_keys_by_collection_name(tmp_path):
 
     assert set(result) == {"orders", "customers"}
     assert result["orders"]["sampled_documents"] == 5
+
+
+def test_load_existing_summary_empty_file_returns_empty_instead_of_raising(tmp_path):
+    path = tmp_path / "schema_summary.json"
+    path.write_text("")  # e.g. a truncated/interrupted previous run
+
+    assert load_existing_summary(str(path)) == {}

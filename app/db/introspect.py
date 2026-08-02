@@ -7,6 +7,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 from collections import defaultdict
 from datetime import datetime
@@ -68,8 +69,12 @@ def load_existing_summary(path: str) -> dict[str, dict]:
     """Load a prior schema_summary.json (if any) keyed by collection name, for merging."""
     if not os.path.exists(path):
         return {}
-    with open(path) as f:
-        data = json.load(f)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        logging.warning("Ignoring unreadable/malformed existing summary at %s", path)
+        return {}
     return {entry["collection"]: entry for entry in data}
 
 

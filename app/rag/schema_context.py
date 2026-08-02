@@ -1,14 +1,21 @@
 """Turn schema_summary.json (+ optional human annotations) into prompt text."""
 
 import json
+import logging
 import os
+
+logger = logging.getLogger("audit")
 
 
 def _load_json(path: str) -> object | None:
     if not os.path.exists(path):
         return None
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        logger.warning("Ignoring unreadable/malformed JSON file: %s", path)
+        return None
 
 
 def build_schema_context(
