@@ -6,6 +6,16 @@ import os
 
 logger = logging.getLogger("audit")
 
+# Keyed by (summary_path, annotations_path) -> (summary_mtime, annotations_mtime, result).
+# Both files are static prompt inputs re-read on every question; caching avoids redundant disk
+# I/O + JSON parsing per request while still picking up edits (e.g. a re-run of introspect.py or
+# an updated schema_annotations.json) via mtime comparison, no restart required.
+_cache: dict[tuple[str, str], tuple[float | None, float | None, str]] = {}
+
+
+def _mtime(path: str) -> float | None:
+    return os.path.getmtime(path) if os.path.exists(path) else None
+
 
 def _load_json(path: str) -> object | None:
     if not os.path.exists(path):
@@ -18,10 +28,7 @@ def _load_json(path: str) -> object | None:
         return None
 
 
-def build_schema_context(
-    summary_path: str = "schema_summary.json",
-    annotations_path: str = "schema_annotations.json",
-) -> str:
+def _render(summary_path: str, annotations_path: str) -> str:
     summary = _load_json(summary_path)
     if not summary:
         return "No schema information is available yet."
@@ -43,3 +50,19 @@ def build_schema_context(
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+def build_schema_context(
+    summary_path: str = "schema_summary.json",
+    annotations_path: str = "schema_annotations.json",
+) -> str:
+    cache_key = (summary_path, annotations_path)
+    current_mtimes = (_mtime(summary_path), _mtime(annotations_path))
+
+    cached = _cache.get(cache_key)
+    if cached is not None and cached[:2] == current_mtimes:
+        return cached[2]
+
+    result = _render(summary_path, annotations_path)
+    _cache[cache_key] = (*current_mtimes, result)
+    return result

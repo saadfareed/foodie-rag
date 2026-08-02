@@ -64,11 +64,36 @@ tests/                   # pytest suite, fully mocked (no live Slack/Mongo/Gemin
 
    Optional tuning (defaults shown):
    - `GEMINI_MODEL=gemini-3-flash-preview`
-   - `MONGODB_QUERY_TIMEOUT_MS=5000`
+   - `MONGODB_QUERY_TIMEOUT_MS=8000`
    - `MONGODB_MAX_RESULT_LIMIT=200`
    - `AUDIT_LOG_LEVEL=INFO`
-   - `GEMINI_MAX_RETRIES=3`, `GEMINI_RETRY_BASE_DELAY_SECONDS=1.0`
+   - `GEMINI_MAX_RETRIES=3`, `GEMINI_RETRY_BASE_DELAY_SECONDS=1.0` -- retries now also cover
+     client-side HTTP timeouts, not just Gemini-returned 429/5xx responses.
+   - `GEMINI_MAX_RETRY_SECONDS=20.0` -- hard wall-clock ceiling on retry backoff, independent of
+     `GEMINI_MAX_RETRIES`, so a question can't stall indefinitely on repeated transient errors.
+   - `GEMINI_REQUEST_TIMEOUT_MS=15000` -- client-side HTTP timeout per Gemini call. If this fires
+     it's now retried (see above) instead of failing the question outright on the first slow
+     response.
+   - `GEMINI_QUERY_THINKING_BUDGET=0` -- disables "thinking" for the query-generation call (0 =
+     off, -1 = automatic). Query generation is deterministic structured extraction, not open-ended
+     reasoning; on thinking-capable models this both removes needless latency and avoids a real
+     failure mode we hit in production, where reasoning tokens silently consumed the output-token
+     budget and truncated the JSON mid-object before the model ever reached the closing brace.
+   - `GEMINI_QUERY_MAX_OUTPUT_TOKENS=2048` -- output-token cap for the query-generation call only.
+     Kept generous specifically because a too-small cap is what caused the truncation above --
+     this is a safety ceiling, not the latency lever (`GEMINI_QUERY_THINKING_BUDGET` is).
+   - `GEMINI_ANSWER_MAX_ROWS=30` -- caps how many result rows are serialized into the
+     answer-generation prompt, independent of `MONGODB_MAX_RESULT_LIMIT`, so a large result set
+     doesn't inflate prompt size (and Gemini latency).
    - `GEMINI_DAILY_CALL_BUDGET=0` (0 = unlimited)
+   - `MONGODB_SERVER_SELECTION_TIMEOUT_MS=3000`, `MONGODB_CONNECT_TIMEOUT_MS=3000`,
+     `MONGODB_SOCKET_TIMEOUT_MS=8000` -- pymongo's own default for server selection is 30s; left
+     unset, a slow/unreachable Mongo can silently eat up to 30s of a request before the query even
+     starts. These give it an explicit, much lower ceiling.
+   - `MONGODB_MAX_POOL_SIZE=20` -- keep this at or above `SLACK_SOCKET_MODE_CONCURRENCY` so DB
+     connections don't become the concurrency bottleneck.
+   - `SLACK_SOCKET_MODE_CONCURRENCY=10` -- thread pool size for the Socket Mode client (this is
+     `slack_sdk`'s own default; made explicit here so it's tuned deliberately, not left implicit).
    - `SLACK_ALLOWED_CHANNEL_IDS`, `SLACK_ALLOWED_USER_IDS` (comma-separated; empty = open to all)
 
 3. **Generate a schema summary** so Gemini knows your data's shape:
@@ -123,9 +148,13 @@ pytest
 ```
 
 The suite covers the query safety validator (banned operators, disallowed collections, $lookup
-cross-collection checks, limit clamping), the calculation helpers, schema-context building,
-schema introspection's type/example logic, and the end-to-end pipeline orchestration — all with
-mocked Gemini/MongoDB, so `pytest` never makes network calls or needs real credentials.
+cross-collection checks, limit clamping), the calculation helpers, schema-context building and
+caching, schema introspection's type/example logic, the end-to-end pipeline orchestration
+(including per-stage timing and its failure-ordering edge case), Gemini retry/deadline behavior
+(including client-side timeout retries) and answer-row truncation, Mongo client connection config
+and lifecycle, Slack handler wiring (verifying the injected `GeminiClient` reaches every entry
+point), and startup/shutdown wiring in `app.main` — all with mocked Gemini/MongoDB/Slack, so
+`pytest` never makes network calls or needs real credentials.
 
 ## CI/CD
 
@@ -189,17 +218,36 @@ Run everything manually at any time with `pre-commit run --all-files` (add
 ## Observability & access control
 
 - **Audit logging**: every question logs one structured JSON record to stdout (the generated
-  query, row count, duration, and answer) via [app/audit/logger.py](app/audit/logger.py) —
-  useful for debugging bad query generations and for auditing what data was surfaced in Slack.
-- **Gemini retry/backoff**: transient errors (429/5xx) are retried with exponential backoff
-  (`GEMINI_MAX_RETRIES`, `GEMINI_RETRY_BASE_DELAY_SECONDS`) in
-  [app/llm/gemini_client.py](app/llm/gemini_client.py).
+  query, row count, duration, per-stage timings, and answer) via
+  [app/audit/logger.py](app/audit/logger.py) — useful for debugging bad query generations and for
+  auditing what data was surfaced in Slack.
+- **Per-stage timing**: each audit record includes a `timings` breakdown
+  (`schema_context_ms`, `query_gen_ms`, `db_ms`, `answer_gen_ms`) so a slow/failing question can be
+  attributed to a specific stage instead of only showing total `duration_ms`. Timings are captured
+  via a context manager whose `finally` runs *before* the failure is logged, so the stage that
+  actually failed still shows its own duration (see `_timed_stage` in
+  [app/rag/pipeline.py](app/rag/pipeline.py)).
+- **Gemini retry/backoff**: transient errors (429/5xx **and** client-side HTTP timeouts) are
+  retried with exponential backoff (`GEMINI_MAX_RETRIES`, `GEMINI_RETRY_BASE_DELAY_SECONDS`),
+  capped by a hard wall-clock deadline (`GEMINI_MAX_RETRY_SECONDS`) so retries can't stack into an
+  unbounded stall, in [app/llm/gemini_client.py](app/llm/gemini_client.py). Both
+  `generate_query_spec` and `generate_answer` are wrapped with graceful fallback messages if
+  retries are exhausted — neither can crash the request unhandled.
 - **Daily call budget**: `GEMINI_DAILY_CALL_BUDGET` caps Gemini requests per process per day
   ([app/llm/quota.py](app/llm/quota.py)); once exceeded, the bot replies with a friendly message
   instead of calling Gemini. In-process only — resets on restart, not shared across instances.
+  **This is the reason horizontal scaling (multiple bot instances) isn't a drop-in throughput
+  fix today** — quota would need to move to a shared store (Mongo/Redis) first.
 - **Slack access control**: `SLACK_ALLOWED_CHANNEL_IDS`/`SLACK_ALLOWED_USER_IDS` restrict who can
   query the bot ([app/slack/access_control.py](app/slack/access_control.py)). Unauthorized
   mentions/DMs are silently ignored; an unauthorized `/ask` gets a visible denial.
+- **Shared clients, not per-request**: a single `GeminiClient` is constructed once at startup
+  ([app/main.py](app/main.py)) and injected into `register_handlers`, and `MongoClient` is a
+  process-wide singleton ([app/db/mongo.py](app/db/mongo.py)) with explicit connection timeouts
+  and a bounded pool — neither is recreated per question.
+- **Graceful shutdown**: `SIGTERM`/`SIGINT` close the Socket Mode connection and the pooled
+  `MongoClient` before the process exits ([app/main.py](app/main.py)), instead of leaving
+  connections orphaned.
 
 ## Safety notes
 

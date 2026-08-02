@@ -1,5 +1,7 @@
 import json
+import os
 
+from app.rag import schema_context
 from app.rag.schema_context import build_schema_context
 
 SUMMARY = [
@@ -74,3 +76,51 @@ def test_malformed_annotations_file_is_ignored_not_fatal(tmp_path):
     )
 
     assert "Collection: orders" in context
+
+
+def test_unchanged_files_are_served_from_cache_without_reparsing(tmp_path, monkeypatch):
+    summary_path = tmp_path / "schema_summary.json"
+    summary_path.write_text(json.dumps(SUMMARY))
+    annotations_path = tmp_path / "missing_annotations.json"
+
+    schema_context._cache.clear()
+    first = build_schema_context(
+        summary_path=str(summary_path), annotations_path=str(annotations_path)
+    )
+
+    def _boom(_path):
+        raise AssertionError("_load_json should not be called again for unchanged files")
+
+    monkeypatch.setattr(schema_context, "_load_json", _boom)
+
+    second = build_schema_context(
+        summary_path=str(summary_path), annotations_path=str(annotations_path)
+    )
+
+    assert second == first
+
+
+def test_editing_summary_file_invalidates_the_cache(tmp_path):
+    summary_path = tmp_path / "schema_summary.json"
+    summary_path.write_text(json.dumps(SUMMARY))
+    annotations_path = tmp_path / "missing_annotations.json"
+
+    schema_context._cache.clear()
+    first = build_schema_context(
+        summary_path=str(summary_path), annotations_path=str(annotations_path)
+    )
+    assert "status" in first
+
+    updated = [{**SUMMARY[0], "fields": {"new_field": {"types": ["str"], "examples": ["x"]}}}]
+    summary_path.write_text(json.dumps(updated))
+    # Force the mtime forward in case the filesystem's clock resolution makes the two writes
+    # land in the same second, which would otherwise make the cache-invalidation check flaky.
+    future = os.path.getmtime(summary_path) + 5
+    os.utime(summary_path, (future, future))
+
+    second = build_schema_context(
+        summary_path=str(summary_path), annotations_path=str(annotations_path)
+    )
+
+    assert "new_field" in second
+    assert "status" not in second

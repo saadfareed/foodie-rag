@@ -38,6 +38,26 @@ def test_log_query_event_without_spec_leaves_query_spec_none(caplog):
     assert event["error"] == "no data"
 
 
+def test_log_query_event_records_stage_timings_when_given(caplog):
+    with caplog.at_level(logging.INFO, logger="audit"):
+        log_query_event(
+            question="how many orders?",
+            duration_ms=42.0,
+            timings={"query_gen_ms": 10.0, "db_ms": 5.0},
+        )
+
+    event = caplog.records[0].event
+    assert event["timings"] == {"query_gen_ms": 10.0, "db_ms": 5.0}
+
+
+def test_log_query_event_defaults_timings_to_empty_dict(caplog):
+    with caplog.at_level(logging.INFO, logger="audit"):
+        log_query_event(question="hi", duration_ms=1.0)
+
+    event = caplog.records[0].event
+    assert event["timings"] == {}
+
+
 def test_json_formatter_produces_valid_json():
     formatter = _JsonFormatter()
     record = logging.LogRecord(
