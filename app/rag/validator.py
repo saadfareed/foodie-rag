@@ -1,9 +1,13 @@
 """Safety checks applied to an LLM-generated QuerySpec before it touches MongoDB."""
 
+from datetime import date
+
 from app.rag.query_spec import QuerySpec
 
 BANNED_OPERATORS = {"$where", "$function", "$accumulator", "$merge", "$out"}
 ALLOWED_OPERATIONS = {"find", "aggregate", "count"}
+MAX_DATE_RANGE_DAYS = 365
+NO_DATE_RANGE_LIMIT_CAP = 100
 
 
 class QueryValidationError(Exception):
@@ -30,8 +34,50 @@ def _find_violation(value: object, allowed_collections: list[str]) -> str | None
     return None
 
 
+def _parse_iso_date(value: str, field_name: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise QueryValidationError(
+            f"invalid {field_name} '{value}': must be an ISO date (YYYY-MM-DD)"
+        ) from exc
+
+
+def _validate_date_range(spec: QuerySpec, max_range_days: int) -> None:
+    """Reasons over the *structured* start_date/end_date fields only -- these describe (not
+    drive) whatever date filter Gemini embedded in filter/pipeline.
+
+    Both bounds given: span is end - start (and end must not precede start). Exactly one bound
+    given: span is measured against today rather than treating the missing bound as literally
+    "today" -- an end_date alone is normally a bound in the past (e.g. "orders up to a year ago"),
+    so anchoring the missing start to today would make it look like an inverted range instead of
+    just a wide one."""
+    if spec.start_date is None and spec.end_date is None:
+        return
+
+    if spec.start_date and spec.end_date:
+        start = _parse_iso_date(spec.start_date, "start_date")
+        end = _parse_iso_date(spec.end_date, "end_date")
+        if end < start:
+            raise QueryValidationError(f"end_date '{end}' is before start_date '{start}'")
+        span_days = (end - start).days
+    else:
+        field_name = "start_date" if spec.start_date else "end_date"
+        given = _parse_iso_date(spec.start_date or spec.end_date, field_name)
+        span_days = abs((date.today() - given).days)
+
+    if span_days > max_range_days:
+        raise QueryValidationError(
+            f"date range too long: {span_days} days requested (max {max_range_days})"
+        )
+
+
 def validate_query_spec(
-    spec: QuerySpec, allowed_collections: list[str], max_limit: int = 200
+    spec: QuerySpec,
+    allowed_collections: list[str],
+    max_limit: int = 200,
+    max_date_range_days: int = MAX_DATE_RANGE_DAYS,
+    no_date_range_limit_cap: int = NO_DATE_RANGE_LIMIT_CAP,
 ) -> QuerySpec:
     """Raise QueryValidationError on anything unsafe or out of scope; clamp the limit otherwise."""
     if spec.collection not in allowed_collections:
@@ -48,5 +94,9 @@ def validate_query_spec(
     if violation:
         raise QueryValidationError(violation)
 
-    spec.limit = min(max(spec.limit, 1), max_limit)
+    _validate_date_range(spec, max_date_range_days)
+
+    no_dates = spec.start_date is None and spec.end_date is None
+    effective_cap = min(max_limit, no_date_range_limit_cap) if no_dates else max_limit
+    spec.limit = min(max(spec.limit, 1), effective_cap)
     return spec

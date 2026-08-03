@@ -44,6 +44,7 @@ def log_query_event(
     row_count: int | None = None,
     answer: str | None = None,
     timings: dict[str, float] | None = None,
+    cache_hit: bool = False,
 ) -> None:
     logger = logging.getLogger(_LOGGER_NAME)
     event = {
@@ -56,5 +57,6 @@ def log_query_event(
         "duration_ms": round(duration_ms, 2),
         "timings": timings or {},
         "answer": answer,
+        "cache_hit": cache_hit,
     }
     logger.info("query_event", extra={"event": event})

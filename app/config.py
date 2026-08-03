@@ -73,6 +73,11 @@ class Settings:
         # 0 means unlimited
         self.gemini_daily_call_budget = int(os.environ.get("GEMINI_DAILY_CALL_BUDGET", "0"))
 
+        # In-process per-channel answer cache (app/rag/answer_cache.py) -- avoids repeating
+        # identical Gemini + Mongo round-trips for a repeated question within the same channel.
+        self.answer_cache_ttl_seconds = int(os.environ.get("ANSWER_CACHE_TTL_SECONDS", "1800"))
+        self.answer_cache_max_entries = int(os.environ.get("ANSWER_CACHE_MAX_ENTRIES", "500"))
+
         self.slack_allowed_channel_ids = _parse_list(
             os.environ.get("SLACK_ALLOWED_CHANNEL_IDS", "")
         )

@@ -15,6 +15,7 @@ graph TD
     Handlers --> AccessControl[app/slack/access_control.py]
     Handlers --> Pipeline[app/rag/pipeline.py<br/>answer_question]
 
+    Pipeline --> AnswerCache[app/rag/answer_cache.py<br/>answer_cache, TTL+LRU, per-channel<br/>checked first -- a hit skips everything below]
     Pipeline --> Quota[app/llm/quota.py<br/>quota_tracker]
     Pipeline --> SchemaCtx[app/rag/schema_context.py<br/>build_schema_context<br/>mtime-cached]
     Pipeline --> Gemini[app/llm/gemini_client.py<br/>GeminiClient<br/>shared singleton, not per-request]
@@ -28,7 +29,7 @@ graph TD
     Gemini --> QuotaRecord[quota_tracker.record_call]
     Gemini --> GeminiAPI[(Google Gemini API<br/>client-side HTTP timeout, retried on timeout too)]
 
-    Validator --> QuerySpecModel[app/rag/query_spec.py<br/>QuerySpec / QueryError]
+    Validator --> QuerySpecModel[app/rag/query_spec.py<br/>QuerySpec / QueryError<br/>+ start_date/end_date, descriptive only]
 
     Executor --> Mongo[app/db/mongo.py<br/>get_db / close_client<br/>pooled, timeouts set]
     Mongo --> MongoDB[(MongoDB)]
@@ -96,6 +97,7 @@ sequenceDiagram
     participant H as handlers.handle_ask_command
     participant AC as access_control.is_authorized
     participant P as pipeline.answer_question
+    participant AN as answer_cache
     participant Q as quota_tracker
     participant SC as schema_context.build_schema_context
     participant G as GeminiClient
@@ -115,60 +117,75 @@ sequenceDiagram
         AC-->>H: True
         H->>H: strip/validate question text
         H->>P: answer_question(question, user_id=, channel_id=)
-        P->>Q: is_over_budget()
-        alt over daily budget
-            Q-->>P: True
-            P->>L: log_query_event(error="daily_budget_exceeded")
-            P-->>H: "I've hit my daily question budget..."
-        else under budget
-            Q-->>P: False
-            P->>SC: build_schema_context()
-            Note over SC: mtime-cached -- files are only re-read/parsed if they changed on disk
-            SC-->>P: schema text (or "No schema information is available yet.")
-            Note over P: records schema_context_ms
-            P->>G: generate_query_spec(question, schema_context)
-            Note over G: temperature=0, response_mime_type=application/json, max_output_tokens capped -- narrow deterministic extraction, no prose to regex-parse
-            G->>Q: record_call()
-            G->>G: _call_with_retry(...) [retries 429/5xx AND client-side timeouts w/ backoff, capped by GEMINI_MAX_RETRY_SECONDS]
-            Note over G: Gemini API call (client-side timeout: GEMINI_REQUEST_TIMEOUT_MS)
-            G-->>P: QuerySpec or QueryError
-            Note over P: records query_gen_ms via _timed_stage -- captured even on failure, before the except block logs
-            alt QueryError (LLM says "can't answer this")
-                P->>L: log_query_event(error=...)
-                P-->>H: the error message, verbatim
-            else QuerySpec returned
-                P->>V: validate_query_spec(spec, allowed_collections)
-                alt validation fails (banned op / disallowed collection)
-                    V-->>P: raises QueryValidationError
+        P->>AN: answer_cache.get(channel_id, question)
+        alt cache hit
+            AN-->>P: CachedResult
+            P->>L: log_query_event(cache_hit=True, answer=..., error=...)
+            P-->>H: cached answer (zero Gemini calls, zero quota spent)
+        else cache miss
+            AN-->>P: None
+            P->>Q: is_over_budget()
+            alt over daily budget
+                Q-->>P: True
+                P->>L: log_query_event(error="daily_budget_exceeded")
+                P-->>H: "I've hit my daily question budget..."
+            else under budget
+                Q-->>P: False
+                P->>SC: build_schema_context()
+                Note over SC: mtime-cached -- files are only re-read/parsed if they changed on disk
+                SC-->>P: schema text (or "No schema information is available yet.")
+                Note over P: records schema_context_ms
+                P->>G: generate_query_spec(question, schema_context)
+                Note over G: temperature=0, response_mime_type=application/json, max_output_tokens capped -- narrow deterministic extraction, no prose to regex-parse
+                G->>Q: record_call()
+                G->>G: _call_with_retry(...) [retries 429/5xx AND client-side timeouts w/ backoff, capped by GEMINI_MAX_RETRY_SECONDS]
+                Note over G: Gemini API call (client-side timeout: GEMINI_REQUEST_TIMEOUT_MS)
+                G-->>P: QuerySpec or QueryError
+                Note over P: records query_gen_ms via _timed_stage -- captured even on failure, before the except block logs
+                alt QueryError (LLM says "can't answer this")
                     P->>L: log_query_event(error=...)
-                    P-->>H: "I can't run that query: ..."
-                else valid
-                    V-->>P: validated spec (limit clamped)
-                    P->>E: execute_query_spec(get_db(), spec)
-                    Note over E,M: get_db() uses the pooled MongoClient with explicit timeouts (serverSelectionTimeoutMS etc.) -- no unbounded 30s default wait
-                    E->>M: find / aggregate / count
-                    M-->>E: raw documents
-                    E-->>P: JSON-safe rows (ObjectId/datetime -> str)
-                    Note over P: records db_ms via _timed_stage (even on failure)
-                    alt db error
+                    P-->>H: the error message, verbatim
+                    Note over P: cached (deterministic) via answer_cache.set
+                else QuerySpec returned
+                    P->>V: validate_query_spec(spec, allowed_collections)
+                    Note over V: also enforces the date-range guardrail: no start_date/end_date caps limit to 100; one or both given must span <= 365 days else QueryValidationError
+                    alt validation fails (banned op / disallowed collection / date range too long)
+                        V-->>P: raises QueryValidationError
                         P->>L: log_query_event(error=...)
-                        P-->>H: "I ran into a database error..."
-                    else no rows
-                        P->>L: log_query_event(row_count=0)
-                        P-->>H: "I didn't find any data..."
-                    else rows found
-                        P->>G: generate_answer(question, rows)
-                        Note over G: rows capped at GEMINI_ANSWER_MAX_ROWS before being serialized into the prompt
-                        G->>Q: record_call()
-                        alt Gemini fails/times out generating the answer
-                            G-->>P: raises
-                            P->>L: log_query_event(spec=, row_count=, error=..., timings=)
-                            P-->>H: "I found the data but couldn't put it into words just now..."
-                        else success
-                            G-->>P: natural-language answer
-                            Note over P: records answer_gen_ms
-                            P->>L: log_query_event(row_count=, answer=, timings=)
-                            P-->>H: answer text
+                        P-->>H: "I can't run that query: ..."
+                        Note over P: cached (deterministic) via answer_cache.set
+                    else valid
+                        V-->>P: validated spec (limit clamped)
+                        P->>E: execute_query_spec(get_db(), spec)
+                        Note over E,M: get_db() uses the pooled MongoClient with explicit timeouts (serverSelectionTimeoutMS etc.) -- no unbounded 30s default wait
+                        E->>M: find / aggregate / count
+                        M-->>E: raw documents
+                        E-->>P: JSON-safe rows (ObjectId/datetime -> str)
+                        Note over P: records db_ms via _timed_stage (even on failure)
+                        alt db error
+                            P->>L: log_query_event(error=...)
+                            P-->>H: "I ran into a database error..."
+                            Note over P: NOT cached -- transient/infra failure
+                        else no rows
+                            P->>L: log_query_event(row_count=0)
+                            P-->>H: "I didn't find any data..."
+                            Note over P: cached (deterministic) via answer_cache.set
+                        else rows found
+                            P->>G: generate_answer(question, rows)
+                            Note over G: rows capped at GEMINI_ANSWER_MAX_ROWS before being serialized into the prompt
+                            G->>Q: record_call()
+                            alt Gemini fails/times out generating the answer
+                                G-->>P: raises
+                                P->>L: log_query_event(spec=, row_count=, error=..., timings=)
+                                P-->>H: "I found the data but couldn't put it into words just now..."
+                                Note over P: NOT cached -- transient/infra failure
+                            else success
+                                G-->>P: natural-language answer
+                                Note over P: records answer_gen_ms
+                                P->>L: log_query_event(row_count=, answer=, timings=)
+                                P-->>H: answer text
+                                Note over P: cached via answer_cache.set
+                            end
                         end
                     end
                 end
@@ -238,9 +255,19 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/rag/pipeline.py` — the orchestrator
 | Function | Does |
 |---|---|
-| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: budget check -> schema context -> Gemini query generation -> validation -> execution -> Gemini answer generation, with audit logging (including per-stage timing) and a user-facing string return at every exit point (never raises to the caller, including if `generate_answer` itself fails). `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
+| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: **answer_cache check first** (a hit returns immediately, before `gemini` is even constructed) -> budget check -> schema context -> Gemini query generation -> validation -> execution -> Gemini answer generation, with audit logging (including per-stage timing and `cache_hit`) and a user-facing string return at every exit point (never raises to the caller, including if `generate_answer` itself fails). Deterministic outcomes (`QueryError`, `QueryValidationError`, no-rows, success) are written back into `answer_cache`; transient/infra failures (quota, Gemini exceptions, DB exceptions) are not. `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
 | `*_timed_stage(timings, name)` | Context manager: records elapsed ms for `name` into `timings` in its `finally` block, which runs as an exception unwinds out of the `with` block -- i.e. *before* any enclosing `except` clause (and therefore before `_log`) sees it. This ordering is what makes a failing stage's own duration show up in the audit log for that failure, instead of being silently dropped. |
 | `*_log(**kwargs)` | Local closure inside `answer_question`; fills in `question`/`user_id`/`channel_id`/`duration_ms`/`timings` and calls `log_query_event`. |
+
+### `app/rag/answer_cache.py`
+| Function | Does |
+|---|---|
+| `AnswerCache.__init__(ttl_seconds, max_entries)` | Sets up an in-process, thread-safe (via `threading.Lock`, same rationale as `QuotaTracker` -- Socket Mode dispatches handlers via a thread pool) TTL + LRU store backed by `collections.OrderedDict`. |
+| `AnswerCache.get(key)` | Returns the cached `CachedResult`, or `None` on a miss; an entry past its TTL is evicted on lookup (not left for later eviction pressure) and also treated as a miss. A hit moves the entry to the end of the ordering (LRU touch). |
+| `AnswerCache.set(key, value)` | Inserts/refreshes an entry and moves it to the end, then evicts from the front (`popitem(last=False)`, least-recently-used first) while over `max_entries`. |
+| `AnswerCache.make_key(channel_id, question)` | `(channel_id or "", question.strip().lower())` -- cache is scoped per-channel, keyed on exact-normalized question text (no fuzzy/semantic matching). |
+| `CachedResult` | Frozen dataclass: `answer`, `error` -- everything replayed on a cache hit and logged via `log_query_event(cache_hit=True, ...)`. |
+| `answer_cache` | Module-level singleton, constructed from `settings.answer_cache_ttl_seconds` / `settings.answer_cache_max_entries` (defaults: 30 minutes, 500 entries). |
 
 ### `app/llm/quota.py`
 | Function | Does |
@@ -265,7 +292,7 @@ Grouped by module, in call order for a typical successful request. `*` = private
 | Function | Does |
 |---|---|
 | `GeminiClient.__init__(model_name=None)` | Builds the `google.genai.Client` with an explicit `http_options` timeout (`GEMINI_REQUEST_TIMEOUT_MS`), reads retry/row-cap settings from `app.config.settings`, and builds `query_generation_config` (`temperature=0`, `response_mime_type="application/json"`, `max_output_tokens=GEMINI_QUERY_MAX_OUTPUT_TOKENS`, `thinking_config=ThinkingConfig(thinking_budget=GEMINI_QUERY_THINKING_BUDGET)`) used only for `generate_query_spec` -- thinking is disabled by default since query generation is deterministic extraction, not reasoning, and on thinking-capable models reasoning tokens otherwise silently consume the output-token budget (see the incident note above the component diagram). Constructed **once** in `app.main` and shared across all requests, not per-question. |
-| `GeminiClient.generate_query_spec(question, schema_context)` | Sends `_QUERY_PROMPT` to Gemini using `query_generation_config`, parses the JSON reply into a `QuerySpec` or `QueryError`. |
+| `GeminiClient.generate_query_spec(question, schema_context)` | Sends `_QUERY_PROMPT` to Gemini using `query_generation_config`, parses the JSON reply into a `QuerySpec` or `QueryError`. `_QUERY_PROMPT` also asks Gemini to populate `start_date`/`end_date` (ISO `YYYY-MM-DD`) whenever it embeds a date filter into `filter`/`pipeline`, describing (not driving) that range for `validator.py` to enforce. |
 | `GeminiClient.generate_answer(question, rows)` | Serializes `rows` via `_rows_for_prompt` (capped at `answer_max_rows`), sends `_ANSWER_PROMPT` to Gemini, returns the natural-language reply text. |
 | `*GeminiClient._call_with_retry(fn)` | Wraps any Gemini API call: records a quota call, retries on 429/5xx **and client-side timeouts** with exponential backoff + jitter up to `max_retries`, re-raises immediately on non-retryable errors, after retries are exhausted, **or if the next retry's delay would push total elapsed time past `max_retry_seconds`** — a hard wall-clock ceiling independent of the retry count. |
 | `*_is_retryable(exc)` | `True` if `exc` is a `google.genai.errors.APIError` with a 429/500/502/503/504 status code, **or** an `httpx.TimeoutException` (a client-side read/connect timeout past `GEMINI_REQUEST_TIMEOUT_MS` -- this used to be treated as non-retryable, which is exactly what caused a production failure: a single slow response failed the question outright with no retry). |
@@ -275,14 +302,16 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/rag/query_spec.py`
 | Model | Does |
 |---|---|
-| `QuerySpec` | Pydantic model: `collection`, `operation` (`find`/`aggregate`/`count`), `filter`, `pipeline`, `projection`, `sort`, `limit`. What Gemini is asked to produce instead of raw MQL. |
+| `QuerySpec` | Pydantic model: `collection`, `operation` (`find`/`aggregate`/`count`), `filter`, `pipeline`, `projection`, `sort`, `limit`, `start_date`/`end_date` (optional ISO `YYYY-MM-DD`). What Gemini is asked to produce instead of raw MQL. `start_date`/`end_date` are descriptive-only -- `executor.py` never reads them; they exist purely so `validator.py` can enforce the date-range guardrail without parsing an arbitrary Mongo filter dict. |
 | `QueryError` | `{error: str}` — what Gemini returns when it can't answer the question from the available schema. |
 
 ### `app/rag/validator.py` — the safety gate
 | Function | Does |
 |---|---|
-| `validate_query_spec(spec, allowed_collections, max_limit=200)` | Rejects any collection not in the allow-list, any operation outside `find`/`aggregate`/`count`, and any use of `$where`/`$function`/`$accumulator`/`$merge`/`$out` (including inside `$lookup` targets) anywhere in the filter/pipeline/projection. Clamps `limit` into `[1, max_limit]`. Raises `QueryValidationError` on rejection. |
+| `validate_query_spec(spec, allowed_collections, max_limit=200, max_date_range_days=365, no_date_range_limit_cap=100)` | Rejects any collection not in the allow-list, any operation outside `find`/`aggregate`/`count`, and any use of `$where`/`$function`/`$accumulator`/`$merge`/`$out` (including inside `$lookup` targets) anywhere in the filter/pipeline/projection. Then enforces the date-range guardrail (see `_validate_date_range` below). Clamps `limit` into `[1, max_limit]` -- or `[1, min(max_limit, no_date_range_limit_cap)]` when neither `start_date` nor `end_date` is set, so an undated question is capped to the last 100 rows by default. Raises `QueryValidationError` on rejection. |
 | `*_find_violation(value, allowed_collections)` | Recursively walks the filter/pipeline/projection structure looking for banned operators or disallowed `$lookup` targets. |
+| `*_validate_date_range(spec, max_range_days)` | No-op if neither date is set. If both are set, the span is `end - start` (raises if `end < start`). If only one is set, the span is measured against **today** rather than treating the missing bound as literally today (an `end_date` alone is normally a bound in the past, so anchoring a missing `start_date` to today would misreport it as an inverted range). Raises `QueryValidationError` ("date range too long: N days requested (max M)") if the span exceeds `max_range_days`. |
+| `*_parse_iso_date(value, field_name)` | `date.fromisoformat`, wrapping a `ValueError` into a `QueryValidationError` naming the offending field. |
 
 ### `app/db/executor.py`
 | Function | Does |
@@ -301,7 +330,7 @@ Grouped by module, in call order for a typical successful request. `*` = private
 | Function | Does |
 |---|---|
 | `configure_logging(level="INFO")` | Attaches a JSON-formatting stdout handler to the `"audit"` logger, called once at startup in `main()`. |
-| `log_query_event(**fields)` | Logs one structured JSON record per question (question, user/channel IDs, the `QuerySpec` if any, error, row count, duration, per-stage `timings`, answer). This is the exact log format you're seeing in production. |
+| `log_query_event(**fields)` | Logs one structured JSON record per question (question, user/channel IDs, the `QuerySpec` if any, error, row count, duration, per-stage `timings`, answer, `cache_hit`). This is the exact log format you're seeing in production. |
 | `*_JsonFormatter.format(record)` | Turns a `LogRecord`'s `.event` dict (plus timestamp/level) into a single JSON line. |
 
 ### Not in the live request path (CLI-only tools)
