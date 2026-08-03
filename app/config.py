@@ -146,6 +146,21 @@ class Settings:
         # stays valid before a later, unrelated message from the same user is treated as a new
         # question instead of a follow-up answer.
         self.clarification_cache_ttl_seconds = _int("CLARIFICATION_CACHE_TTL_SECONDS", "300")
+        # TTL for app/rag/conversation_context.py entries -- how long the *last resolved
+        # question* for a (channel, user) stays available for the classifier to fold into a
+        # short follow-up (e.g. "total amount?" after "how many orders?"). Deliberately short
+        # and single-turn: this is conversational continuity within one active exchange, not a
+        # long-term memory feature -- see app/agents/classifier.py's context_mode field, which
+        # decides per-message whether this cache is even consulted.
+        self.conversation_context_ttl_seconds = _int("CONVERSATION_CONTEXT_TTL_SECONDS", "300")
+        # TTL for app/rag/context_switch_cache.py entries -- how long an unanswered "should I
+        # clear the context and treat this as a new question?" prompt stays valid before a later
+        # message is treated as an ordinary fresh question instead of a reply to it. Short and
+        # separate from conversation_context_ttl_seconds: this is "waiting on a yes/no right now,"
+        # not "how long is old context worth remembering."
+        self.context_switch_confirmation_ttl_seconds = _int(
+            "CONTEXT_SWITCH_CONFIRMATION_TTL_SECONDS", "120"
+        )
 
         # Per-(channel,user) sliding-window rate limit (app/rag/rate_limiter.py) -- independent of
         # gemini_daily_call_budget (a *shared* ceiling): this bounds one user's request rate so a

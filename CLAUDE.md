@@ -26,7 +26,7 @@ changing anything in the request path.
 app/
   config.py        Settings singleton -- every env var this app reads, validated at import time
   agents/          Multi-domain LangGraph agent: classify -> resolve anchors -> fan out -> synthesize
-    classifier.py    question -> domain(s) + confidence + clarification (enum-constrained)
+    classifier.py    question -> domain(s) + confidence + clarification + context_mode/resolved_question (enum-constrained)
     domains.py        domain registry; forces collection/usertype scoping in code (THE guardrail)
     query_agents.py   per-domain schema-scoped query generation
     graph.py           the StateGraph itself
@@ -45,6 +45,8 @@ app/
     pipeline.py          orchestrator: cache -> rate limit -> budget -> clarification -> graph -> audit
     answer_cache.py       per-channel TTL+LRU cache of full answers
     clarification_cache.py  per-(channel,user) "we asked a follow-up" state
+    conversation_context.py per-(channel,user) last resolved_question, for short elliptical follow-ups
+    context_switch_cache.py per-(channel,user) "should I clear that context?" pending confirmation
     rate_limiter.py        per-(channel,user) sliding-window rate limit
   llm/
     gemini_client.py  all Gemini calls: retry/backoff/timeout/thinking-budget/fallback-models/quota
@@ -68,14 +70,25 @@ schema_summary.json, schema_annotations.json   git-ignored, environment-specific
 ```
 Slack event -> handlers.py -> access_control.is_authorized
   -> pipeline.answer_question:
+       "reset"/"new topic"/"start over"/"forget that" (exact match)?
+          -> clear clarification/conversation-context/context-switch state, reply, done (no Gemini)
+       pending context_switch_cache confirmation for this user?
+          -> yes/no (exact match, no Gemini): yes answers the parked candidate question fresh;
+             no keeps current context; anything else drops the prompt and falls through below
        answer_cache (hit? return immediately, zero cost)
        -> rate_limiter (per channel+user; before any Gemini/Mongo work)
        -> quota_tracker (shared daily Gemini budget)
        -> clarification_cache (merge with a pending follow-up if any)
+       -> conversation_context_cache (only if no clarification pending: last resolved_question,
+          if any, threaded in as previous_question)
        -> agent graph (app/agents/graph.py):
-            classify -> [resolve_anchors if needed] -> fan out to domain_agent (parallel, one per domain)
+            classify (also decides context_mode/resolved_question from previous_question)
+            -> if context_mode=="new_topic" AND previous_question is live: confirm_context_switch
+               (asks the user before discarding it -- no query generated yet)
+            -> else [resolve_anchors if needed] -> fan out to domain_agent (parallel, one per domain)
             -> synthesize
-       -> clarification handling / audit log / answer_cache.set
+       -> clarification/context-switch handling / conversation_context_cache.set / audit log /
+          answer_cache.set
 ```
 
 Every Gemini call funnels through `GeminiClient._call_with_retry`:
@@ -105,10 +118,30 @@ Every Gemini call funnels through `GeminiClient._call_with_retry`:
 ## Known limitations / tradeoffs (already decided, don't re-litigate without new information)
 
 - **Every stateful guardrail is in-process only**: `answer_cache`, `clarification_cache`,
-  `rate_limiter`, `quota_tracker`, and `gemini_circuit_breaker` are all module-level singletons
-  with no shared backing store. This is *the* reason running more than one bot instance isn't a
-  drop-in throughput fix today — each replica would enforce its own daily budget, cache, and rate
-  limit independently. Revisit with Mongo/Redis-backed state first if that's ever needed.
+  `conversation_context_cache`, `context_switch_cache`, `rate_limiter`, `quota_tracker`, and
+  `gemini_circuit_breaker` are all module-level singletons with no shared backing store. This is
+  *the* reason running more than one bot instance isn't a drop-in throughput fix today — each
+  replica would enforce its own daily budget, cache, rate limit, and follow-up context
+  independently. Revisit with Mongo/Redis-backed state first if that's ever needed.
+- **Conversational follow-up context (`app/rag/conversation_context.py`) is deliberately
+  same-session, single-turn only** — it remembers one prior *resolved* question per
+  (channel, user), not a growing transcript, and expires after
+  `CONVERSATION_CONTEXT_TTL_SECONDS` (default 300s). Recalling things from days/weeks ago (a
+  different feature — semantic search over long-term history) was deliberately scoped out: that's
+  a job for search/retrieval over accumulated Q&A, not this recency-based cache, and mixing the
+  two would risk serving a stale cached *answer* instead of always re-querying MongoDB for current
+  data.
+- **An unrelated-looking question is confirmed, not silently answered, while prior context is
+  still live.** When `previous_question` is set and the classifier decides the new message is a
+  `"new_topic"`, `app/agents/graph.py` routes to `confirm_context_switch` instead of generating a
+  query — the user gets "should I clear that context and answer this as a new question?" and has
+  to reply yes/no before anything is queried. This is a deliberate product choice (asked for
+  explicitly), not an oversight: it costs one extra round-trip on every topic switch made within
+  `CONVERSATION_CONTEXT_TTL_SECONDS` of the last question, in exchange for never guessing wrong
+  about whether to discard context. Once that TTL lapses (`previous_question` unset), a fresh
+  question is answered immediately as before — the confirmation only fires while there's something
+  live to actually discard. A user can also skip straight to a clean slate at any time by typing
+  `reset` (or `new topic` / `start over` / `forget that`) — see `app/rag/pipeline.py::_is_reset_command`.
 - **Google's free-tier Gemini quota is the real system-wide throughput ceiling** ("as low as
   20/day for some models" per Google), not anything in this codebase. `GEMINI_FALLBACK_MODELS`
   and `GEMINI_DAILY_CALL_BUDGET` help; they don't remove the ceiling.
@@ -172,6 +205,29 @@ Lint (must pass before any PR, also pre-commit/CI gated): `ruff check .`, `ruff 
   (`errors_by_domain`, "I ran into a problem"); the latter is the model's own deliberate rejection
   (`out_of_scope_by_domain`, its message shown verbatim). Don't conflate them when adding new
   failure handling.
+- **`state["question"]` is not what most graph nodes should generate/answer against —
+  `resolved_question` is.** `_classify_node` may rewrite a short follow-up ("what about the total
+  amount?") into a self-contained `resolved_question`; `_resolve_anchors_node`, `_fan_out`, and
+  `_synthesize_node` all read it via `_effective_question(state)`, never `state["question"]`
+  directly. A new node added to the graph must do the same, or it'll silently generate against the
+  raw, potentially incomplete fragment instead of the context-folded question.
+- **`clarification_cache` and `conversation_context_cache` are mutually exclusive per request, by
+  design.** `pipeline.answer_question` only reads `conversation_context_cache` when no
+  clarification is pending — a pending clarification already carries context forward its own way
+  (string-merging the original question with the follow-up). Consulting both would double up
+  context for no benefit.
+- **The reset command and the yes/no context-switch reply are matched by exact string, not
+  substring or LLM judgment** (`app/rag/pipeline.py::_normalize_command` + `_RESET_PHRASES`/
+  `_AFFIRMATIVE_PHRASES`/`_NEGATIVE_PHRASES`). This is deliberate: a real question that happens to
+  contain "reset" or "yes" (e.g. "did we reset the counter?") must still reach the classifier, not
+  get swallowed by a keyword match. Adding a new phrase to any of these sets is safe; switching the
+  match to substring/fuzzy is not.
+- **An ambiguous reply to the context-switch prompt drops the *old* context too, not just the
+  pending prompt.** If the user replies with neither yes nor no, `pipeline.answer_question` clears
+  both `context_switch_cache` and `conversation_context_cache` for that (channel, user) before
+  falling through to answer the new message fresh. Keeping the old context there instead would let
+  it silently re-trigger a second confirmation chained off context the user never actually
+  confirmed keeping.
 
 ## Where to look for more
 

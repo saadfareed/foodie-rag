@@ -14,8 +14,18 @@ class GraphState(TypedDict, total=False):
     question: str
     user_id: str | None
     channel_id: str | None
+    # The previous turn's resolved_question for this (channel, user), from
+    # app/rag/conversation_context.py -- None for a fresh conversation or when the answer_cache/
+    # clarification path already short-circuited. Read only by _classify_node, which decides
+    # (via Classification.context_mode) whether the current question actually needs it.
+    previous_question: str | None
 
     classification: Classification
+    # Set once by _classify_node from classification.resolved_question -- either the question
+    # verbatim (new_topic) or a context-folded rewrite (followup). Every downstream node
+    # (_resolve_anchors_node, the domain_agent fan-out, _synthesize_node) generates/answers
+    # against this instead of the raw `question`, via _effective_question() in graph.py.
+    resolved_question: str
 
     # Present only inside a single fanned-out domain_agent invocation (see Send() in graph.py) --
     # never appears in the overall merged state.
@@ -44,3 +54,8 @@ class GraphState(TypedDict, total=False):
 
     answer: str
     needs_clarification: bool
+    # Set by _confirm_context_switch_node when classify decided this message doesn't fit the
+    # still-live conversation (context_mode == "new_topic" while previous_question is set) --
+    # `answer` is a yes/no prompt in that case, not a real answer. Mutually exclusive with
+    # needs_clarification: _route_after_classify picks at most one branch per invocation.
+    needs_context_confirmation: bool
