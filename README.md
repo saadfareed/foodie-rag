@@ -8,6 +8,15 @@ Ask questions in Slack, get answers computed from your MongoDB data via Google's
 2. The question is **classified** into one or more domains (`orders`/`customers`/`vendors`); a
    question needing a cross-domain geo lookup (e.g. "vendors near customer X with pending
    orders") first resolves that anchor in code (never by asking the model to invent coordinates).
+   A short follow-up in the same conversation (e.g. "what about the total amount?" right after
+   "how many orders did vendor V1 have last week?") is recognized at this same step and folded
+   into one self-contained question (see
+   [docs/architecture.md](docs/architecture.md#the-agent-graph-in-detail)). If a question instead
+   looks *unrelated* to what was just asked, the bot doesn't guess either way — it asks "should I
+   clear that context and answer this as a new question?" and waits for a yes/no before generating
+   anything, so it only ever discards context you actually confirmed dropping. Say `reset` (or
+   `new topic` / `start over` / `forget that`) at any time to clear that context immediately
+   without waiting to be asked.
 3. The question fans out to one schema-scoped **domain agent** per classified domain (in
    parallel), each producing a structured query (`{collection, operation, filter/pipeline, ...}`)
    — not raw code — scoped so it can only ever touch its own domain's data, regardless of what
@@ -33,7 +42,7 @@ agent graph, and sequence diagrams of both entry points (`/ask` and `@mention`/D
 app/
   config.py              # loads and validates .env settings
   agents/                 # multi-domain LangGraph agent (classify -> resolve anchors -> fan out -> synthesize)
-    classifier.py          # question -> domain(s) + confidence + clarification
+    classifier.py          # question -> domain(s) + confidence + clarification + context_mode/resolved_question
     domains.py              # domain registry; forces collection/usertype scoping in code
     graph.py                 # the StateGraph itself (app/agents/state.py holds its schema)
     query_agents.py           # per-domain schema-scoped query generation
@@ -51,6 +60,8 @@ app/
     pipeline.py                 # orchestrates: cache -> rate limit -> budget -> graph -> audit log
     answer_cache.py               # per-channel TTL+LRU cache of full answers
     clarification_cache.py         # per-(channel,user) "we asked a follow-up" cache
+    conversation_context.py         # per-(channel,user) last resolved_question, for short follow-ups
+    context_switch_cache.py         # per-(channel,user) "should I clear that context?" pending confirmation
     rate_limiter.py                 # per-(channel,user) sliding-window rate limit
   llm/
     gemini_client.py        # Gemini calls: retry/backoff/timeout/thinking-budget/quota
@@ -139,6 +150,18 @@ one enforces, and the tradeoffs behind them.
      `AUDIT_LOG_FILE_BACKUP_COUNT=5`), so they survive a container restart instead of only
      existing in however stdout happens to be captured
      ([app/audit/logger.py](app/audit/logger.py)).
+   - `CONVERSATION_CONTEXT_TTL_SECONDS=300` -- how long a (channel, user)'s last resolved question
+     stays available for the classifier to fold a short follow-up into (e.g. "what about the total
+     amount?"). Same-session, single-turn only, never a growing transcript
+     ([app/rag/conversation_context.py](app/rag/conversation_context.py)) -- not a substitute for
+     long-term/cross-session memory, which is out of scope for now (see
+     [CONTRIBUTING.md](CONTRIBUTING.md)).
+   - `CONTEXT_SWITCH_CONFIRMATION_TTL_SECONDS=120` -- how long the "should I clear that context and
+     answer this as a new question?" prompt stays valid before a later message is treated as an
+     ordinary fresh question instead of a reply to it
+     ([app/rag/context_switch_cache.py](app/rag/context_switch_cache.py)). The reply itself (and
+     the `reset`/`new topic`/`start over`/`forget that` commands) are matched by exact phrase, not
+     sent to Gemini.
 
 3. **Generate a schema summary** so Gemini knows your data's shape:
 

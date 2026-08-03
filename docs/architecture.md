@@ -23,6 +23,8 @@ graph TD
     Pipeline --> RateLimiter[app/rag/rate_limiter.py<br/>per-(channel,user) sliding window<br/>checked before any Gemini/Mongo work]
     Pipeline --> Quota[app/llm/quota.py<br/>quota_tracker -- shared daily budget]
     Pipeline --> ClarificationCache[app/rag/clarification_cache.py<br/>per-(channel,user) pending-clarification state]
+    Pipeline --> ConversationContext[app/rag/conversation_context.py<br/>per-(channel,user) last resolved_question<br/>only read when no clarification is pending]
+    Pipeline --> ContextSwitch[app/rag/context_switch_cache.py<br/>per-(channel,user) pending "should I clear<br/>that context?" confirmation]
     Pipeline --> Graph[app/agents/graph.py<br/>build_graph / graph.invoke<br/>-- see detail below]
     Pipeline --> Audit[app/audit/logger.py<br/>log_query_event + timings]
 
@@ -90,7 +92,8 @@ then synthesizes one answer from every domain's rows:
 graph TD
     START --> classify[classify<br/>classify_question -> Classification]
     classify -->|low confidence, no domain,<br/>or model asked to clarify| clarify[clarify] --> END1[END]
-    classify -->|confident| resolve_anchors[resolve_anchors<br/>only does real work for<br/>"vendors near &lt;customer&gt;[, with pending orders]"]
+    classify -->|context_mode=="new_topic" AND<br/>a previous_question is live| confirm[confirm_context_switch<br/>asks before discarding it -- no query yet] --> END3[END]
+    classify -->|confident, and either on-topic<br/>or nothing live to discard| resolve_anchors[resolve_anchors<br/>only does real work for<br/>"vendors near &lt;customer&gt;[, with pending orders]"]
     resolve_anchors -->|Send, one per classified domain,<br/>capped at AGENT_MAX_FAN_OUT| domain_agent["domain_agent (x N, parallel)"]
     domain_agent --> synthesize[synthesize] --> END2[END]
 ```
@@ -98,10 +101,35 @@ graph TD
 - **classify** (`_classify_node` / `classify_question`): a cheap, narrow, enum-constrained call —
   the model only ever names a domain from `DOMAIN_NAMES`, never a raw collection or field, so a
   hallucinated domain fails Pydantic validation rather than being silently accepted. Also creates
-  `spec_cache: {}` in state (see the dedup note below).
+  `spec_cache: {}` in state (see the dedup note below). If `state["previous_question"]` is set (the
+  last resolved question for this (channel, user), from `app/rag/conversation_context.py`), the
+  same call also decides `Classification.context_mode` — `"new_topic"` or `"followup"` — and, if
+  `"followup"`, rewrites the question into a self-contained `Classification.resolved_question`
+  that folds in only what's needed from the previous turn (e.g. "what about the total amount?"
+  after "how many orders did vendor V1 have last week?" becomes "what is the total amount of
+  orders vendor V1 had last week?"). `resolved_question` is written into `state["resolved_question"]`
+  and every node from here on (`resolve_anchors`, `domain_agent` generation, `synthesize`) works
+  against it instead of the raw `question` — see `_effective_question()`. This piggybacks on the
+  classify call that already runs on every message, so an unrelated question with nothing live to
+  discard costs nothing beyond the classify prompt's fixed few-shot examples: no extra Gemini call,
+  and downstream stages see exactly what they would have without this feature. (When context *is*
+  live, see **confirm_context_switch** below — that question isn't answered immediately either
+  way.)
 - **clarify** (`_route_after_classify` / `_clarify_node`): routed here if `confidence` is below
   `AGENT_CLASSIFIER_MIN_CONFIDENCE`, no domain was named, or the classifier itself asked a
   clarifying question (e.g. a geo question with no location given).
+- **confirm_context_switch** (`_route_after_classify` / `_confirm_context_switch_node`): routed
+  here — checked *after* the clarify conditions above, so a low-confidence/ambiguous question still
+  goes to `clarify`, not this — when `Classification.context_mode == "new_topic"` **and**
+  `state["previous_question"]` is set. Rather than silently discarding that context (or asking a
+  fresh query for something that might have been the wrong call), it sets `answer` to a yes/no
+  confirmation prompt and `needs_context_confirmation: True`, and ends the graph immediately — no
+  query generated, no `generate_answer` call. `app/rag/pipeline.py` parks the candidate question in
+  `context_switch_cache` and interprets the *next* message deterministically (no Gemini call) as
+  yes / no / neither — see that module's docstring for the full reply-handling contract. Only
+  reachable when there's actually something live to discard; with no `previous_question` a
+  `"new_topic"` question goes straight to `resolve_anchors` exactly as it did before this feature
+  existed.
 - **resolve_anchors** (`_resolve_anchors_node`): a no-op for every question shape except the one
   named cross-domain pattern — "vendors near a customer[, with pending orders]". For that shape
   only: resolves the named customer's coordinates (a real `customers` domain query, not a
@@ -163,6 +191,8 @@ sequenceDiagram
     participant RL as rate_limiter
     participant Q as quota_tracker
     participant CC as clarification_cache
+    participant CX as conversation_context_cache
+    participant SW as context_switch_cache
     participant G as agent graph (app/agents/graph.py)
     participant L as audit.log_query_event
 
@@ -177,6 +207,30 @@ sequenceDiagram
         AC-->>H: True
         H->>H: strip/validate question text
         H->>P: answer_question(question, user_id=, channel_id=)
+        alt question is an exact-match reset phrase ("reset"/"new topic"/"start over"/"forget that")
+            P->>CC: clarification_cache.clear(...)
+            P->>CX: conversation_context_cache.clear(...)
+            P->>SW: context_switch_cache.clear(...)
+            P->>L: log_query_event(error="context_reset")
+            P-->>H: "Got it -- I've cleared our conversation context..." (no Gemini call)
+        else not a reset phrase
+        P->>SW: context_switch_cache.get((channel_id, user_id))
+        alt a confirmation is pending
+            Note over SW: the *previous* answer asked "should I clear that context and answer this as a new question?" -- interpret this message as the reply, not a fresh question (still no Gemini call either way)
+            alt exact-match yes
+                P->>SW: context_switch_cache.clear(...)
+                P->>CX: conversation_context_cache.clear(...)
+                Note over P: question is replaced with the parked candidate_question and flows into the normal path below, as a clean standalone question
+            else exact-match no
+                P->>SW: context_switch_cache.clear(...)
+                P->>L: log_query_event(error="context_switch_declined")
+                P-->>H: "Okay, sticking with our current conversation -- go ahead." (no Gemini call)
+            else neither
+                P->>SW: context_switch_cache.clear(...)
+                P->>CX: conversation_context_cache.clear(...)
+                Note over P: stale prompt AND stale context both dropped -- this message is judged fresh, on its own, below
+            end
+        end
         P->>AN: answer_cache.get(channel_id, question)
         alt cache hit
             AN-->>P: CachedResult
@@ -200,8 +254,13 @@ sequenceDiagram
                     Q-->>P: False
                     P->>CC: clarification_cache.get((channel_id, user_id))
                     Note over CC: a pending entry means the *previous* answer was itself a clarifying question -- this message is merged with the original as one "effective_question"
-                    P->>G: graph.invoke({question: effective_question, user_id, channel_id})
-                    Note over G: classify -> resolve_anchors -> fan out to domain_agent (parallel) -> synthesize -- see "The agent graph in detail" above. Internally: Gemini calls go through GeminiClient -> circuit_breaker.before_call() -> quota_tracker.record_call() -> retry/backoff -> the Gemini API.
+                    alt no clarification pending
+                        P->>CX: conversation_context_cache.get((channel_id, user_id))
+                        Note over CX: the last turn's *resolved* question, if any and not yet expired -- skipped entirely when a clarification is pending, so the two context mechanisms never stack
+                        CX-->>P: previous_question (or None)
+                    end
+                    P->>G: graph.invoke({question: effective_question, previous_question, user_id, channel_id})
+                    Note over G: classify (also decides context_mode/resolved_question from previous_question) -> resolve_anchors -> fan out to domain_agent (parallel) -> synthesize -- see "The agent graph in detail" above. Internally: Gemini calls go through GeminiClient -> circuit_breaker.before_call() -> quota_tracker.record_call() -> retry/backoff -> the Gemini API.
                     alt graph.invoke raises
                         G-->>P: exception
                         alt CircuitBreakerOpenError
@@ -222,15 +281,22 @@ sequenceDiagram
                             P-->>H: the clarifying question, verbatim
                         end
                         P->>L: log_query_event(error="clarification_needed")
+                    else needs_context_confirmation
+                        G-->>P: {answer, needs_context_confirmation: true}
+                        Note over G: confirm_context_switch node -- no query was generated for this question
+                        P->>SW: context_switch_cache.set((channel_id, user_id), candidate_question=effective_question)
+                        P->>L: log_query_event(error="context_switch_confirmation_needed")
                     else answered
-                        G-->>P: {answer, specs_by_domain, rows_by_domain, errors_by_domain, out_of_scope_by_domain, timings}
+                        G-->>P: {answer, resolved_question, specs_by_domain, rows_by_domain, errors_by_domain, out_of_scope_by_domain, timings}
                         P->>CC: clarification_cache.clear(...)
+                        P->>CX: conversation_context_cache.set((channel_id, user_id), resolved_question)
                         P->>L: log_query_event(specs=, row_count=, errors_by_domain=, answer=, timings=)
                         P->>AN: answer_cache.set(cache_key, answer)
                         P-->>H: answer text
                     end
                 end
             end
+        end
         end
         H-->>User: respond(answer)
     end
@@ -296,7 +362,8 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/rag/pipeline.py` — the orchestrator
 | Function | Does |
 |---|---|
-| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: **answer_cache check first** (a hit returns immediately, before `gemini` is even constructed) → **rate_limiter check** (before any Gemini/Mongo work, so a cache hit is never penalized) → daily budget check → clarification-cache merge (a pending clarification makes this message a follow-up, not a fresh question) → `graph.invoke(...)` (see "The agent graph in detail") → clarification handling (asks again, or gives up after `AGENT_MAX_CLARIFICATION_ROUNDS`) → audit logging (including per-stage timing and `cache_hit`) → `answer_cache.set(...)` on a real answer. Never raises to the caller — every exit point returns a user-facing string, including `graph.invoke` itself raising (distinguishes `CircuitBreakerOpenError`, a Gemini 429, and everything else into three different friendly messages). Deterministic outcomes are written back into `answer_cache`; transient/infra failures, rate-limit rejections, and budget-exceeded are not. `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
+| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: **exact-match reset phrase check first** (`"reset"`/`"new topic"`/`"start over"`/`"forget that"` — clears all three conversational caches and replies immediately, no Gemini call) → **pending context-switch confirmation check** (deterministic yes/no/neither reply handling, also no Gemini call — see below) → **answer_cache check** (a hit returns immediately, before `gemini` is even constructed) → **rate_limiter check** (before any Gemini/Mongo work, so a cache hit is never penalized) → daily budget check → clarification-cache merge (a pending clarification makes this message a follow-up, not a fresh question) → **conversation-context lookup** (only when no clarification is pending — the last turn's resolved question, if any and unexpired, threaded into the graph as `previous_question` for the classifier to fold in, ignore, or trigger a confirmation over) → `graph.invoke(...)` (see "The agent graph in detail") → clarification handling (asks again, or gives up after `AGENT_MAX_CLARIFICATION_ROUNDS`) → **context-switch-confirmation handling** (parks the candidate question in `context_switch_cache` instead of answering) → `conversation_context_cache.set(...)` with the graph's `resolved_question` → audit logging (including per-stage timing and `cache_hit`) → `answer_cache.set(...)` on a real answer. Never raises to the caller — every exit point returns a user-facing string, including `graph.invoke` itself raising (distinguishes `CircuitBreakerOpenError`, a Gemini 429, and everything else into three different friendly messages). Deterministic outcomes are written back into `answer_cache`; transient/infra failures, rate-limit rejections, budget-exceeded, resets, and context-switch prompts/declines are not. `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
+| `*_normalize_command(question)` / `_is_reset_command` / `_is_affirmative` / `_is_negative` | Exact-match phrase detection (strip/lowercase/trim trailing `!.?`) against `_RESET_PHRASES`/`_AFFIRMATIVE_PHRASES`/`_NEGATIVE_PHRASES` — deliberately not substring/keyword matching or an LLM call, so a real question that happens to contain "reset" or "yes" still reaches the classifier instead of being swallowed. |
 | `*_get_graph(gemini)` | Returns the compiled graph for this `GeminiClient`, building it once via `build_graph(gemini)` and caching by identity in a `WeakKeyDictionary` (not a plain `id()`-keyed dict — a plain dict would return a stale graph, built for a different already-garbage-collected client, once a short-lived client's `id()` gets reused, exactly what happened across the test suite's many stub clients). |
 | `*_timed_stage(timings, name)` | Context manager: records elapsed ms for `name` into `timings` in its `finally` block, which runs as an exception unwinds out of the `with` block — i.e. *before* any enclosing `except` clause (and therefore before `_log`) sees it. This ordering is what makes a failing stage's own duration show up in the audit log for that failure, instead of being silently dropped. |
 | `*_log(**kwargs)` | Local closure inside `answer_question`; fills in `question`/`user_id`/`channel_id`/`duration_ms`/`timings` and calls `log_query_event`. |
@@ -316,6 +383,19 @@ Grouped by module, in call order for a typical successful request. `*` = private
 | `ClarificationCache.get/set/clear` | Same TTL+LRU shape as `answer_cache`, keyed by `(channel_id, user_id)` instead — a clarification round-trip is about one user's specific back-and-forth, not a question shareable across a channel. |
 | `PendingClarification` | Frozen dataclass: `original_question`, `rounds` (how many unresolved clarification round-trips so far, gated by `AGENT_MAX_CLARIFICATION_ROUNDS`). |
 | `clarification_cache` | Module-level singleton, from `settings.clarification_cache_ttl_seconds` (default 300s) / max 500 entries. |
+
+### `app/rag/conversation_context.py`
+| Function | Does |
+|---|---|
+| `ConversationContextCache.get/set/clear` | Same TTL+LRU shape as `answer_cache`/`clarification_cache`, keyed by `(channel_id, user_id)`. Stores a single `str` — the previous turn's `resolved_question` — never a list or growing transcript; `set` always overwrites, so an unrelated question naturally replaces stale context for the *next* turn instead of it lingering. |
+| `conversation_context_cache` | Module-level singleton, from `settings.conversation_context_ttl_seconds` (default 300s) / max 500 entries. Only consulted by `pipeline.answer_question` when no clarification is pending (see `app/rag/clarification_cache.py`, which already carries context forward its own way for that case). |
+
+### `app/rag/context_switch_cache.py`
+| Function | Does |
+|---|---|
+| `ContextSwitchCache.get/set/clear` | Same TTL+LRU shape as the other per-conversation caches, keyed by `(channel_id, user_id)`. Holds the *candidate* question the classifier decided looked unrelated to still-live context — parked here, unanswered, until the user's next message resolves it (yes/no/neither, matched deterministically in `pipeline.py`, no Gemini call to interpret the reply). |
+| `PendingContextSwitch` | Frozen dataclass: `candidate_question` — the question that would have been asked next, had it been confirmed. |
+| `context_switch_cache` | Module-level singleton, from `settings.context_switch_confirmation_ttl_seconds` (default 120s) / max 500 entries. Deliberately a shorter TTL than `conversation_context_cache` — this is "waiting on an active yes/no reply right now," not general conversational memory. |
 
 ### `app/rag/rate_limiter.py`
 | Function | Does |
@@ -354,8 +434,8 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/agents/classifier.py`
 | Function | Does |
 |---|---|
-| `classify_question(gemini, question)` | Enum-constrained structured call: the model names zero or more domains from `DOMAIN_NAMES` (never a raw collection/field), plus `needs_geo`, `confidence`, and an optional `clarification_question`. Deliberately narrow — never sees per-domain schema detail, only domain names, so it stays fast and isn't itself a source of field-level hallucination. |
-| `Classification` | Pydantic model: `domains: list[DomainName]`, `needs_geo: bool`, `confidence: float`, `clarification_question: str \| None`. |
+| `classify_question(gemini, question, previous_question=None)` | Enum-constrained structured call: the model names zero or more domains from `DOMAIN_NAMES` (never a raw collection/field), plus `needs_geo`, `confidence`, an optional `clarification_question`, and (see below) `context_mode`/`resolved_question`. Deliberately narrow — never sees per-domain schema detail, only domain names, so it stays fast and isn't itself a source of field-level hallucination. When `previous_question` is given (from `app/rag/conversation_context.py`), it's shown to the model as one extra prompt line; when omitted, the prompt is unchanged from before this parameter existed. Backfills `resolved_question` to `question` if the model leaves it blank. |
+| `Classification` | Pydantic model: `domains: list[DomainName]`, `needs_geo: bool`, `confidence: float`, `clarification_question: str \| None`, `context_mode: Literal["new_topic", "followup"]` (default `"new_topic"`), `resolved_question: str` (default `""`, backfilled by `classify_question`). `context_mode` is `"followup"` only when the current question can't stand on its own without `previous_question` (no subject of its own, "what about...", a different aggregate of the same thing just asked about); `resolved_question` is the question verbatim for `"new_topic"`, or a self-contained rewrite folding in just what's needed from `previous_question` for `"followup"` — never a growing transcript, always exactly one turn's worth of prior context. |
 
 ### `app/agents/domains.py` — the domain registry
 | Function | Does |
@@ -372,12 +452,19 @@ Grouped by module, in call order for a typical successful request. `*` = private
 
 ### `app/agents/graph.py` and `app/agents/state.py`
 See ["The agent graph in detail"](#the-agent-graph-in-detail) above for the full node-by-node
-breakdown (`_classify_node`, `_resolve_anchors_node`, `_fan_out`/`_domain_agent_node`,
-`_synthesize_node`, and the `spec_cache` dedup). `GraphState` (a `TypedDict`) is the graph's
-schema; fields without an `Annotated` reducer are "last write wins," fields with
-`Annotated[..., _merge_dicts]` (`specs_by_domain`, `rows_by_domain`, `out_of_scope_by_domain`,
-`errors_by_domain`, `timings`) accumulate across the parallel `domain_agent` fan-out instead of
-one overwriting another.
+breakdown (`_classify_node`, `_confirm_context_switch_node`, `_resolve_anchors_node`,
+`_fan_out`/`_domain_agent_node`, `_synthesize_node`, and the `spec_cache` dedup). `GraphState` (a
+`TypedDict`) is the graph's schema; fields without an `Annotated` reducer are "last write wins,"
+fields with `Annotated[..., _merge_dicts]` (`specs_by_domain`, `rows_by_domain`,
+`out_of_scope_by_domain`, `errors_by_domain`, `timings`) accumulate across the parallel
+`domain_agent` fan-out instead of one overwriting another. `previous_question` (input, optional)
+and `resolved_question` (written once by `_classify_node`) are both plain last-write-wins fields;
+`*_effective_question(state)` returns `resolved_question` if set, else the raw `question`, and is
+what `_resolve_anchors_node`, `_fan_out`, and `_synthesize_node` all call instead of reading
+`state["question"]` directly. `needs_context_confirmation` (set only by
+`_confirm_context_switch_node`) mirrors `needs_clarification`'s shape and is mutually exclusive
+with it — `_route_after_classify` picks at most one of `clarify` / `confirm_context_switch` /
+`resolve_anchors` per invocation.
 
 ### `app/rag/schema_context.py`
 | Function | Does |

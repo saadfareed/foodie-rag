@@ -21,7 +21,42 @@ from app.llm.gemini_client import GeminiClient, is_rate_limited
 from app.llm.quota import quota_tracker
 from app.rag.answer_cache import CachedResult, answer_cache
 from app.rag.clarification_cache import PendingClarification, clarification_cache
+from app.rag.context_switch_cache import PendingContextSwitch, context_switch_cache
+from app.rag.conversation_context import conversation_context_cache
 from app.rag.rate_limiter import rate_limiter
+
+
+def _normalize_command(question: str) -> str:
+    return question.strip().lower().rstrip("!.?")
+
+
+# Exact-match phrases (after _normalize_command) that clear this user's conversational state
+# instead of being treated as a question -- deterministic, no Gemini call, so it's checked before
+# even the answer_cache and doesn't spend rate-limit/quota budget. Deliberately exact-match, not a
+# substring/keyword search: a real question that happens to contain the word "reset" (e.g. "how
+# many orders did we reset last week?") must still reach the classifier, not be swallowed by this.
+_RESET_PHRASES = frozenset({"reset", "new topic", "start over", "forget that"})
+
+# Replies to the "should I clear that context?" prompt (app/agents/graph.py's
+# confirm_context_switch node) -- matched the same deterministic, exact-match way as the reset
+# phrases above, so interpreting a yes/no never costs a Gemini call either.
+_AFFIRMATIVE_PHRASES = frozenset(
+    {"yes", "y", "yeah", "yep", "sure", "go ahead", "confirm", "correct"}
+)
+_NEGATIVE_PHRASES = frozenset({"no", "n", "nope", "cancel", "nevermind", "never mind"})
+
+
+def _is_reset_command(question: str) -> bool:
+    return _normalize_command(question) in _RESET_PHRASES
+
+
+def _is_affirmative(question: str) -> bool:
+    return _normalize_command(question) in _AFFIRMATIVE_PHRASES
+
+
+def _is_negative(question: str) -> bool:
+    return _normalize_command(question) in _NEGATIVE_PHRASES
+
 
 # Compiling a StateGraph isn't free (~10ms) and the graph's structure only depends on which
 # GeminiClient instance it closes over, not on any per-question state -- production always
@@ -75,6 +110,54 @@ def answer_question(
             **kwargs,
         )
 
+    if _is_reset_command(question):
+        # Ahead of answer_cache deliberately -- caching this reply would mean a second "reset"
+        # from a different user in the same channel gets served the confirmation text without
+        # actually clearing *their* clarification/context state (both caches are keyed by
+        # (channel_id, user_id), not shared per-channel like answer_cache is).
+        clarification_cache.clear(clarification_cache.make_key(channel_id, user_id))
+        conversation_context_cache.clear(conversation_context_cache.make_key(channel_id, user_id))
+        context_switch_cache.clear(context_switch_cache.make_key(channel_id, user_id))
+        answer = (
+            "Got it -- I've cleared our conversation context. Ask me something new whenever "
+            "you're ready."
+        )
+        _log(error="context_reset", answer=answer)
+        return answer
+
+    # A pending confirmation means the *previous* answer asked "should I clear that context and
+    # answer this as a new question?" (app/agents/graph.py's confirm_context_switch node) --
+    # interpret this message as the reply, not a fresh question. Checked before answer_cache for
+    # the same reason as the reset command above: deterministic, no Gemini call, must not be
+    # cached, and must not miss a per-user reply because someone else's identical-text question
+    # was cached first.
+    switch_key = context_switch_cache.make_key(channel_id, user_id)
+    pending_switch = context_switch_cache.get(switch_key)
+    if pending_switch is not None:
+        if _is_affirmative(question):
+            # Confirmed -- drop the stale context and answer the original candidate question as
+            # a clean, standalone question (previous_question stays unset below).
+            context_switch_cache.clear(switch_key)
+            conversation_context_cache.clear(
+                conversation_context_cache.make_key(channel_id, user_id)
+            )
+            question = pending_switch.candidate_question
+        elif _is_negative(question):
+            context_switch_cache.clear(switch_key)
+            answer = "Okay, sticking with our current conversation -- go ahead."
+            _log(error="context_switch_declined", answer=answer)
+            return answer
+        else:
+            # Neither a clear yes nor no -- the user moved on without answering, so whatever
+            # context prompted the question is already stale. Drop both the pending prompt and
+            # the old context (rather than just the prompt) so this message is judged purely on
+            # its own merits instead of risking a second confirmation chained off context the
+            # user never actually confirmed keeping.
+            context_switch_cache.clear(switch_key)
+            conversation_context_cache.clear(
+                conversation_context_cache.make_key(channel_id, user_id)
+            )
+
     cache_key = answer_cache.make_key(channel_id, question)
     cached = answer_cache.get(cache_key)
     if cached is not None:
@@ -106,11 +189,25 @@ def answer_question(
     pending = clarification_cache.get(clarification_key)
     effective_question = f"{pending.original_question} {question}".strip() if pending else question
 
+    # Only consulted on a fresh (non-clarification) message -- a pending clarification already
+    # has its own, more direct way of carrying context forward (the merge above), so checking
+    # both would be redundant. This is the previous turn's *resolved* question, not raw chat
+    # history (see app/rag/conversation_context.py); app/agents/classifier.py decides per-message
+    # whether the current question actually needs it (Classification.context_mode), so an
+    # unrelated question here costs nothing beyond this cache lookup.
+    context_key = conversation_context_cache.make_key(channel_id, user_id)
+    previous_question = None if pending else conversation_context_cache.get(context_key)
+
     graph = _get_graph(gemini)
     try:
         with _timed_stage(timings, "graph_ms"):
             result = graph.invoke(
-                {"question": effective_question, "user_id": user_id, "channel_id": channel_id}
+                {
+                    "question": effective_question,
+                    "previous_question": previous_question,
+                    "user_id": user_id,
+                    "channel_id": channel_id,
+                }
             )
     except Exception as exc:
         if isinstance(exc, CircuitBreakerOpenError):
@@ -142,7 +239,24 @@ def answer_question(
         _log(error="clarification_needed", answer=answer)
         return answer
 
+    if result.get("needs_context_confirmation"):
+        # The classifier decided this message doesn't fit the still-live context but didn't
+        # discard it -- park the candidate question until the reply comes in (see the
+        # pending_switch handling above), instead of answering or touching
+        # conversation_context_cache yet.
+        context_switch_cache.set(
+            switch_key, PendingContextSwitch(candidate_question=effective_question)
+        )
+        _log(error="context_switch_confirmation_needed", answer=answer)
+        return answer
+
     clarification_cache.clear(clarification_key)
+    # Stores resolved_question (the context-folded rewrite when this was itself a follow-up, or
+    # just the question verbatim otherwise) -- never a growing transcript, so a chain of
+    # follow-ups never costs more than one prior turn's text on the next classify call.
+    conversation_context_cache.set(
+        context_key, result.get("resolved_question") or effective_question
+    )
 
     specs = list(result.get("specs_by_domain", {}).values())
     row_count = sum(len(rows) for rows in result.get("rows_by_domain", {}).values())

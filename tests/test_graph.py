@@ -52,6 +52,169 @@ def test_single_domain_question_returns_a_synthesized_answer(monkeypatch):
     assert not result.get("needs_clarification")
 
 
+def test_followup_classification_threads_resolved_question_to_generation_and_synthesis(
+    monkeypatch,
+):
+    """When classify returns context_mode="followup" with a rewritten resolved_question, every
+    downstream node (domain agent generation, synthesize) must generate/answer against that
+    rewrite -- not the raw, potentially incomplete fragment in state["question"]."""
+    seen_generation_prompts = []
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(
+                domains=["orders"],
+                needs_geo=False,
+                confidence=0.9,
+                context_mode="followup",
+                resolved_question="what is the total amount of orders vendor V1 had last week?",
+            )
+
+        def generate_structured_or_error(self, prompt, schema):
+            seen_generation_prompts.append(prompt)
+            return QuerySpec(collection="orders", operation="find")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            return f"answered: {question}"
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(orders=_FakeCollection([{"amount": 10}])),
+    )
+
+    app = build_graph(StubGemini())
+    result = app.invoke(
+        _base_state(
+            "what about the total amount?",
+            previous_question="how many orders did vendor V1 have last week?",
+        )
+    )
+
+    resolved = "what is the total amount of orders vendor V1 had last week?"
+    assert result["resolved_question"] == resolved
+    assert result["answer"] == f"answered: {resolved}"
+    assert any(resolved in prompt for prompt in seen_generation_prompts)
+
+
+def test_new_topic_classification_leaves_resolved_question_equal_to_the_question(monkeypatch):
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=["orders"], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            return QuerySpec(collection="orders", operation="find")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            return f"answered: {question}"
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(orders=_FakeCollection([{"amount": 10}])),
+    )
+
+    app = build_graph(StubGemini())
+    result = app.invoke(_base_state("how many orders"))
+
+    assert result["resolved_question"] == "how many orders"
+    assert result["answer"] == "answered: how many orders"
+
+
+def test_new_topic_with_live_previous_question_routes_to_confirm_context_switch(monkeypatch):
+    """context_mode == "new_topic" alone isn't enough to trigger a confirmation -- it only fires
+    when there's actual prior context (state["previous_question"]) that would otherwise be
+    silently discarded. No query should be generated and no answer synthesized for the candidate
+    question until the user confirms."""
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=["orders"], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            raise AssertionError("no query should be generated before confirmation")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            raise AssertionError("no answer should be synthesized before confirmation")
+
+    app = build_graph(StubGemini())
+    result = app.invoke(
+        _base_state(
+            "how many pending orders are there?",
+            previous_question="how many orders did vendor V1 have last week?",
+        )
+    )
+
+    assert result["needs_context_confirmation"] is True
+    assert not result.get("needs_clarification")
+    assert "how many orders did vendor V1 have last week?" in result["answer"]
+    assert "yes" in result["answer"].lower() and "no" in result["answer"].lower()
+    assert not result.get("rows_by_domain")
+
+
+def test_new_topic_without_a_previous_question_answers_normally(monkeypatch):
+    """The default, no-context case: context_mode == "new_topic" with nothing live to discard
+    (state["previous_question"] unset) must go straight through to a real answer, exactly as
+    before this feature existed."""
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=["orders"], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            return QuerySpec(collection="orders", operation="find")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            return "answered"
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(orders=_FakeCollection([{"amount": 10}])),
+    )
+
+    app = build_graph(StubGemini())
+    result = app.invoke(_base_state("how many orders"))
+
+    assert not result.get("needs_context_confirmation")
+    assert result["answer"] == "answered"
+
+
+def test_followup_with_live_previous_question_skips_confirmation(monkeypatch):
+    """context_mode == "followup" must never route to confirm_context_switch, regardless of
+    previous_question being set -- that's precisely the case this whole feature answers directly
+    instead of discarding."""
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(
+                domains=["orders"],
+                needs_geo=False,
+                confidence=0.9,
+                context_mode="followup",
+                resolved_question="what is the total amount of orders vendor V1 had last week?",
+            )
+
+        def generate_structured_or_error(self, prompt, schema):
+            return QuerySpec(collection="orders", operation="find")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            return "answered"
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(orders=_FakeCollection([{"amount": 10}])),
+    )
+
+    app = build_graph(StubGemini())
+    result = app.invoke(
+        _base_state(
+            "what about the total amount?",
+            previous_question="how many orders did vendor V1 have last week?",
+        )
+    )
+
+    assert not result.get("needs_context_confirmation")
+    assert result["answer"] == "answered"
+
+
 def test_low_confidence_classification_routes_to_clarify(monkeypatch):
     class StubGemini:
         def generate_structured(self, prompt, schema):

@@ -1,12 +1,15 @@
-"""LangGraph state machine: classify -> clarify | resolve cross-domain anchors -> fan out to
-per-domain agents -> validate -> execute -> synthesize.
+"""LangGraph state machine: classify -> clarify | confirm a context switch | resolve cross-domain
+anchors -> fan out to per-domain agents -> validate -> execute -> synthesize.
 
     question
        |
        v
     [classify] --confidence too low, no domain, or model asked for clarification--> [clarify] -> END
        |
-       v (confident)
+       |--context_mode=="new_topic" AND a previous_question is still live-->
+       |     [confirm_context_switch] -- asks the user to confirm before discarding that context;
+       |                                 no LLM call, no query generated yet -> END
+       v (confident, and either on-topic or nothing live to discard)
     [resolve_anchors] -- only does real work for "vendors near <customer>[, with pending
        |                  orders]": resolves the named customer's coordinates (and, if orders
        |                  is also in play, which vendors are nearby) *in code*, not by asking a
@@ -143,18 +146,31 @@ def _generate_validate_execute(
 def _classify_node(gemini: GeminiClient):
     def node(state: GraphState) -> dict:
         start = time.perf_counter()
-        classification = classify_question(gemini, state["question"])
+        classification = classify_question(
+            gemini, state["question"], previous_question=state.get("previous_question")
+        )
         elapsed = round((time.perf_counter() - start) * 1000, 2)
         # Created once here (the first node every invocation passes through) so it exists in
         # state by the time _resolve_anchors_node and the fanned-out domain_agent nodes run --
-        # see _generate_validate_execute's spec_cache parameter above.
+        # see _generate_validate_execute's spec_cache parameter above. resolved_question is set
+        # here too (see _effective_question below) so every downstream node generates/answers
+        # against the context-folded question rather than the raw fragment when this turn was a
+        # follow-up.
         return {
             "classification": classification,
+            "resolved_question": classification.resolved_question,
             "spec_cache": {},
             "timings": {"classify_ms": elapsed},
         }
 
     return node
+
+
+def _effective_question(state: GraphState) -> str:
+    """The question every node past classify should actually generate/answer against --
+    resolved_question when classify has run (always set by _classify_node), the raw question as
+    a defensive fallback otherwise."""
+    return state.get("resolved_question") or state["question"]
 
 
 def _route_after_classify(state: GraphState) -> str:
@@ -163,6 +179,13 @@ def _route_after_classify(state: GraphState) -> str:
         return "clarify"
     if c.clarification_question:
         return "clarify"
+    # A previous turn's context is still live (state["previous_question"], from
+    # app/rag/conversation_context.py) but classify decided *this* message doesn't need it --
+    # rather than silently discarding that context, ask before answering. Only reachable when
+    # previous_question is actually set: with nothing live to discard, a "new_topic" question is
+    # just an ordinary question and goes straight to resolve_anchors as before.
+    if c.context_mode == "new_topic" and state.get("previous_question"):
+        return "confirm_context_switch"
     return "resolve_anchors"
 
 
@@ -174,6 +197,17 @@ def _clarify_node(state: GraphState) -> dict:
     }
 
 
+def _confirm_context_switch_node(state: GraphState) -> dict:
+    previous = state.get("previous_question", "")
+    return {
+        "answer": (
+            f'That looks unrelated to what we were just discussing ("{previous}") -- should I '
+            "clear that context and answer this as a new question? Reply yes or no."
+        ),
+        "needs_context_confirmation": True,
+    }
+
+
 def _resolve_anchors_node(gemini: GeminiClient):
     def node(state: GraphState) -> dict:
         classification: Classification = state["classification"]
@@ -181,7 +215,7 @@ def _resolve_anchors_node(gemini: GeminiClient):
         if not (classification.needs_geo and "vendors" in domains):
             return {}
 
-        question = state["question"]
+        question = _effective_question(state)
         spec_cache = state.get("spec_cache")
         timings: dict[str, float] = {}
         update: dict = {}
@@ -229,7 +263,7 @@ def _fan_out(state: GraphState) -> list[Send]:
     sends = []
     for domain_name in domains:
         payload: dict = {
-            "question": state["question"],
+            "question": _effective_question(state),
             "domain": domain_name,
             # Shared with _resolve_anchors_node so a domain already queried while resolving a
             # cross-domain anchor (customers/vendors, in the geo composite pattern) doesn't pay
@@ -316,7 +350,9 @@ def _synthesize_node(gemini: GeminiClient):
                 answer = "I didn't find any data matching that question."
         else:
             skipped = {**out_of_scope_by_domain, **errors_by_domain}
-            answer = gemini.generate_answer(state["question"], rows_by_domain, skipped or None)
+            answer = gemini.generate_answer(
+                _effective_question(state), rows_by_domain, skipped or None
+            )
 
         elapsed = round((time.perf_counter() - start) * 1000, 2)
         return {"answer": answer, "timings": {"synthesize_ms": elapsed}}
@@ -328,13 +364,19 @@ def build_graph(gemini: GeminiClient):
     graph = StateGraph(GraphState)
     graph.add_node("classify", _classify_node(gemini))
     graph.add_node("clarify", _clarify_node)
+    graph.add_node("confirm_context_switch", _confirm_context_switch_node)
     graph.add_node("resolve_anchors", _resolve_anchors_node(gemini))
     graph.add_node("domain_agent", _domain_agent_node(gemini))
     graph.add_node("synthesize", _synthesize_node(gemini))
 
     graph.add_edge(START, "classify")
-    graph.add_conditional_edges("classify", _route_after_classify, ["clarify", "resolve_anchors"])
+    graph.add_conditional_edges(
+        "classify",
+        _route_after_classify,
+        ["clarify", "confirm_context_switch", "resolve_anchors"],
+    )
     graph.add_edge("clarify", END)
+    graph.add_edge("confirm_context_switch", END)
     graph.add_conditional_edges("resolve_anchors", _fan_out, ["domain_agent"])
     graph.add_edge("domain_agent", "synthesize")
     graph.add_edge("synthesize", END)
