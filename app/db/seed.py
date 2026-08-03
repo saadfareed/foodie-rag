@@ -10,7 +10,13 @@ Payment mapping (confirmed against real data):
 `payby` breaks the order amount down by the component method(s) that paid it,
 e.g. {"cash": 100} or {"wallet": 40, "card": 60}; its values always sum to `amount`.
 
+Each order also gets a customer_id/vendor_id referencing users.user_id (see
+app/db/seed_users.py), so cross-domain questions like "vendors near a customer with pending
+orders" have real fields to join on. Run seed_users FIRST -- this reads the live `users`
+collection for its pool of customer/vendor ids and fails clearly if it's empty.
+
 Usage:
+    python -m app.db.seed_users
     python -m app.db.seed [--count-per-method 6]
 """
 
@@ -18,6 +24,7 @@ import argparse
 import random
 from datetime import datetime, timedelta, timezone
 
+from app.db.indexes import ensure_indexes
 from app.db.mongo import get_db
 
 PAYMENT_METHOD_MAP: dict[str, tuple[int, bool]] = {
@@ -55,7 +62,12 @@ def build_payby(payment_method: str, amount: float, rng: random.Random) -> dict[
     return {"wallet": wallet_part, other_key: other_part}
 
 
-def generate_sample_orders(count_per_method: int = 6, seed: int | None = 42) -> list[dict]:
+def generate_sample_orders(
+    customer_ids: list[str],
+    vendor_ids: list[str],
+    count_per_method: int = 6,
+    seed: int | None = 42,
+) -> list[dict]:
     rng = random.Random(seed)  # nosec B311 - non-cryptographic demo data, seeded for reproducibility
     now = datetime.now(timezone.utc)
     orders: list[dict] = []
@@ -68,6 +80,8 @@ def generate_sample_orders(count_per_method: int = 6, seed: int | None = 42) -> 
             orders.append(
                 {
                     "order_id": f"ORD-{order_seq:05d}",
+                    "customer_id": rng.choice(customer_ids),
+                    "vendor_id": rng.choice(vendor_ids),
                     "amount": amount,
                     "payment_method": payment_method,
                     "onlinepaymentmethod": onlinepaymentmethod,
@@ -84,10 +98,19 @@ def generate_sample_orders(count_per_method: int = 6, seed: int | None = 42) -> 
 
 def seed_orders(count_per_method: int = 6, clear_existing: bool = True) -> int:
     db = get_db()
+    customer_ids = db["users"].distinct("user_id", {"usertype": 1})
+    vendor_ids = db["users"].distinct("user_id", {"usertype": 2})
+    if not customer_ids or not vendor_ids:
+        raise RuntimeError(
+            "No customers/vendors found in 'users' -- run `python -m app.db.seed_users` first "
+            "so orders have real customer_id/vendor_id values to reference."
+        )
+
     if clear_existing:
         db["orders"].delete_many({})
-    orders = generate_sample_orders(count_per_method)
+    orders = generate_sample_orders(customer_ids, vendor_ids, count_per_method)
     result = db["orders"].insert_many(orders)
+    ensure_indexes(db)
     return len(result.inserted_ids)
 
 

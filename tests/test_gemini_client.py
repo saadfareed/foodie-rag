@@ -1,8 +1,19 @@
 import json
 
 import pytest
+from google.genai import errors
+from pydantic import BaseModel
 
 from app.llm.gemini_client import GeminiClient, _extract_json, _rows_for_prompt
+from app.rag.query_spec import QuerySpec
+
+
+def _rate_limit_error() -> errors.ClientError:
+    return errors.ClientError(429, {"error": {"message": "quota exceeded"}})
+
+
+def _model_not_found_error() -> errors.ClientError:
+    return errors.ClientError(404, {"error": {"message": "no longer available to new users"}})
 
 
 def test_extract_json_raises_clearly_on_truncated_response():
@@ -18,36 +29,51 @@ def test_extract_json_raises_clearly_on_truncated_response():
 
 
 def test_rows_for_prompt_passes_small_row_sets_through_unmodified():
-    rows = [{"amount": 1}, {"amount": 2}]
+    rows_by_domain = {"orders": [{"amount": 1}, {"amount": 2}]}
 
-    result = _rows_for_prompt(rows, max_rows=30)
+    result = _rows_for_prompt(rows_by_domain, max_rows=30)
 
-    assert json.loads(result) == rows
+    assert json.loads(result) == rows_by_domain
     assert "omitted" not in result
 
 
-def test_rows_for_prompt_truncates_and_notes_omitted_count():
-    rows = [{"i": i} for i in range(50)]
+def test_rows_for_prompt_truncates_per_domain_and_notes_omitted_count():
+    rows_by_domain = {"orders": [{"i": i} for i in range(50)]}
 
-    result = _rows_for_prompt(rows, max_rows=30)
+    result = _rows_for_prompt(rows_by_domain, max_rows=30)
 
     assert "20 more row(s) omitted" in result
-    kept_json = result.split("\n(...")[0]
-    assert json.loads(kept_json) == rows[:30]
+    parsed = json.loads(result)
+    assert parsed["orders"][:30] == rows_by_domain["orders"][:30]
 
 
 def test_rows_for_prompt_boundary_equal_to_max_is_not_truncated():
-    rows = [{"i": i} for i in range(30)]
+    rows_by_domain = {"orders": [{"i": i} for i in range(30)]}
 
-    result = _rows_for_prompt(rows, max_rows=30)
+    result = _rows_for_prompt(rows_by_domain, max_rows=30)
 
     assert "omitted" not in result
-    assert json.loads(result) == rows
+    assert json.loads(result) == rows_by_domain
+
+
+def test_rows_for_prompt_caps_each_domain_independently():
+    """One chatty domain shouldn't crowd another out of the prompt -- the cap applies per
+    domain, not to the combined total."""
+    rows_by_domain = {"orders": [{"i": i} for i in range(50)], "vendors": [{"i": 1}]}
+
+    result = _rows_for_prompt(rows_by_domain, max_rows=30)
+    parsed = json.loads(result)
+
+    assert parsed["vendors"] == [{"i": 1}]
+    assert "40 more row(s) omitted" not in result  # only orders was over the cap
+    assert "20 more row(s) omitted" in result
 
 
 def test_generate_answer_uses_configured_row_cap(monkeypatch):
     client = GeminiClient.__new__(GeminiClient)
     client.model_name = "test-model"
+    client.fallback_models = []
+    client._breakers = {}
     client.answer_max_rows = 2
 
     captured = {}
@@ -55,7 +81,7 @@ def test_generate_answer_uses_configured_row_cap(monkeypatch):
     class _FakeResponse:
         text = "  the answer  "
 
-    def fake_call_with_retry(fn):
+    def fake_call_with_retry(fn, breaker=None):
         return fn()
 
     class _FakeModels:
@@ -71,18 +97,76 @@ def test_generate_answer_uses_configured_row_cap(monkeypatch):
     client.client = _FakeClient()
     client._call_with_retry = fake_call_with_retry
 
-    rows = [{"i": i} for i in range(5)]
-    answer = client.generate_answer("how many?", rows)
+    rows_by_domain = {"orders": [{"i": i} for i in range(5)]}
+    answer = client.generate_answer("how many?", rows_by_domain)
 
     assert answer == "the answer"
     assert "3 more row(s) omitted" in captured["contents"]
 
 
-def test_generate_query_spec_uses_low_temperature_json_config(monkeypatch):
-    """Query generation should use a deterministic, JSON-mode config -- narrower output (no
-    prose to regex-parse) and a token cap trim latency on this specific call."""
+def _client_for_answer_prompt_capture():
     client = GeminiClient.__new__(GeminiClient)
     client.model_name = "test-model"
+    client.fallback_models = []
+    client._breakers = {}
+    client.answer_max_rows = 30
+
+    captured = {}
+
+    class _FakeResponse:
+        text = "the answer"
+
+    class _FakeModels:
+        def generate_content(self, model, contents, **kwargs):
+            captured["contents"] = contents
+            return _FakeResponse()
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    client.client = _FakeClient()
+    client._call_with_retry = lambda fn, breaker=None: fn()
+    return client, captured
+
+
+def test_generate_answer_without_skipped_domains_omits_the_note():
+    client, captured = _client_for_answer_prompt_capture()
+
+    client.generate_answer("how many orders?", {"orders": [{"amount": 10}]})
+
+    assert "could not be queried" not in captured["contents"]
+
+
+def test_generate_answer_with_skipped_domains_includes_them_as_context_not_a_verdict():
+    """Regression test for a production bug: a skipped domain used to unconditionally append
+    "(Note: I couldn't query X, so that part may be incomplete.)" to the answer regardless of
+    whether X's data was actually needed -- e.g. a question asking for a per-vendor sum was fully
+    answered using vendor_id from the orders data alone, but the note claimed the answer "may be
+    incomplete" anyway. The skipped-domain reason must be handed to the model as context (so it
+    can judge relevance), not mechanically appended after the fact."""
+    client, captured = _client_for_answer_prompt_capture()
+
+    client.generate_answer(
+        "sum of amount each vendor got?",
+        {"orders": [{"vendor_id": "V1", "total_amount": 10}]},
+        skipped_domains={"vendors": "orders/amounts are outside the vendors schema"},
+    )
+
+    prompt = captured["contents"]
+    assert "vendors" in prompt
+    assert "orders/amounts are outside the vendors schema" in prompt
+    assert "Only mention this if it actually leaves" in prompt
+    assert "could not be queried" in prompt
+
+
+def test_generate_structured_uses_low_temperature_json_config():
+    """Structured extraction (classification, query-spec generation) should use a deterministic,
+    JSON-mode config -- narrower output (no prose to regex-parse) and a token cap trim latency
+    on this specific call."""
+    client = GeminiClient.__new__(GeminiClient)
+    client.model_name = "test-model"
+    client.fallback_models = []
+    client._breakers = {}
     client.query_generation_config = "the-configured-config-object"
 
     captured = {}
@@ -90,7 +174,7 @@ def test_generate_query_spec_uses_low_temperature_json_config(monkeypatch):
     class _FakeResponse:
         text = '{"collection": "orders", "operation": "count"}'
 
-    def fake_call_with_retry(fn):
+    def fake_call_with_retry(fn, breaker=None):
         return fn()
 
     class _FakeModels:
@@ -104,9 +188,61 @@ def test_generate_query_spec_uses_low_temperature_json_config(monkeypatch):
     client.client = _FakeClient()
     client._call_with_retry = fake_call_with_retry
 
-    client.generate_query_spec("how many orders?", "Collection: orders")
+    result = client.generate_structured("how many orders?", QuerySpec)
 
     assert captured["config"] == "the-configured-config-object"
+    assert result == QuerySpec(collection="orders", operation="count")
+
+
+def test_generate_structured_or_error_returns_query_error_on_error_shape():
+    client = GeminiClient.__new__(GeminiClient)
+    client.model_name = "test-model"
+    client.fallback_models = []
+    client._breakers = {}
+    client.query_generation_config = None
+
+    class _FakeResponse:
+        text = '{"error": "no data for that"}'
+
+    class _FakeModels:
+        def generate_content(self, model, contents, config=None):
+            return _FakeResponse()
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    client.client = _FakeClient()
+    client._call_with_retry = lambda fn, breaker=None: fn()
+
+    result = client.generate_structured_or_error("how many orders?", QuerySpec)
+
+    assert result.error == "no data for that"
+
+
+def test_generate_structured_is_generic_over_any_pydantic_schema():
+    class _Widget(BaseModel):
+        count: int
+
+    client = GeminiClient.__new__(GeminiClient)
+    client.model_name = "test-model"
+    client.fallback_models = []
+    client._breakers = {}
+    client.query_generation_config = None
+
+    class _FakeResponse:
+        text = '{"count": 7}'
+
+    class _FakeModels:
+        def generate_content(self, model, contents, config=None):
+            return _FakeResponse()
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    client.client = _FakeClient()
+    client._call_with_retry = lambda fn, breaker=None: fn()
+
+    assert client.generate_structured("irrelevant prompt", _Widget) == _Widget(count=7)
 
 
 def test_client_construction_sets_http_timeout_and_query_config(monkeypatch):
@@ -150,3 +286,215 @@ def test_client_construction_lets_query_thinking_budget_be_tuned(monkeypatch):
     captured["budget"] = client.query_generation_config.thinking_config.thinking_budget
 
     assert captured["budget"] == 1024
+
+
+def _client_with_models(model_name, fallback_models, generate_content_fn):
+    client = GeminiClient.__new__(GeminiClient)
+    client.model_name = model_name
+    client.fallback_models = fallback_models
+    client._breakers = {}
+    client.query_generation_config = None
+    client.max_retries = 0
+    client.retry_base_delay_seconds = 0
+    client.max_retry_seconds = 0
+
+    class _FakeModels:
+        def generate_content(self, model, contents, config=None):
+            return generate_content_fn(model, config)
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    client.client = _FakeClient()
+    return client
+
+
+def test_falls_back_to_next_model_on_rate_limit():
+    def generate_content(model, config=None):
+        if model == "primary":
+            raise _rate_limit_error()
+
+        class _FakeResponse:
+            text = '{"count": 1}'
+
+        return _FakeResponse()
+
+    client = _client_with_models("primary", ["fallback"], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    result = client.generate_structured("prompt", _Widget)
+
+    assert result == _Widget(count=1)
+    assert client.last_model_used == "fallback"
+
+
+def test_tries_each_fallback_model_in_order():
+    attempts = []
+
+    def generate_content(model, config=None):
+        attempts.append(model)
+        if model != "third":
+            raise _rate_limit_error()
+
+        class _FakeResponse:
+            text = '{"count": 1}'
+
+        return _FakeResponse()
+
+    client = _client_with_models("primary", ["second", "third"], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    client.generate_structured("prompt", _Widget)
+
+    assert attempts == ["primary", "second", "third"]
+
+
+def test_does_not_fall_back_on_a_non_rate_limit_error():
+    """A timeout or 5xx isn't a per-model problem -- cascading through every fallback model
+    would just multiply latency for a failure a different model can't fix."""
+    attempts = []
+
+    def generate_content(model, config=None):
+        attempts.append(model)
+        raise TimeoutError("boom")
+
+    client = _client_with_models("primary", ["fallback"], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    with pytest.raises(TimeoutError):
+        client.generate_structured("prompt", _Widget)
+
+    assert attempts == ["primary"]
+
+
+def test_raises_the_final_models_error_when_all_are_rate_limited():
+    def generate_content(model, config=None):
+        raise _rate_limit_error()
+
+    client = _client_with_models("primary", ["fallback"], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    with pytest.raises(errors.ClientError):
+        client.generate_structured("prompt", _Widget)
+
+
+def test_no_fallback_models_configured_behaves_like_before():
+    def generate_content(model, config=None):
+        raise _rate_limit_error()
+
+    client = _client_with_models("primary", [], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    with pytest.raises(errors.ClientError):
+        client.generate_structured("prompt", _Widget)
+
+
+def test_falls_back_on_a_404_model_not_found_too():
+    """Confirmed in practice against a real account: an entire model family can return 404 'no
+    longer available to new users' rather than a 429 -- that's just as much a reason to try the
+    next configured model as a quota-exhausted 429 is."""
+
+    def generate_content(model, config=None):
+        if model == "primary":
+            raise _model_not_found_error()
+
+        class _FakeResponse:
+            text = '{"count": 1}'
+
+        return _FakeResponse()
+
+    client = _client_with_models("primary", ["fallback"], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    result = client.generate_structured("prompt", _Widget)
+
+    assert result == _Widget(count=1)
+    assert client.last_model_used == "fallback"
+
+
+def test_open_circuit_breaker_on_primary_still_falls_back_to_a_healthy_model(monkeypatch):
+    """Regression test for a production incident: circuit breaker state used to be one shared,
+    global CircuitBreaker across every model, so repeated real failures against the *primary*
+    model (e.g. gemini-3-flash-preview hitting its daily quota) tripped the SAME breaker that
+    gemini-3.5-flash-lite (a different, perfectly healthy model) was gated by too -- once open,
+    every subsequent call failed immediately with "circuit breaker open", even though the
+    fallback model would have succeeded fine. Breaker state must be per-model."""
+    monkeypatch.setattr("app.llm.gemini_client.settings.gemini_circuit_breaker_threshold", 2)
+    monkeypatch.setattr(
+        "app.llm.gemini_client.settings.gemini_circuit_breaker_cooldown_seconds", 999
+    )
+
+    def generate_content(model, config=None):
+        if model == "primary":
+            raise _rate_limit_error()
+
+        class _FakeResponse:
+            text = '{"count": 1}'
+
+        return _FakeResponse()
+
+    client = _client_with_models("primary", ["fallback"], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    # Two calls that both fail against "primary" and fall back to "fallback" -- this trips
+    # primary's own breaker (threshold=2) without ever calling generate_structured against
+    # "fallback" directly, so fallback's breaker stays untouched throughout.
+    for _ in range(2):
+        result = client.generate_structured("prompt", _Widget)
+        assert result == _Widget(count=1)
+        assert client.last_model_used == "fallback"
+
+    # A third call: primary's breaker is now open, so _call_with_retry raises
+    # CircuitBreakerOpenError for "primary" *without even invoking generate_content for it* --
+    # this must still fall through to "fallback", not propagate the breaker error.
+    result = client.generate_structured("prompt", _Widget)
+    assert result == _Widget(count=1)
+    assert client.last_model_used == "fallback"
+
+
+def test_fallback_attempt_drops_thinking_config_but_keeps_it_for_primary():
+    """Confirmed in practice against a real account: gemini-3.6-flash 400s on
+    thinking_budget=0, a value the primary model (gemini-3-flash-preview) accepts fine -- a
+    fallback attempt should keep everything else from the configured GenerateContentConfig
+    except that one tuning knob, which is specific to the primary model's behavior, not a
+    general requirement."""
+    from google.genai import types
+
+    captured_configs = {}
+
+    def generate_content(model, config=None):
+        captured_configs[model] = config
+        if model == "primary":
+            raise _rate_limit_error()
+
+        class _FakeResponse:
+            text = '{"count": 1}'
+
+        return _FakeResponse()
+
+    client = _client_with_models("primary", ["fallback"], generate_content)
+    config = types.GenerateContentConfig(
+        temperature=0,
+        response_mime_type="application/json",
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
+
+    client._generate_content("prompt", config=config)
+
+    assert captured_configs["primary"].thinking_config.thinking_budget == 0
+    assert captured_configs["fallback"].thinking_config is None
+    assert captured_configs["fallback"].response_mime_type == "application/json"

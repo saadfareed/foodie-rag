@@ -1,6 +1,8 @@
 {
   "orders": {
     "order_id": "human-readable order identifier",
+    "customer_id": "references users.user_id where usertype=1 (the customer who placed the order)",
+    "vendor_id": "references users.user_id where usertype=2 (the vendor who fulfilled the order)",
     "amount": "order total (demo data — no currency implied)",
     "payment_method": "demo-only label (cash/card/wallet/hybrid_card_wallet/hybrid_wallet_cash) added for readability while seeding; may not exist in production data — do not rely on it, use onlinepaymentmethod + isWallet instead",
     "onlinepaymentmethod": "payment method code: 1 = cash, 2 = card. For wallet-only payments this defaults to 1. For hybrid payments, the non-wallet component decides the code (card+wallet -> 2, wallet+cash -> 1)",
@@ -8,5 +10,18 @@
     "payby": "breakdown of how much of `amount` was paid via each method, e.g. {\"cash\": 100} or {\"wallet\": 40, \"card\": 60}; values always sum to `amount`",
     "status": "order status: completed, pending, or refunded (demo data)",
     "created_at": "order creation timestamp (UTC)"
+  },
+  "users": {
+    "user_id": "human-readable user identifier",
+    "usertype": "discriminator: 1 = customer, 2 = vendor. Customers and vendors share this single collection -- ANY query about 'customers' or 'vendors' MUST filter on usertype (1 or 2 respectively) in addition to any other criteria, or it will silently mix both kinds of user together",
+    "status": "account status: active, inactive, or suspended (demo data). 'active customers'/'active vendors' means status == 'active' AND usertype matches",
+    "city": "demo-only label for the user's city (Karachi/Lahore/Islamabad); coarse alternative to `location` for non-geo filtering",
+    "location": "GeoJSON Point {type: 'Point', coordinates: [lng, lat]} -- has a 2dsphere index, use with $near/$geoWithin for 'nearby' queries. coordinates are [longitude, latitude], NOT [lat, lng]",
+    "created_at": "account creation timestamp (UTC)",
+    "last_active_at": "timestamp of the user's last activity (UTC) -- use this for 'active in the last N days' questions, not `status`",
+    "loyalty_tier": "customer-only field (usertype=1): bronze/silver/gold; absent on vendor documents",
+    "business_name": "vendor-only field (usertype=2); absent on customer documents",
+    "category": "vendor-only field (usertype=2): restaurant/grocery/pharmacy/electronics/clothing; absent on customer documents",
+    "rating": "vendor-only field (usertype=2): 3.0-5.0; absent on customer documents"
   }
 }

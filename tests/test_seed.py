@@ -1,11 +1,17 @@
 import random
 
+import pytest
+
 from app.db.seed import (
     PAYMENT_METHOD_MAP,
     build_payby,
     build_payment_fields,
     generate_sample_orders,
+    seed_orders,
 )
+
+CUSTOMER_IDS = ["USR-00001", "USR-00002"]
+VENDOR_IDS = ["USR-00031", "USR-00032"]
 
 
 def test_payment_method_mapping_matches_spec():
@@ -17,14 +23,14 @@ def test_payment_method_mapping_matches_spec():
 
 
 def test_generate_sample_orders_count_per_method():
-    orders = generate_sample_orders(count_per_method=3)
+    orders = generate_sample_orders(CUSTOMER_IDS, VENDOR_IDS, count_per_method=3)
     assert len(orders) == 3 * len(PAYMENT_METHOD_MAP)
     for method in PAYMENT_METHOD_MAP:
         assert sum(1 for o in orders if o["payment_method"] == method) == 3
 
 
 def test_generate_sample_orders_fields_match_mapping():
-    orders = generate_sample_orders(count_per_method=2)
+    orders = generate_sample_orders(CUSTOMER_IDS, VENDOR_IDS, count_per_method=2)
     for order in orders:
         expected_code, expected_wallet = PAYMENT_METHOD_MAP[order["payment_method"]]
         assert order["onlinepaymentmethod"] == expected_code
@@ -34,9 +40,16 @@ def test_generate_sample_orders_fields_match_mapping():
 
 
 def test_generate_sample_orders_ids_are_unique():
-    orders = generate_sample_orders(count_per_method=4)
+    orders = generate_sample_orders(CUSTOMER_IDS, VENDOR_IDS, count_per_method=4)
     ids = [o["order_id"] for o in orders]
     assert len(ids) == len(set(ids))
+
+
+def test_generate_sample_orders_customer_and_vendor_ids_come_from_given_pools():
+    orders = generate_sample_orders(CUSTOMER_IDS, VENDOR_IDS, count_per_method=4)
+    for order in orders:
+        assert order["customer_id"] in CUSTOMER_IDS
+        assert order["vendor_id"] in VENDOR_IDS
 
 
 def test_payby_single_method_equals_full_amount():
@@ -61,6 +74,21 @@ def test_payby_hybrid_values_sum_to_amount():
 
 
 def test_generate_sample_orders_payby_sums_to_amount():
-    orders = generate_sample_orders(count_per_method=6)
+    orders = generate_sample_orders(CUSTOMER_IDS, VENDOR_IDS, count_per_method=6)
     for order in orders:
         assert round(sum(order["payby"].values()), 2) == order["amount"]
+
+
+def test_seed_orders_fails_clearly_when_users_collection_is_empty(monkeypatch):
+    class _FakeCollection:
+        def distinct(self, field, filter_):
+            return []
+
+    class _FakeDb(dict):
+        def __getitem__(self, name):
+            return dict.__getitem__(self, name)
+
+    monkeypatch.setattr("app.db.seed.get_db", lambda: _FakeDb(users=_FakeCollection()))
+
+    with pytest.raises(RuntimeError, match="seed_users"):
+        seed_orders()

@@ -8,6 +8,9 @@ BANNED_OPERATORS = {"$where", "$function", "$accumulator", "$merge", "$out"}
 ALLOWED_OPERATIONS = {"find", "aggregate", "count"}
 MAX_DATE_RANGE_DAYS = 365
 NO_DATE_RANGE_LIMIT_CAP = 100
+# Clamp for geo_near.max_distance_m, same role as MAX_DATE_RANGE_DAYS -- keeps a "nearby"
+# question from silently becoming an unbounded/full-scan geo query.
+MAX_GEO_RADIUS_M = 50_000
 
 
 class QueryValidationError(Exception):
@@ -72,12 +75,35 @@ def _validate_date_range(spec: QuerySpec, max_range_days: int) -> None:
         )
 
 
+def _validate_geo_near(
+    spec: QuerySpec, geo_allowed_fields: dict[str, set[str]], max_radius_m: float
+) -> None:
+    """geo_near is structured data the LLM emits (coordinates + a requested radius), not raw
+    Mongo operator syntax -- see app/rag/query_spec.py:GeoNear. Validated the same way dates
+    are: reject what's out of scope, clamp what's just too broad."""
+    if spec.geo_near is None:
+        return
+
+    allowed_fields = geo_allowed_fields.get(spec.collection, set())
+    if not allowed_fields:
+        raise QueryValidationError(f"collection '{spec.collection}' does not support geo queries")
+    if spec.geo_near.field not in allowed_fields:
+        raise QueryValidationError(
+            f"geo field '{spec.geo_near.field}' is not recognized on '{spec.collection}'"
+        )
+    if spec.geo_near.max_distance_m <= 0:
+        raise QueryValidationError("geo_near.max_distance_m must be positive")
+    spec.geo_near.max_distance_m = min(spec.geo_near.max_distance_m, max_radius_m)
+
+
 def validate_query_spec(
     spec: QuerySpec,
     allowed_collections: list[str],
     max_limit: int = 200,
     max_date_range_days: int = MAX_DATE_RANGE_DAYS,
     no_date_range_limit_cap: int = NO_DATE_RANGE_LIMIT_CAP,
+    geo_allowed_fields: dict[str, set[str]] | None = None,
+    max_geo_radius_m: float = MAX_GEO_RADIUS_M,
 ) -> QuerySpec:
     """Raise QueryValidationError on anything unsafe or out of scope; clamp the limit otherwise."""
     if spec.collection not in allowed_collections:
@@ -95,6 +121,7 @@ def validate_query_spec(
         raise QueryValidationError(violation)
 
     _validate_date_range(spec, max_date_range_days)
+    _validate_geo_near(spec, geo_allowed_fields or {}, max_geo_radius_m)
 
     no_dates = spec.start_date is None and spec.end_date is None
     effective_cap = min(max_limit, no_date_range_limit_cap) if no_dates else max_limit
