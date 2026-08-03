@@ -35,8 +35,12 @@ Rules:
     "pipeline": [],        // for "aggregate", a list of aggregation stages
     "projection": null,    // optional, for "find"
     "sort": null,          // optional, for "find", e.g. {{"field": -1}}
-    "limit": 50
+    "limit": 50,
+    "start_date": null,    // optional, "YYYY-MM-DD" -- lower date bound, if any, in filter/pipeline
+    "end_date": null       // optional, "YYYY-MM-DD" -- upper date bound, if any, in filter/pipeline
   }}
+- If the question implies a date range, restrict it in filter/pipeline as usual AND also set
+  start_date/end_date to describe that same range -- they must agree with the actual filter.
 - Never use $where, $function, $accumulator, $merge, or $out.
 
 Question: {question}

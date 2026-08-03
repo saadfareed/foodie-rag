@@ -10,6 +10,7 @@ from app.db.executor import execute_query_spec
 from app.db.mongo import get_db
 from app.llm.gemini_client import GeminiClient
 from app.llm.quota import quota_tracker
+from app.rag.answer_cache import CachedResult, answer_cache
 from app.rag.query_spec import QueryError
 from app.rag.schema_context import build_schema_context
 from app.rag.validator import QueryValidationError, validate_query_spec
@@ -35,7 +36,6 @@ def answer_question(
     user_id: str | None = None,
     channel_id: str | None = None,
 ) -> str:
-    gemini = gemini or GeminiClient()
     start = time.perf_counter()
     timings: dict[str, float] = {}
 
@@ -48,6 +48,14 @@ def answer_question(
             timings=timings,
             **kwargs,
         )
+
+    cache_key = answer_cache.make_key(channel_id, question)
+    cached = answer_cache.get(cache_key)
+    if cached is not None:
+        _log(error=cached.error, answer=cached.answer, cache_hit=True)
+        return cached.answer
+
+    gemini = gemini or GeminiClient()
 
     if quota_tracker.is_over_budget():
         answer = "I've hit my daily question budget -- please try again tomorrow."
@@ -67,6 +75,9 @@ def answer_question(
 
     if isinstance(spec_or_error, QueryError):
         _log(error=spec_or_error.error, answer=spec_or_error.error)
+        answer_cache.set(
+            cache_key, CachedResult(answer=spec_or_error.error, error=spec_or_error.error)
+        )
         return spec_or_error.error
 
     try:
@@ -74,6 +85,7 @@ def answer_question(
     except QueryValidationError as exc:
         answer = f"I can't run that query: {exc}"
         _log(spec=spec_or_error, error=str(exc), answer=answer)
+        answer_cache.set(cache_key, CachedResult(answer=answer, error=str(exc)))
         return answer
 
     try:
@@ -87,6 +99,7 @@ def answer_question(
     if not rows:
         answer = "I didn't find any data matching that question."
         _log(spec=spec, row_count=0, answer=answer)
+        answer_cache.set(cache_key, CachedResult(answer=answer))
         return answer
 
     try:
@@ -98,4 +111,5 @@ def answer_question(
         return answer
 
     _log(spec=spec, row_count=len(rows), answer=answer)
+    answer_cache.set(cache_key, CachedResult(answer=answer))
     return answer

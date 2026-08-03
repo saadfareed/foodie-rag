@@ -13,6 +13,8 @@ class QuerySpec(BaseModel):
     projection: dict | None = None
     sort: dict | None = None
     limit: int = 50
+    start_date: str | None = None
+    end_date: str | None = None
 
 
 class QueryError(BaseModel):
