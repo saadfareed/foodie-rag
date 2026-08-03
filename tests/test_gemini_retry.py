@@ -1,3 +1,4 @@
+import httpx
 import pytest
 from google.genai import errors
 
@@ -16,6 +17,16 @@ def test_is_retryable_for_429_and_5xx():
 def test_is_retryable_false_for_4xx_non_429():
     assert _is_retryable(_client_error(400)) is False
     assert _is_retryable(ValueError("not an api error")) is False
+
+
+def test_is_retryable_true_for_client_side_timeouts():
+    """A hung/slow request past our own http_options timeout raises httpx.TimeoutException, not
+    a google.genai.errors.APIError -- this must still be retried, otherwise a single slow (but
+    transient) response fails the whole question with zero retry attempts, as happened in
+    production: a 15s client timeout on query generation raised httpx.ReadTimeout and was treated
+    as non-retryable, so the request failed outright instead of getting a second chance."""
+    assert _is_retryable(httpx.ReadTimeout("The read operation timed out")) is True
+    assert _is_retryable(httpx.ConnectTimeout("connect timed out")) is True
 
 
 def _make_client(max_retries: int, retry_base_delay_seconds: float, max_retry_seconds: float = 60):
@@ -51,6 +62,22 @@ def test_call_with_retry_retries_then_succeeds(monkeypatch):
 
     assert result == "recovered"
     assert calls["count"] == 3
+
+
+def test_call_with_retry_retries_on_client_side_timeout(monkeypatch):
+    monkeypatch.setattr("app.llm.gemini_client.time.sleep", lambda _: None)
+    client = _make_client(max_retries=3, retry_base_delay_seconds=0)
+
+    calls = {"count": 0}
+
+    def times_out_then_succeeds():
+        calls["count"] += 1
+        if calls["count"] < 2:
+            raise httpx.ReadTimeout("The read operation timed out")
+        return "recovered"
+
+    assert client._call_with_retry(times_out_then_succeeds) == "recovered"
+    assert calls["count"] == 2
 
 
 def test_call_with_retry_raises_immediately_on_non_retryable(monkeypatch):

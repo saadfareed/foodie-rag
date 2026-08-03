@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from typing import TypeVar
 
+import httpx
 from google import genai
 from google.genai import errors, types
 
@@ -61,7 +62,14 @@ def _extract_json(text: str) -> dict:
 
 
 def _is_retryable(exc: Exception) -> bool:
-    return isinstance(exc, errors.APIError) and exc.code in _RETRYABLE_STATUS_CODES
+    if isinstance(exc, errors.APIError):
+        return exc.code in _RETRYABLE_STATUS_CODES
+    # A client-side read/connect timeout is transient by nature -- worth a retry rather than an
+    # immediate hard failure. Without this, a single slow response fails the whole question with
+    # no retry at all (this is what happened in production: a 15s HTTP timeout on the
+    # query-generation call raised httpx.ReadTimeout, which wasn't a google.genai.errors.APIError,
+    # so _call_with_retry gave up on the first attempt instead of retrying).
+    return isinstance(exc, httpx.TimeoutException)
 
 
 def _rows_for_prompt(rows: list[dict], max_rows: int) -> str:
@@ -84,6 +92,21 @@ class GeminiClient:
         self.retry_base_delay_seconds = settings.gemini_retry_base_delay_seconds
         self.max_retry_seconds = settings.gemini_max_retry_seconds
         self.answer_max_rows = settings.gemini_answer_max_rows
+        # Query generation is deterministic structured extraction, not open-ended reasoning:
+        # temperature=0 for consistent output, response_mime_type="application/json" to skip
+        # prose padding, and thinking disabled (thinking_budget=0) since on "thinking" models
+        # reasoning tokens otherwise count against max_output_tokens -- this previously truncated
+        # the JSON mid-object in production (a 512-token cap was consumed by invisible reasoning
+        # before the model finished emitting the closing brace) while contributing most of that
+        # call's ~14s latency. Disabling thinking fixes both the correctness bug and the latency.
+        self.query_generation_config = types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+            max_output_tokens=settings.gemini_query_max_output_tokens,
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=settings.gemini_query_thinking_budget
+            ),
+        )
 
     def _call_with_retry(self, fn: Callable[[], T]) -> T:
         quota_tracker.record_call()
@@ -105,7 +128,9 @@ class GeminiClient:
     def generate_query_spec(self, question: str, schema_context: str) -> QuerySpec | QueryError:
         prompt = _QUERY_PROMPT.format(schema_context=schema_context, question=question)
         response = self._call_with_retry(
-            lambda: self.client.models.generate_content(model=self.model_name, contents=prompt)
+            lambda: self.client.models.generate_content(
+                model=self.model_name, contents=prompt, config=self.query_generation_config
+            )
         )
         data = _extract_json(response.text)
         if "error" in data:

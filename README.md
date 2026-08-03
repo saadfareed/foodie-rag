@@ -64,14 +64,24 @@ tests/                   # pytest suite, fully mocked (no live Slack/Mongo/Gemin
 
    Optional tuning (defaults shown):
    - `GEMINI_MODEL=gemini-3-flash-preview`
-   - `MONGODB_QUERY_TIMEOUT_MS=5000`
+   - `MONGODB_QUERY_TIMEOUT_MS=8000`
    - `MONGODB_MAX_RESULT_LIMIT=200`
    - `AUDIT_LOG_LEVEL=INFO`
-   - `GEMINI_MAX_RETRIES=3`, `GEMINI_RETRY_BASE_DELAY_SECONDS=1.0`
+   - `GEMINI_MAX_RETRIES=3`, `GEMINI_RETRY_BASE_DELAY_SECONDS=1.0` -- retries now also cover
+     client-side HTTP timeouts, not just Gemini-returned 429/5xx responses.
    - `GEMINI_MAX_RETRY_SECONDS=20.0` -- hard wall-clock ceiling on retry backoff, independent of
      `GEMINI_MAX_RETRIES`, so a question can't stall indefinitely on repeated transient errors.
-   - `GEMINI_REQUEST_TIMEOUT_MS=15000` -- client-side HTTP timeout per Gemini call; bounds a
-     hung request that would otherwise never fail on its own.
+   - `GEMINI_REQUEST_TIMEOUT_MS=15000` -- client-side HTTP timeout per Gemini call. If this fires
+     it's now retried (see above) instead of failing the question outright on the first slow
+     response.
+   - `GEMINI_QUERY_THINKING_BUDGET=0` -- disables "thinking" for the query-generation call (0 =
+     off, -1 = automatic). Query generation is deterministic structured extraction, not open-ended
+     reasoning; on thinking-capable models this both removes needless latency and avoids a real
+     failure mode we hit in production, where reasoning tokens silently consumed the output-token
+     budget and truncated the JSON mid-object before the model ever reached the closing brace.
+   - `GEMINI_QUERY_MAX_OUTPUT_TOKENS=2048` -- output-token cap for the query-generation call only.
+     Kept generous specifically because a too-small cap is what caused the truncation above --
+     this is a safety ceiling, not the latency lever (`GEMINI_QUERY_THINKING_BUDGET` is).
    - `GEMINI_ANSWER_MAX_ROWS=30` -- caps how many result rows are serialized into the
      answer-generation prompt, independent of `MONGODB_MAX_RESULT_LIMIT`, so a large result set
      doesn't inflate prompt size (and Gemini latency).
@@ -140,10 +150,11 @@ pytest
 The suite covers the query safety validator (banned operators, disallowed collections, $lookup
 cross-collection checks, limit clamping), the calculation helpers, schema-context building and
 caching, schema introspection's type/example logic, the end-to-end pipeline orchestration
-(including per-stage timing), Gemini retry/deadline behavior and answer-row truncation, Mongo
-client connection config and lifecycle, Slack handler wiring (verifying the injected `GeminiClient`
-reaches every entry point), and startup/shutdown wiring in `app.main` — all with mocked
-Gemini/MongoDB/Slack, so `pytest` never makes network calls or needs real credentials.
+(including per-stage timing and its failure-ordering edge case), Gemini retry/deadline behavior
+(including client-side timeout retries) and answer-row truncation, Mongo client connection config
+and lifecycle, Slack handler wiring (verifying the injected `GeminiClient` reaches every entry
+point), and startup/shutdown wiring in `app.main` — all with mocked Gemini/MongoDB/Slack, so
+`pytest` never makes network calls or needs real credentials.
 
 ## CI/CD
 
@@ -211,13 +222,17 @@ Run everything manually at any time with `pre-commit run --all-files` (add
   [app/audit/logger.py](app/audit/logger.py) — useful for debugging bad query generations and for
   auditing what data was surfaced in Slack.
 - **Per-stage timing**: each audit record includes a `timings` breakdown
-  (`schema_context_ms`, `query_gen_ms`, `db_ms`, `answer_gen_ms`) so a slow question can be
-  attributed to a specific stage (Gemini vs. Mongo vs. schema loading) instead of only showing
-  total `duration_ms`. See `answer_question` in [app/rag/pipeline.py](app/rag/pipeline.py).
-- **Gemini retry/backoff**: transient errors (429/5xx) are retried with exponential backoff
-  (`GEMINI_MAX_RETRIES`, `GEMINI_RETRY_BASE_DELAY_SECONDS`), capped by a hard wall-clock deadline
-  (`GEMINI_MAX_RETRY_SECONDS`) so retries can't stack up into an unbounded stall, in
-  [app/llm/gemini_client.py](app/llm/gemini_client.py).
+  (`schema_context_ms`, `query_gen_ms`, `db_ms`, `answer_gen_ms`) so a slow/failing question can be
+  attributed to a specific stage instead of only showing total `duration_ms`. Timings are captured
+  via a context manager whose `finally` runs *before* the failure is logged, so the stage that
+  actually failed still shows its own duration (see `_timed_stage` in
+  [app/rag/pipeline.py](app/rag/pipeline.py)).
+- **Gemini retry/backoff**: transient errors (429/5xx **and** client-side HTTP timeouts) are
+  retried with exponential backoff (`GEMINI_MAX_RETRIES`, `GEMINI_RETRY_BASE_DELAY_SECONDS`),
+  capped by a hard wall-clock deadline (`GEMINI_MAX_RETRY_SECONDS`) so retries can't stack into an
+  unbounded stall, in [app/llm/gemini_client.py](app/llm/gemini_client.py). Both
+  `generate_query_spec` and `generate_answer` are wrapped with graceful fallback messages if
+  retries are exhausted — neither can crash the request unhandled.
 - **Daily call budget**: `GEMINI_DAILY_CALL_BUDGET` caps Gemini requests per process per day
   ([app/llm/quota.py](app/llm/quota.py)); once exceeded, the bot replies with a friendly message
   instead of calling Gemini. In-process only — resets on restart, not shared across instances.

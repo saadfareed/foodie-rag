@@ -26,7 +26,7 @@ graph TD
     SchemaCtx --> AnnotationsFile[(schema_annotations.json)]
 
     Gemini --> QuotaRecord[quota_tracker.record_call]
-    Gemini --> GeminiAPI[(Google Gemini API<br/>client-side HTTP timeout)]
+    Gemini --> GeminiAPI[(Google Gemini API<br/>client-side HTTP timeout, retried on timeout too)]
 
     Validator --> QuerySpecModel[app/rag/query_spec.py<br/>QuerySpec / QueryError]
 
@@ -56,6 +56,36 @@ question. `answer_question`'s `gemini=None` default is kept only so tests can om
 stub — production code always passes the shared instance. `MongoClient` was already a singleton
 (`app/db/mongo.py::get_client`) and now additionally has explicit connection timeouts, a bounded
 pool, and a `close_client()` used on graceful shutdown.
+
+**Incident note (production): a client-side Gemini timeout on query generation**. A real production
+log showed `generate_query_spec` failing after ~15.35s with `"The read operation timed out"` and
+zero retries. Root cause: `httpx.ReadTimeout` (raised when `GEMINI_REQUEST_TIMEOUT_MS` elapses)
+isn't a `google.genai.errors.APIError`, so `_is_retryable` didn't classify it as retryable -- a
+single slow-but-transient response failed the whole question outright instead of getting a second
+attempt. Fixed by extending `_is_retryable` to also treat `httpx.TimeoutException` as retryable
+(bounded, as always, by `GEMINI_MAX_RETRY_SECONDS`). The same log also revealed a second, subtler
+bug: the audit record's `timings` only showed `schema_context_ms`, not `query_gen_ms` -- the stage
+that actually failed -- because `log_query_event` was being called (and the log line serialized)
+*before* the timing block's `finally` had recorded that stage's duration. Fixed by timing each
+stage with a context manager (`_timed_stage`) whose `finally` runs as the exception unwinds out of
+the `with` block, i.e. strictly before the enclosing `except` clause (and therefore before
+`_log`) runs. See `app/llm/gemini_client.py::_is_retryable` and
+`app/rag/pipeline.py::_timed_stage`.
+
+**Incident note (production): query-generation JSON truncated by a "thinking" model**. A second
+production log showed `generate_query_spec` failing with `"Gemini response did not contain JSON:
+'{\n  \"collection'"` after ~14s -- the response was cut off mid-object, no closing brace. Root
+cause: the fix above introduced `max_output_tokens=512` on the query-generation call to trim
+latency, but `gemini-3-flash-preview` is a "thinking" model -- by default, invisible reasoning
+tokens count against `max_output_tokens` before any visible output is emitted, so the budget was
+consumed by reasoning rather than by the (small) JSON the model was trying to produce, truncating
+it partway through. The ~14s was mostly reasoning time, not JSON-generation time. Fixed by adding
+`thinking_config=ThinkingConfig(thinking_budget=GEMINI_QUERY_THINKING_BUDGET)` (default `0` =
+disabled) to `query_generation_config` -- query generation is deterministic structured extraction,
+not open-ended reasoning, so it doesn't need thinking at all. Also raised
+`GEMINI_QUERY_MAX_OUTPUT_TOKENS`'s default from 512 to 2048 as a safety margin (the token cap was
+never the real latency lever; disabling thinking is). See
+`app/llm/gemini_client.py::GeminiClient.__init__`.
 
 ## Flow 1: `/ask` slash command
 
@@ -97,11 +127,12 @@ sequenceDiagram
             SC-->>P: schema text (or "No schema information is available yet.")
             Note over P: records schema_context_ms
             P->>G: generate_query_spec(question, schema_context)
+            Note over G: temperature=0, response_mime_type=application/json, max_output_tokens capped -- narrow deterministic extraction, no prose to regex-parse
             G->>Q: record_call()
-            G->>G: _call_with_retry(...) [retries 429/5xx w/ backoff, capped by GEMINI_MAX_RETRY_SECONDS]
+            G->>G: _call_with_retry(...) [retries 429/5xx AND client-side timeouts w/ backoff, capped by GEMINI_MAX_RETRY_SECONDS]
             Note over G: Gemini API call (client-side timeout: GEMINI_REQUEST_TIMEOUT_MS)
             G-->>P: QuerySpec or QueryError
-            Note over P: records query_gen_ms (even on failure)
+            Note over P: records query_gen_ms via _timed_stage -- captured even on failure, before the except block logs
             alt QueryError (LLM says "can't answer this")
                 P->>L: log_query_event(error=...)
                 P-->>H: the error message, verbatim
@@ -118,7 +149,7 @@ sequenceDiagram
                     E->>M: find / aggregate / count
                     M-->>E: raw documents
                     E-->>P: JSON-safe rows (ObjectId/datetime -> str)
-                    Note over P: records db_ms (even on failure)
+                    Note over P: records db_ms via _timed_stage (even on failure)
                     alt db error
                         P->>L: log_query_event(error=...)
                         P-->>H: "I ran into a database error..."
@@ -129,10 +160,16 @@ sequenceDiagram
                         P->>G: generate_answer(question, rows)
                         Note over G: rows capped at GEMINI_ANSWER_MAX_ROWS before being serialized into the prompt
                         G->>Q: record_call()
-                        G-->>P: natural-language answer
-                        Note over P: records answer_gen_ms
-                        P->>L: log_query_event(row_count=, answer=, timings=)
-                        P-->>H: answer text
+                        alt Gemini fails/times out generating the answer
+                            G-->>P: raises
+                            P->>L: log_query_event(spec=, row_count=, error=..., timings=)
+                            P-->>H: "I found the data but couldn't put it into words just now..."
+                        else success
+                            G-->>P: natural-language answer
+                            Note over P: records answer_gen_ms
+                            P->>L: log_query_event(row_count=, answer=, timings=)
+                            P-->>H: answer text
+                        end
                     end
                 end
             end
@@ -201,8 +238,8 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/rag/pipeline.py` — the orchestrator
 | Function | Does |
 |---|---|
-| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: budget check -> schema context -> Gemini query generation -> validation -> execution -> Gemini answer generation, with audit logging (including per-stage timing) and a user-facing string return at every exit point (never raises to the caller). `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
-| `*_mark(name, stage_start)` | Local closure inside `answer_question`; records elapsed ms for a named stage (`schema_context_ms`, `query_gen_ms`, `db_ms`, `answer_gen_ms`) into the `timings` dict. Stages are timed with `try`/`finally` so a stage's duration is still recorded even if it raises. |
+| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: budget check -> schema context -> Gemini query generation -> validation -> execution -> Gemini answer generation, with audit logging (including per-stage timing) and a user-facing string return at every exit point (never raises to the caller, including if `generate_answer` itself fails). `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
+| `*_timed_stage(timings, name)` | Context manager: records elapsed ms for `name` into `timings` in its `finally` block, which runs as an exception unwinds out of the `with` block -- i.e. *before* any enclosing `except` clause (and therefore before `_log`) sees it. This ordering is what makes a failing stage's own duration show up in the audit log for that failure, instead of being silently dropped. |
 | `*_log(**kwargs)` | Local closure inside `answer_question`; fills in `question`/`user_id`/`channel_id`/`duration_ms`/`timings` and calls `log_query_event`. |
 
 ### `app/llm/quota.py`
@@ -227,11 +264,11 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/llm/gemini_client.py`
 | Function | Does |
 |---|---|
-| `GeminiClient.__init__(model_name=None)` | Builds the `google.genai.Client` with an explicit `http_options` timeout (`GEMINI_REQUEST_TIMEOUT_MS`), reads retry/row-cap settings from `app.config.settings`. Constructed **once** in `app.main` and shared across all requests, not per-question. |
-| `GeminiClient.generate_query_spec(question, schema_context)` | Sends `_QUERY_PROMPT` to Gemini, parses the JSON reply into a `QuerySpec` or `QueryError`. |
+| `GeminiClient.__init__(model_name=None)` | Builds the `google.genai.Client` with an explicit `http_options` timeout (`GEMINI_REQUEST_TIMEOUT_MS`), reads retry/row-cap settings from `app.config.settings`, and builds `query_generation_config` (`temperature=0`, `response_mime_type="application/json"`, `max_output_tokens=GEMINI_QUERY_MAX_OUTPUT_TOKENS`, `thinking_config=ThinkingConfig(thinking_budget=GEMINI_QUERY_THINKING_BUDGET)`) used only for `generate_query_spec` -- thinking is disabled by default since query generation is deterministic extraction, not reasoning, and on thinking-capable models reasoning tokens otherwise silently consume the output-token budget (see the incident note above the component diagram). Constructed **once** in `app.main` and shared across all requests, not per-question. |
+| `GeminiClient.generate_query_spec(question, schema_context)` | Sends `_QUERY_PROMPT` to Gemini using `query_generation_config`, parses the JSON reply into a `QuerySpec` or `QueryError`. |
 | `GeminiClient.generate_answer(question, rows)` | Serializes `rows` via `_rows_for_prompt` (capped at `answer_max_rows`), sends `_ANSWER_PROMPT` to Gemini, returns the natural-language reply text. |
-| `*GeminiClient._call_with_retry(fn)` | Wraps any Gemini API call: records a quota call, retries on 429/5xx with exponential backoff + jitter up to `max_retries`, re-raises immediately on non-retryable errors, after retries are exhausted, **or if the next retry's delay would push total elapsed time past `max_retry_seconds`** — a hard wall-clock ceiling independent of the retry count. |
-| `*_is_retryable(exc)` | `True` if `exc` is a `google.genai.errors.APIError` with a 429/500/502/503/504 status code. |
+| `*GeminiClient._call_with_retry(fn)` | Wraps any Gemini API call: records a quota call, retries on 429/5xx **and client-side timeouts** with exponential backoff + jitter up to `max_retries`, re-raises immediately on non-retryable errors, after retries are exhausted, **or if the next retry's delay would push total elapsed time past `max_retry_seconds`** — a hard wall-clock ceiling independent of the retry count. |
+| `*_is_retryable(exc)` | `True` if `exc` is a `google.genai.errors.APIError` with a 429/500/502/503/504 status code, **or** an `httpx.TimeoutException` (a client-side read/connect timeout past `GEMINI_REQUEST_TIMEOUT_MS` -- this used to be treated as non-retryable, which is exactly what caused a production failure: a single slow response failed the question outright with no retry). |
 | `*_extract_json(text)` | Regex-extracts the first `{...}` block from Gemini's raw text response and `json.loads`s it. |
 | `*_rows_for_prompt(rows, max_rows)` | Serializes at most `max_rows` rows to JSON; if more were passed, appends an `"...N more row(s) omitted for brevity..."` note instead of the full set, so prompt size (and Gemini latency) doesn't scale unbounded with `MONGODB_MAX_RESULT_LIMIT`. |
 
