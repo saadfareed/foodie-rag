@@ -2,15 +2,18 @@ from datetime import date, timedelta
 
 import pytest
 
-from app.rag.query_spec import QuerySpec
+from app.rag.query_spec import GeoNear, QuerySpec
 from app.rag.validator import (
     MAX_DATE_RANGE_DAYS,
+    MAX_GEO_RADIUS_M,
     NO_DATE_RANGE_LIMIT_CAP,
     QueryValidationError,
     validate_query_spec,
 )
 
 ALLOWED = ["orders"]
+ALLOWED_WITH_USERS = ["orders", "users"]
+GEO_FIELDS = {"users": {"location"}}
 
 
 def test_valid_find_spec_passes():
@@ -193,3 +196,54 @@ def test_custom_max_date_range_days_parameter_respected():
 
 def test_default_max_date_range_days_constant_is_365():
     assert MAX_DATE_RANGE_DAYS == 365
+
+
+def _geo_spec(max_distance_m=1000.0, field="location", collection="users"):
+    return QuerySpec(
+        collection=collection,
+        operation="find",
+        geo_near=GeoNear(field=field, longitude=67.0, latitude=24.8, max_distance_m=max_distance_m),
+    )
+
+
+def test_geo_near_on_a_geo_capable_collection_passes():
+    result = validate_query_spec(_geo_spec(), ALLOWED_WITH_USERS, geo_allowed_fields=GEO_FIELDS)
+    assert result.geo_near.max_distance_m == 1000.0
+
+
+def test_geo_near_is_clamped_to_max_radius():
+    result = validate_query_spec(
+        _geo_spec(max_distance_m=999_999_999),
+        ALLOWED_WITH_USERS,
+        geo_allowed_fields=GEO_FIELDS,
+        max_geo_radius_m=50_000,
+    )
+    assert result.geo_near.max_distance_m == 50_000
+
+
+def test_geo_near_on_a_non_geo_capable_collection_rejected():
+    spec = _geo_spec(collection="orders")
+    with pytest.raises(QueryValidationError, match="does not support geo queries"):
+        validate_query_spec(spec, ALLOWED, geo_allowed_fields={})
+
+
+def test_geo_near_with_unrecognized_field_rejected():
+    spec = _geo_spec(field="not_a_real_field")
+    with pytest.raises(QueryValidationError, match="not recognized"):
+        validate_query_spec(spec, ALLOWED_WITH_USERS, geo_allowed_fields=GEO_FIELDS)
+
+
+def test_geo_near_with_non_positive_distance_rejected():
+    spec = _geo_spec(max_distance_m=0)
+    with pytest.raises(QueryValidationError, match="must be positive"):
+        validate_query_spec(spec, ALLOWED_WITH_USERS, geo_allowed_fields=GEO_FIELDS)
+
+
+def test_spec_without_geo_near_is_unaffected_by_geo_validation():
+    spec = QuerySpec(collection="orders", operation="find")
+    result = validate_query_spec(spec, ALLOWED)
+    assert result.geo_near is None
+
+
+def test_default_max_geo_radius_m_constant_is_50000():
+    assert MAX_GEO_RADIUS_M == 50_000
