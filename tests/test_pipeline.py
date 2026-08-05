@@ -711,25 +711,61 @@ def test_circuit_breaker_open_gives_a_clean_message_not_the_raw_exception(monkey
 
 def test_rate_limited_user_gets_a_clean_message_without_reaching_gemini(monkeypatch):
     _patch_shared_caches(monkeypatch)
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _fake_db([{"amount": 10}]),
+    )
+
     monkeypatch.setattr(rate_limiter, "_limit", 1)
 
     gemini = _StubGemini()
-    first = answer_question("first question", gemini, channel_id="C1", user_id="U1")
+
+    first = answer_question(
+        "first question",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+    )
+
     assert first == "the answer"
 
-    second = answer_question("second question", gemini, channel_id="C1", user_id="U1")
+    second = answer_question(
+        "second question",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+    )
 
     assert "asking faster" in second
-    assert gemini.query_spec_calls == 1  # the second call never reached Gemini
+    assert gemini.query_spec_calls == 1
 
 
 def test_rate_limit_is_scoped_per_user_not_shared_across_the_channel(monkeypatch):
     _patch_shared_caches(monkeypatch)
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _fake_db([{"amount": 10}]),
+    )
+
     monkeypatch.setattr(rate_limiter, "_limit", 1)
 
     gemini = _StubGemini()
-    answer_question("q from u1", gemini, channel_id="C1", user_id="U1")
-    other_user = answer_question("q from u2", gemini, channel_id="C1", user_id="U2")
+
+    answer_question(
+        "q from u1",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+    )
+
+    other_user = answer_question(
+        "q from u2",
+        gemini,
+        channel_id="C1",
+        user_id="U2",
+    )
 
     assert other_user == "the answer"
 
