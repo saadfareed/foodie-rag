@@ -140,6 +140,17 @@ one enforces, and the tradeoffs behind them.
    - `SLACK_SOCKET_MODE_CONCURRENCY=10` -- thread pool size for the Socket Mode client (this is
      `slack_sdk`'s own default; made explicit here so it's tuned deliberately, not left implicit).
    - `SLACK_ALLOWED_CHANNEL_IDS`, `SLACK_ALLOWED_USER_IDS` (comma-separated; empty = open to all)
+
+   **Required bot token scopes.** Under *OAuth & Permissions -> Bot Token Scopes* in your Slack
+   app, the token needs at least `chat:write` (posting answers), `files:write` (attaching
+   generated CSV/XLSX/PDF reports), `commands` (the slash commands), plus `app_mentions:read`
+   and `im:history` for the mention and DM event subscriptions. **A scope change only takes
+   effect once you reinstall the app to the workspace**, which issues a new `SLACK_BOT_TOKEN`.
+
+   Missing `files:write` is the one that degrades quietly: every text answer keeps working and
+   only report requests fall back to prose, with a logged `slack_file_upload_failed`. `app.main`
+   checks the granted scopes at startup and logs `startup_scope_warning` naming what's missing,
+   so this surfaces at boot rather than the first time somebody asks for a PDF.
    - `USER_RATE_LIMIT_PER_MINUTE=10` (0 = disabled), `USER_RATE_LIMIT_WINDOW_SECONDS=60.0` -- caps
      how many questions one (channel, user) pair may ask per window
      ([app/rag/rate_limiter.py](app/rag/rate_limiter.py)). Independent of

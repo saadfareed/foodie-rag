@@ -13,6 +13,7 @@ from app.db.mongo import close_client, get_db
 from app.generators.render_pool import shutdown as shutdown_render_pool
 from app.llm.gemini_client import GeminiClient
 from app.slack.handlers import register_handlers
+from app.slack.scopes import missing_scope_warning
 
 
 def main() -> None:
@@ -32,6 +33,14 @@ def main() -> None:
         ensure_indexes(get_db())
 
         app = App(token=settings.slack_bot_token, signing_secret=settings.slack_signing_secret)
+
+        # Checked here rather than discovered when a user asks for a report: a missing scope is
+        # invisible until the one API call that needs it is made, which for files:write is the
+        # first report request -- long after anyone would connect it to installation.
+        scope_warning = missing_scope_warning(app.client)
+        if scope_warning:
+            logger.warning("startup_scope_warning", extra={"event": {"message": scope_warning}})
+
         # Built once and shared across every request -- see app/slack/handlers.py.
         gemini = GeminiClient()
         register_handlers(app, gemini)

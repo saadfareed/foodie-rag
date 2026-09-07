@@ -30,15 +30,18 @@ class _FakeApp:
 
 
 class _FakeSlackClient:
-    """Records files_upload_v2 calls; `fail` makes every upload raise, to exercise the fallback."""
+    """Records files_upload_v2 calls; `fail`/`error` drive the upload-failure paths."""
 
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, error=None):
         self.uploads = []
         self.fail = fail
+        self.error = error
 
     def files_upload_v2(self, **kwargs):
+        if self.error is not None:
+            raise self.error
         if self.fail:
-            raise RuntimeError("missing_scope: files:write")
+            raise RuntimeError("upload exploded")
         self.uploads.append(kwargs)
 
 
@@ -243,6 +246,34 @@ def test_a_failed_upload_still_delivers_the_text_answer(monkeypatch, caplog):
     assert "couldn't upload" in say_calls[0]["text"]
     # Logged rather than swallowed -- an upload failing on every request is invisible otherwise.
     assert "slack_file_upload_failed" in caplog.text
+
+
+def test_a_missing_scope_upload_failure_says_what_to_fix(monkeypatch, caplog):
+    """A missing scope is a one-time install fix that will fail identically forever until
+    someone makes it -- "couldn't upload it" alone reads like a glitch worth retrying."""
+    from slack_sdk.errors import SlackApiError
+
+    app, _gemini, _calls = _register(
+        monkeypatch,
+        result=AnswerResult(text="Here's your report.", file_bytes=b"%PDF-", file_type="pdf"),
+    )
+    error = SlackApiError(
+        "missing scope",
+        response={"ok": False, "error": "missing_scope", "needed": "files:write"},
+    )
+    say_calls = []
+
+    with caplog.at_level(logging.ERROR, logger="audit"):
+        app.events["app_mention"](
+            {"channel": "C1", "user": "U1", "text": "pdf report", "ts": "1"},
+            lambda **kw: say_calls.append(kw),
+            _FakeSlackClient(error=error),
+        )
+
+    message = say_calls[0]["text"]
+    assert "Here's your report." in message
+    assert "files:write" in message
+    assert "reinstall" in message.lower()
 
 
 def test_login_scopes_subsequent_questions_to_that_vendor(monkeypatch):

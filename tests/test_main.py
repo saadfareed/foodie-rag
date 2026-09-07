@@ -5,9 +5,19 @@ import pytest
 from app import main as main_module
 
 
+class _FakeWebClient:
+    """`app.client`, used by the startup scope check. Returns no scopes header, which the check
+    reads as "couldn't determine" and passes over -- keeping these tests about main()'s wiring
+    rather than about scopes (see tests/test_scopes.py for that)."""
+
+    def auth_test(self):
+        return type("_Response", (), {"headers": {}})()
+
+
 class _FakeApp:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.client = _FakeWebClient()
 
 
 class _FakeHandler:

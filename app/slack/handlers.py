@@ -26,6 +26,28 @@ def _strip_mention(text: str) -> str:
     return _MENTION_RE.sub("", text).strip()
 
 
+def _upload_failure_note(exc: Exception, file_type: str) -> str:
+    """Why the file didn't arrive, phrased so the reader can act on it.
+
+    A missing scope is worth calling out by name. It is a one-time install fix, it will fail
+    identically on every future report until someone makes it, and "couldn't upload it" alone
+    reads like a transient glitch worth retrying -- which it never is.
+    """
+    label = file_type.upper()
+    # SlackApiError.response is a SlackResponse (payload on `.data`) in real use, but the API
+    # also permits a plain dict -- unwrap whichever this is rather than assuming.
+    response = getattr(exc, "response", None)
+    error = getattr(response, "data", response) or {}
+    if isinstance(error, dict) and error.get("error") == "missing_scope":
+        needed = error.get("needed") or "files:write"
+        return (
+            f"(I built the {label} report but this app can't upload files: its Slack token is "
+            f"missing the `{needed}` scope. An admin can add it under OAuth & Permissions and "
+            "reinstall the app.)"
+        )
+    return f"(I generated a {label} file but couldn't upload it to this channel.)"
+
+
 def _send_response(
     result: AnswerResult,
     say=None,
@@ -54,15 +76,12 @@ def _send_response(
                 thread_ts=thread_ts,
             )
             return
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "slack_file_upload_failed",
                 extra={"event": {"channel_id": channel_id, "file_type": result.file_type}},
             )
-            text = (
-                f"{text}\n\n_(I generated a {result.file_type.upper()} file but couldn't upload "
-                "it to this channel.)_"
-            )
+            text = f"{text}\n\n_{_upload_failure_note(exc, result.file_type)}_"
 
     if say:
         say(text=text, thread_ts=thread_ts)
