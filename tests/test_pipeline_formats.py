@@ -138,7 +138,7 @@ def test_an_explicit_format_overrides_the_models_inference():
 def test_generated_files_contain_the_data():
     csv_result = answer_question("csv of orders", _StubGemini(), channel_id="C1", user_id="U1")
     text = csv_result.file_bytes.decode("utf-8-sig")
-    assert "Order ID,Status,Amount" in text
+    assert "Order #,Order Payment,Current Status" in text
     assert "ORD-1" in text
 
     xlsx_result = answer_question("orders as excel", _StubGemini(), channel_id="C1", user_id="U2")

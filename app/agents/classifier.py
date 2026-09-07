@@ -48,6 +48,13 @@ class Classification(BaseModel):
     # runs and overrides whatever the model says -- see app/services/intent_router.py. This
     # field is for the implicit cases the regex can't catch, like "put together a report".
     output_format: OutputFormat = "text"
+    # Title for a generated CSV/XLSX/PDF, in the user's own terms: "last 10 incomplete order
+    # details" -> "Last 10 Incomplete Order Details". Carried on this call for the same reason
+    # as output_format -- the classifier is already reading the question closely, so naming the
+    # report costs nothing extra. Empty means "no opinion"; the caller falls back to
+    # REPORT_TITLE. A generic report title ("Data Report") on a specific request is a small
+    # thing that makes a document feel like it wasn't actually about what was asked.
+    report_title: str = ""
     # Whether resolved_question needed the previous turn's question to make sense. Defaults to
     # "new_topic" so a Classification built without ever mentioning context (e.g. every existing
     # test, or a call site that never passes previous_question) reads as standalone.
@@ -81,6 +88,14 @@ _PROMPT = PromptTemplate.from_template(
     'When someone asks for a "report" or a "breakdown with a chart" without naming a file type, '
     'that is "pdf". A plain question -- even one whose answer happens to be a list -- is '
     '"text".\n'
+    "- report_title: a short Title Case heading for the generated file, restating what the user "
+    "asked for in their own terms. Keep every qualifier that identifies the data -- a count, a "
+    "time range, a status, a named entity -- because those are what distinguish this report "
+    'from the next one. Drop the format word and the request phrasing ("give me", "I need"). '
+    'Examples: "I need last 10 incomplete order details in csv" -> "Last 10 Incomplete Order '
+    'Details"; "vendors in Lahore as a pdf" -> "Vendors In Lahore"; "export all cash orders '
+    'from last week to excel" -> "Cash Orders From Last Week". Leave it "" when output_format '
+    'is "text".\n'
     "- confidence: your confidence (0-1) that the listed domains are correct and sufficient.\n"
     "- clarification_question: if the question is ambiguous, missing a location for a geo "
     "question, or doesn't clearly map to any domain, a short question to ask the user; "

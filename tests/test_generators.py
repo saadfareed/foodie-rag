@@ -14,7 +14,13 @@ from openpyxl import load_workbook
 from app.generators.charts import choose_chart, extract_series, render_chart_png
 from app.generators.csv_generator import generate_csv
 from app.generators.pdf_generator import generate_pdf
-from app.generators.tabular import build_table, build_tables, humanize_header, table_note
+from app.generators.tabular import (
+    build_table,
+    build_tables,
+    humanize_header,
+    render_cell,
+    table_note,
+)
 from app.generators.xlsx_generator import generate_xlsx
 
 _ORDER_ROWS = [
@@ -33,7 +39,16 @@ _ROWS_BY_DOMAIN = {"orders": _ORDER_ROWS, "vendors": [{"user_id": "USR-1", "rati
 
 def test_humanize_header_uppercases_id_and_titles_the_rest():
     assert humanize_header("vendor_id") == "Vendor ID"
-    assert humanize_header("business_name") == "Business Name"
+    assert humanize_header("category") == "Category"
+
+
+def test_humanize_header_uses_the_name_a_person_would_use():
+    """The mechanical rendering is right often enough, but "Order ID" isn't what anyone calls
+    an order number and a bare "Amount" doesn't say what kind."""
+    assert humanize_header("order_id") == "Order #"
+    assert humanize_header("amount") == "Order Payment"
+    assert humanize_header("status") == "Current Status"
+    assert humanize_header("business_name") == "Vendor Name"
 
 
 def test_build_table_unions_columns_across_non_uniform_rows():
@@ -49,6 +64,59 @@ def test_build_table_returns_none_for_no_rows():
     assert build_table("orders", []) is None
 
 
+def test_declared_report_columns_lead_in_their_declared_order():
+    """Mongo key order is an implementation detail, not a reading order -- a reader wants to see
+    who the order is for and which order it is before the payment internals."""
+    row = {
+        "payment_method": "cash",
+        "status": "pending",
+        "vendor_name": "Al-Noor Restaurant",
+        "amount": 120.5,
+        "order_type": "delivery",
+        "order_id": "ORD-1",
+        "customer_name": "Ayesha Khan",
+    }
+    table = build_table("orders", [row])
+
+    assert table.headers[:6] == [
+        "Customer Name",
+        "Order #",
+        "Order Payment",
+        "Order Type",
+        "Current Status",
+        "Vendor Name",
+    ]
+
+
+def test_payment_plumbing_is_hidden_from_reports():
+    """onlinepaymentmethod/isWallet are the storage encoding payment_method already names in
+    words, and payby is its per-method breakdown. Answerable, but not columns a person reads."""
+    table = build_table(
+        "orders",
+        [{"order_id": "ORD-1", "onlinepaymentmethod": 2, "isWallet": True, "payby": {"card": 10}}],
+    )
+
+    assert table.headers == ["Order #"]
+
+
+def test_hidden_columns_are_kept_when_nothing_else_survives():
+    """A question specifically about isWallet would otherwise render an empty table."""
+    table = build_table("orders", [{"isWallet": True}, {"isWallet": False}])
+
+    assert table.headers == ["Iswallet"]
+
+
+def test_render_cell_trims_datetime_noise():
+    """Executor rows carry datetimes as strings; str(datetime) is microseconds and an offset
+    that is always UTC, in the widest column of the table."""
+    assert render_cell("2026-09-07 20:11:40.640857+00:00") == "2026-09-07 20:11"
+    assert render_cell("2026-09-07T20:11:40Z") == "2026-09-07 20:11"
+    assert render_cell("ORD-1") == "ORD-1"
+    assert render_cell(None) == ""
+    assert render_cell(10.0) == "10"
+    assert render_cell(213.85) == "213.85"
+
+
 def test_row_and_column_caps_are_reported_not_silent(monkeypatch):
     monkeypatch.setattr("app.generators.tabular.settings.report_max_rows", 2)
     monkeypatch.setattr("app.generators.tabular.settings.report_max_columns", 2)
@@ -57,7 +125,9 @@ def test_row_and_column_caps_are_reported_not_silent(monkeypatch):
 
     assert len(table.rows) == 2
     assert table.truncated_rows is True
-    assert table.dropped_columns == ["amount"]
+    # `orders` declares a report column order, so the two kept columns are the first two of it
+    # that are present -- order_id then amount -- leaving status dropped.
+    assert table.dropped_columns == ["status"]
     note = table_note(table)
     assert "2 of 12" in note and "1 further column" in note
 
@@ -82,8 +152,8 @@ def test_chart_prefers_a_low_cardinality_dimension_over_an_identifier():
     table = build_table("orders", _ORDER_ROWS)
     spec = choose_chart(table)
 
-    assert table.headers[spec.label_column] == "Status"
-    assert table.headers[spec.value_column] == "Amount"
+    assert table.headers[spec.label_column] == "Current Status"
+    assert table.headers[spec.value_column] == "Order Payment"
 
 
 def test_the_question_steers_the_chart_dimension():
@@ -95,7 +165,7 @@ def test_the_question_steers_the_chart_dimension():
     ]
     table = build_table("orders", rows)
 
-    assert table.headers[choose_chart(table, "orders by status").label_column] == "Status"
+    assert table.headers[choose_chart(table, "orders by status").label_column] == "Current Status"
     assert table.headers[choose_chart(table, "orders by city").label_column] == "City"
     # With no question, lowest cardinality decides.
     assert table.headers[choose_chart(table).label_column] == "City"
@@ -107,6 +177,18 @@ def test_column_matching_is_by_word_not_substring():
 
     assert _mentioned_in("orders by status", "Status")
     assert not _mentioned_in("show me capacity", "City")
+
+
+def test_a_filtered_subset_charts_by_the_column_that_defines_it():
+    """ "incomplete" names no column, but it *is* a statement about status -- and where those
+    orders are stuck is the insight an incomplete-orders report exists to give."""
+    from app.generators.charts import _mentioned_in
+
+    assert _mentioned_in("last 10 incomplete order details", "Current Status")
+    assert _mentioned_in("pending orders this week", "Current Status")
+    # "order" is in both the question and the header, but it's too generic to discriminate --
+    # matching on it would mark every column as mentioned.
+    assert not _mentioned_in("last 10 incomplete order details", "Order Type")
 
 
 def test_chart_aggregates_repeated_dimension_values():
@@ -167,8 +249,8 @@ def test_csv_has_a_title_header_row_and_data():
 
     assert lines[0] == "Data Report"
     assert "Orders" in lines
-    assert "Order ID,Status,Amount" in lines
-    assert "ORD-1,delivered,10.0" in lines
+    assert "Order #,Order Payment,Current Status" in lines
+    assert "ORD-1,10,delivered" in lines
 
 
 def test_csv_writes_each_domain_as_its_own_block():
@@ -207,17 +289,17 @@ def test_xlsx_has_a_title_a_header_row_and_native_typed_data():
 
     assert sheet["A1"].value == "Orders"
     header_row = next(
-        row for row in sheet.iter_rows(values_only=True) if row and row[0] == "Order ID"
+        row for row in sheet.iter_rows(values_only=True) if row and row[0] == "Order #"
     )
-    assert header_row[:3] == ("Order ID", "Status", "Amount")
+    assert header_row[:3] == ("Order #", "Order Payment", "Current Status")
 
     header_index = next(
         i
         for i, row in enumerate(sheet.iter_rows(values_only=True), start=1)
-        if row and row[0] == "Order ID"
+        if row and row[0] == "Order #"
     )
     # Numbers stay numeric so Excel sorts and formats them correctly.
-    amounts = [row[2] for row in sheet.iter_rows(min_row=header_index + 1, values_only=True)]
+    amounts = [row[1] for row in sheet.iter_rows(min_row=header_index + 1, values_only=True)]
     assert amounts and all(isinstance(a, (int, float)) for a in amounts)
 
 

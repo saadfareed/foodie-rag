@@ -17,7 +17,7 @@ collection for its pool of customer/vendor ids and fails clearly if it's empty.
 
 Usage:
     python -m app.db.seed_users
-    python -m app.db.seed [--count-per-method 6]
+    python -m app.db.seed [--count-per-method 12]
 """
 
 import argparse
@@ -35,7 +35,34 @@ PAYMENT_METHOD_MAP: dict[str, tuple[int, bool]] = {
     "hybrid_card_wallet": (2, True),
 }
 
-STATUSES = ["completed", "completed", "completed", "pending", "refunded"]
+# Order lifecycle. TERMINAL_STATUSES are the ones where nothing further will happen; everything
+# else is "in flight" and is what a question about *incomplete* / outstanding / open / pending
+# orders is asking for. Keeping both sets here (rather than only a flat list) means the same
+# definition drives the seed data and the schema annotation shown to the model, so "incomplete"
+# can't come to mean two different things.
+TERMINAL_STATUSES = ["completed", "delivered", "cancelled", "refunded"]
+INCOMPLETE_STATUSES = ["pending", "confirmed", "preparing", "out_for_delivery", "on_hold"]
+
+# Weighted so most orders are finished but there's always a healthy set of in-flight ones to
+# report on -- an "incomplete orders" question against data that is 95% completed returns almost
+# nothing and looks broken.
+STATUSES = [
+    "completed",
+    "completed",
+    "delivered",
+    "delivered",
+    "cancelled",
+    "refunded",
+    "pending",
+    "pending",
+    "confirmed",
+    "preparing",
+    "out_for_delivery",
+    "on_hold",
+]
+
+# How the order is fulfilled -- distinct from payment_method (how it's paid for).
+ORDER_TYPES = ["delivery", "delivery", "delivery", "pickup", "dine_in"]
 
 
 def build_payment_fields(payment_method: str) -> tuple[int, bool]:
@@ -65,7 +92,7 @@ def build_payby(payment_method: str, amount: float, rng: random.Random) -> dict[
 def generate_sample_orders(
     customer_ids: list[str],
     vendor_ids: list[str],
-    count_per_method: int = 6,
+    count_per_method: int = 12,
     seed: int | None = 42,
 ) -> list[dict]:
     rng = random.Random(seed)  # nosec B311 - non-cryptographic demo data, seeded for reproducibility
@@ -83,6 +110,7 @@ def generate_sample_orders(
                     "customer_id": rng.choice(customer_ids),
                     "vendor_id": rng.choice(vendor_ids),
                     "amount": amount,
+                    "order_type": rng.choice(ORDER_TYPES),
                     "payment_method": payment_method,
                     "onlinepaymentmethod": onlinepaymentmethod,
                     "isWallet": is_wallet,
@@ -96,7 +124,7 @@ def generate_sample_orders(
     return orders
 
 
-def seed_orders(count_per_method: int = 6, clear_existing: bool = True) -> int:
+def seed_orders(count_per_method: int = 12, clear_existing: bool = True) -> int:
     db = get_db()
     customer_ids = db["users"].distinct("user_id", {"usertype": 1})
     vendor_ids = db["users"].distinct("user_id", {"usertype": 2})
@@ -116,7 +144,7 @@ def seed_orders(count_per_method: int = 6, clear_existing: bool = True) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--count-per-method", type=int, default=6)
+    parser.add_argument("--count-per-method", type=int, default=12)
     parser.add_argument("--keep-existing", action="store_true")
     args = parser.parse_args()
 

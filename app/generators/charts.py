@@ -78,15 +78,75 @@ def _numeric_column_indexes(table: ReportTable) -> list[int]:
     return result
 
 
+# Words that name a column without using its column name. A question filtered to "incomplete"
+# orders is a question *about status*, and the chart that adds most to that report is the one
+# showing where those orders actually are -- which stage they're stuck at, not how they're paid.
+# Without this the dimension falls to whichever column happens to have fewest distinct values.
+#
+# Keyed by the column name each group implies; extend rather than generalize, since the value
+# here is in the specific vocabulary a domain actually uses.
+_DIMENSION_SYNONYMS: dict[str, frozenset[str]] = {
+    "status": frozenset(
+        {
+            "incomplete",
+            "complete",
+            "completed",
+            "pending",
+            "outstanding",
+            "open",
+            "unfinished",
+            "stuck",
+            "state",
+            "stage",
+            "progress",
+            "cancelled",
+            "delivered",
+            "refunded",
+        }
+    ),
+}
+
+
+# Header words too generic to tell one column from another. "Order Type" and "Order Payment"
+# both contain "order", and so does almost every question about orders -- matching on it would
+# mark every column as mentioned and collapse this back to a pure cardinality tie-break.
+_GENERIC_HEADER_WORDS = frozenset(
+    {
+        "order",
+        "orders",
+        "customer",
+        "customers",
+        "vendor",
+        "vendors",
+        "detail",
+        "details",
+        "data",
+        "record",
+        "records",
+        "name",
+        "current",
+    }
+)
+
+
 def _mentioned_in(question: str, header: str) -> bool:
-    """Whether the question refers to this column, by word.
+    """Whether the question refers to this column, by word or by an implying synonym.
 
     Word-level matching, not substring: "status" should match "Status" and "order status", while
     "city" must not match a question mentioning "capacity".
     """
     words = set(re.findall(r"[a-z]+", question.lower()))
-    header_words = [w for w in re.findall(r"[a-z]+", header.lower()) if len(w) > 2]
-    return bool(header_words) and any(word in words for word in header_words)
+    header_words = [
+        w
+        for w in re.findall(r"[a-z]+", header.lower())
+        if len(w) > 2 and w not in _GENERIC_HEADER_WORDS
+    ]
+    if header_words and any(word in words for word in header_words):
+        return True
+    for column, synonyms in _DIMENSION_SYNONYMS.items():
+        if column in {w.lower() for w in header_words} and words & synonyms:
+            return True
+    return False
 
 
 def _label_column_index(

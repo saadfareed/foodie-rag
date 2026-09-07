@@ -30,7 +30,12 @@ from weasyprint import HTML  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.generators.charts import render_chart_base64  # noqa: E402
-from app.generators.tabular import ReportTable, build_tables, table_note  # noqa: E402
+from app.generators.tabular import (  # noqa: E402
+    ReportTable,
+    build_tables,
+    render_cell,
+    table_note,
+)
 
 _TEMPLATE_SOURCE = """
 <!DOCTYPE html>
@@ -106,7 +111,7 @@ _TEMPLATE_SOURCE = """
       <thead><tr>{% for header in table.headers %}<th>{{ header }}</th>{% endfor %}</tr></thead>
       <tbody>
         {% for row in table.rows %}
-        <tr>{% for cell in row %}<td>{{ cell if cell is not none else "" }}</td>{% endfor %}</tr>
+        <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
         {% endfor %}
       </tbody>
     </table>
@@ -174,7 +179,10 @@ def generate_pdf(
             {
                 "title": table.title,
                 "headers": table.headers,
-                "rows": table.rows,
+                # Rendered here rather than in the template so a datetime prints as
+                # "2026-09-07 20:08" instead of str()'s microsecond-and-offset form, which is
+                # both unreadable and the widest thing in the table.
+                "rows": [[render_cell(cell) for cell in row] for row in table.rows],
                 "note": table_note(table),
             }
             for table in tables

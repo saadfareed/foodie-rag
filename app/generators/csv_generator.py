@@ -13,23 +13,27 @@ empty cells with a `domain` discriminator nobody asked for.
 import csv
 import io
 
-from app.generators.tabular import ReportTable, build_tables, table_note
+from app.generators.tabular import ReportTable, build_tables, render_cell, table_note
 
 # Excel interprets a leading =, +, -, or @ in a cell as the start of a formula. A value from the
 # database that happens to start with one would execute on open, which is CSV injection.
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
-def _escape_cell(value: object) -> object:
-    """Neutralize a value Excel would otherwise treat as a formula.
+def _escape_cell(value: object) -> str:
+    """Render a cell, neutralizing anything Excel would otherwise treat as a formula.
 
     Prefixing with an apostrophe is the conventional fix: Excel shows the original text and
-    treats it as a literal string. Numbers are left alone -- they are typed as numeric, not
-    parsed as text, so a negative number is never a formula.
+    treats it as a literal string. The guard is applied after rendering, so a formatted value
+    can't slip through unchecked.
     """
-    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
-        return "'" + value
-    return value
+    rendered = render_cell(value)
+    # Guarded on the *original* type, not the rendered text: a negative number renders as "-5",
+    # which starts with a formula prefix but is plain numeric data. Only text that came from the
+    # database as text can carry an injected formula.
+    if isinstance(value, str) and rendered.startswith(_FORMULA_PREFIXES):
+        return "'" + rendered
+    return rendered
 
 
 def _write_table(writer: "csv._writer", table: ReportTable) -> None:

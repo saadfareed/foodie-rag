@@ -44,7 +44,14 @@ _INTERNAL_FIELD_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 # Real fields whose value is a credential -- key kept, value replaced.
 _SECRET_FIELD_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"card"),  # card_number, credit_card, cardholder
+    # Card patterns require a qualifier. A bare `card` is NOT treated as a secret, because it is
+    # commonly a payment-*method* label rather than a number -- `payby: {"cash": 100}` /
+    # `payby: {"card": 60}` breaks an order's amount down by method, and redacting that turns a
+    # legitimate payment breakdown into "card=[REDACTED]". The qualified forms below are the
+    # ones that actually carry a PAN.
+    re.compile(r"(?:credit|debit)[_\s-]?card"),
+    re.compile(r"card[_\s-]?(?:number|no|num|holder|details?|info)"),
+    re.compile(r"^cardnumber$"),
     re.compile(r"^cc(?:_|$)"),  # cc, cc_num -- but NOT "account" or "occurred"
     re.compile(r"cvv|cvc"),
     re.compile(r"passw(?:or)?d|passcode"),

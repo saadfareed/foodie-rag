@@ -34,6 +34,86 @@ VENDOR_CATEGORIES = ["restaurant", "grocery", "pharmacy", "electronics", "clothi
 LOYALTY_TIERS = ["bronze", "silver", "gold"]
 STATUSES = ["active", "active", "active", "inactive", "suspended"]
 
+# Real-looking person names, so a report reads "Ayesha Khan" rather than "Customer 00007".
+# A placeholder name is fine for a geo query but useless in a customer-facing report -- and it
+# hides formatting bugs (column widths, truncation, non-ASCII handling) that only show up once
+# names vary in length. Names are drawn from the regions the CITIES above cover.
+FIRST_NAMES = [
+    "Ayesha",
+    "Bilal",
+    "Fatima",
+    "Hamza",
+    "Iqra",
+    "Junaid",
+    "Khadija",
+    "Lubna",
+    "Mahnoor",
+    "Noman",
+    "Omar",
+    "Rabia",
+    "Saad",
+    "Sana",
+    "Tariq",
+    "Usman",
+    "Wajiha",
+    "Yasir",
+    "Zainab",
+    "Zohaib",
+    "Adeel",
+    "Hina",
+    "Imran",
+    "Nadia",
+]
+LAST_NAMES = [
+    "Ahmed",
+    "Akhtar",
+    "Ali",
+    "Aslam",
+    "Baig",
+    "Chaudhry",
+    "Farooq",
+    "Hussain",
+    "Iqbal",
+    "Javed",
+    "Khan",
+    "Malik",
+    "Mirza",
+    "Qureshi",
+    "Raza",
+    "Sheikh",
+    "Siddiqui",
+    "Tanveer",
+    "Yousaf",
+    "Zafar",
+]
+
+# Vendor business names are built from these rather than "<person name> Store", so a vendor
+# column in a report reads like a real business and is visibly distinct from a customer name.
+BUSINESS_PREFIXES = [
+    "Al-Noor",
+    "Bismillah",
+    "City",
+    "Crescent",
+    "Diamond",
+    "Eastern",
+    "Gulberg",
+    "Karachi",
+    "Lahore",
+    "Metro",
+    "New",
+    "Pak",
+    "Royal",
+    "Shalimar",
+    "Star",
+]
+BUSINESS_SUFFIXES = {
+    "restaurant": ["Restaurant", "Kitchen", "Grill", "Cafe", "Biryani House"],
+    "grocery": ["Grocers", "Mart", "Superstore", "Provisions", "Cash & Carry"],
+    "pharmacy": ["Pharmacy", "Medicos", "Chemists", "Drug Store", "Medical Store"],
+    "electronics": ["Electronics", "Traders", "Tech Hub", "Appliances", "Gadgets"],
+    "clothing": ["Fabrics", "Garments", "Boutique", "Textiles", "Collection"],
+}
+
 
 def _scatter(rng: random.Random, center_lng: float, center_lat: float) -> dict:
     lng = round(center_lng + rng.uniform(-0.15, 0.15), 6)
@@ -62,7 +142,7 @@ def generate_sample_users(
             last_active_at = created_at + timedelta(seconds=rng.uniform(0, span_seconds))
         doc = {
             "user_id": f"USR-{seq:05d}",
-            "name": f"{'Customer' if usertype == 1 else 'Vendor'} {seq:05d}",
+            "name": f"{rng.choice(FIRST_NAMES)} {rng.choice(LAST_NAMES)}",
             "usertype": usertype,
             "status": rng.choice(STATUSES),
             "city": city,
@@ -80,8 +160,13 @@ def generate_sample_users(
 
     for _ in range(vendors):
         doc = base_doc(2)
-        doc["business_name"] = f"{doc['name']} Store"
-        doc["category"] = rng.choice(VENDOR_CATEGORIES)
+        category = rng.choice(VENDOR_CATEGORIES)
+        doc["category"] = category
+        # `name` stays the owner's personal name; `business_name` is what a report shows in a
+        # "vendor" column, so the two must not read the same way.
+        doc["business_name"] = (
+            f"{rng.choice(BUSINESS_PREFIXES)} {rng.choice(BUSINESS_SUFFIXES[category])}"
+        )
         doc["rating"] = round(rng.uniform(3.0, 5.0), 1)
         users.append(doc)
 

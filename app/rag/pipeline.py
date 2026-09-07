@@ -138,6 +138,7 @@ def _build_file(
     rows_by_domain: dict[str, list[dict]],
     question: str,
     answer: str,
+    title: str,
 ) -> tuple[bytes, str] | None:
     """Render the requested deliverable, or None if it can't be produced.
 
@@ -152,9 +153,9 @@ def _build_file(
         return None
 
     builders = {
-        "csv": lambda: generate_csv(rows_by_domain, title=settings.report_title),
-        "xlsx": lambda: generate_xlsx(rows_by_domain, title=settings.report_title),
-        "pdf": lambda: generate_pdf(rows_by_domain, question=question, answer=answer),
+        "csv": lambda: generate_csv(rows_by_domain, title=title),
+        "xlsx": lambda: generate_xlsx(rows_by_domain, title=title),
+        "pdf": lambda: generate_pdf(rows_by_domain, question=question, answer=answer, title=title),
     }
     builder = builders.get(output_format)
     if builder is None:
@@ -388,10 +389,18 @@ def answer_question(
     # the answer text is model-generated prose, and a model can restate a number it was shown.
     answer = scan_output_for_pii(answer)
 
+    # The classifier's title restates the request ("Last 10 Incomplete Order Details"); the
+    # configured REPORT_TITLE is the fallback when it had no opinion.
+    report_title = (
+        getattr(classification, "report_title", "") or ""
+    ).strip() or settings.report_title
+
     file_result = None
     if output_format != "text":
         with _timed_stage(timings, "render_ms"):
-            file_result = _build_file(output_format, rows_by_domain, effective_question, answer)
+            file_result = _build_file(
+                output_format, rows_by_domain, effective_question, answer, report_title
+            )
 
     if output_format != "text" and file_result is None and row_count > 0:
         answer = f"{answer}\n\n_(I couldn't build the {output_format.upper()} file this time.)_"

@@ -130,6 +130,26 @@ row/column caps, and flattens values once — so a CSV, an XLSX and a PDF of the
 the same columns in the same order. Caps that actually bite are stated in the output rather than
 truncating silently.
 
+Column order and headers are declared, not inferred. `DomainConfig.report_columns` is the reading
+order (Mongo key order is an implementation detail), `report_hidden_columns` drops storage-level
+encodings that are correct but unhelpful in a table (`onlinepaymentmethod`, `isWallet`, `payby`),
+and `_HEADER_OVERRIDES` supplies the name a person actually uses — "Order #", not "Order ID". So
+an `orders` table renders as:
+
+```
+Customer Name | Order # | Order Payment | Order Type | Current Status | Vendor Name | ...
+```
+
+`customer_name` and `vendor_name` are not stored on an order. `app/agents/enrichment.py` resolves
+them from `customer_id`/`vendor_id` after execution, with a single `$in` query over the indexed
+`user_id`, and drops the id once its name is in hand. Doing this in code rather than as a
+model-authored `$lookup` avoids needing `usertype` scoping inside a generated pipeline — and the
+join is identical every time, so there is nothing for a model to decide.
+
+The document title comes from `Classification.report_title`, produced by the classify call that
+was happening anyway: "last 10 incomplete order details in csv" titles the file *Last 10
+Incomplete Order Details*, falling back to `REPORT_TITLE` when the model has no opinion.
+
 The PDF template is fixed, not model-authored: **title → key insights → chart → data table**. The
 insights block reuses the answer the pipeline already synthesized rather than making a second
 call, so the document and the on-screen reply cannot disagree. Chart type is chosen by rule from

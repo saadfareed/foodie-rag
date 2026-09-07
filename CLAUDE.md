@@ -38,6 +38,8 @@ app/
     classifier.py    question -> domain(s) + confidence + clarification + context_mode/resolved_question
                      + output_format (all enum-constrained, all from ONE Gemini call)
     domains.py        domain registry; forces collection/usertype scoping in code (THE guardrail)
+                      + per-domain report column order / hidden columns
+    enrichment.py      customer_id/vendor_id -> customer_name/vendor_name, in code, one $in query
     query_agents.py   per-domain schema-scoped query generation
     graph.py           the StateGraph itself
     state.py            GraphState TypedDict (the graph's schema)
@@ -116,6 +118,7 @@ Slack event -> handlers.py -> access_control.is_authorized (+ auth.get_authentic
                (asks the user before discarding it -- no query generated yet)
             -> else [resolve_anchors if needed] -> fan out to domain_agent (parallel, one per domain)
                each domain_agent: generate -> scope -> validate -> execute -> **sanitize rows**
+                                  -> enrich_rows_with_names (ids -> names; no-op when no ids)
             -> synthesize
        -> clarification/context-switch handling / conversation_context_cache.set
        -> output_scanner.scan_output_for_pii over the prose
@@ -202,12 +205,32 @@ Every Gemini call funnels through `GeminiClient._call_with_retry`:
   dedicated "classify the intent" call previously cost a full quota unit per question to return
   one word, *and* called the transport without `query_generation_config` so it ran with thinking
   enabled. Don't reintroduce a standalone call for a decision the classify call can carry.
+- **Ids are resolved to names in code, not by a model-authored `$lookup`**
+  (`app/agents/enrichment.py`). A `$lookup` would need its own `usertype` scoping to avoid
+  joining a customer row onto a vendor column — exactly what `scope_spec_to_domain` exists to
+  keep out of the prompt's hands. The join is identical every time, so there is nothing for a
+  model to decide. The id column is dropped once its name is in hand (but only then), so a
+  report never shows `USR-00031` beside `Ayesha Khan`.
+- **Report presentation is declared per domain, not inferred**
+  (`DomainConfig.report_columns` / `report_hidden_columns`). Mongo key order is an
+  implementation detail; `report_columns` is the reading order. `report_hidden_columns` is a
+  *display* list — `onlinepaymentmethod`/`isWallet`/`payby` are correct data the model can still
+  answer about, just not columns a person reads. Keep it separate from
+  `app/security/field_policy.py`: those fields are withheld because showing them is unsafe,
+  these because showing them is unhelpful. Hidden columns are kept anyway if hiding them would
+  empty the table.
+- **The report title comes from the classifier** (`Classification.report_title`), on the call
+  that was happening anyway, so "last 10 incomplete order details in csv" produces a document
+  titled *Last 10 Incomplete Order Details* rather than the generic `REPORT_TITLE`.
 - **Chart type is chosen by rule, not by the model** (`app/generators/charts.py::choose_chart`):
   a temporal dimension is a line, few positive categories are a pie, everything else is a bar.
-  The dimension is the *lowest-cardinality* non-constant column, which is what stops a chart
-  being drawn against a unique identifier (24 bars, one per order id, saying nothing). Asking
-  Gemini to pick would add a round trip to the most quota-constrained path for a decision that
-  follows mechanically from the data's shape.
+  The dimension is a column the question named (including via `_DIMENSION_SYNONYMS` — asking for
+  *incomplete* orders is asking about `status`), falling back to the *lowest-cardinality*
+  non-constant column. That fallback is what stops a chart being drawn against a unique
+  identifier (24 bars, one per order id, saying nothing); the synonym step is what makes an
+  incomplete-orders report break down by where those orders are stuck. Asking Gemini to pick
+  would add a round trip to the most quota-constrained path for a decision that follows
+  mechanically from the data's shape.
 - **`app/rag/calculation.py` is unused** by the live pipeline (fully tested, but not wired in).
   Math currently happens via Gemini-authored aggregation stages or Gemini reasoning over raw
   rows. Wiring it in is a real design decision (where in the graph would it run?), not a small
@@ -249,6 +272,21 @@ Lint (must pass before any PR, also pre-commit/CI gated): `ruff check .`, `ruff 
 `bandit -r app`, `pip-audit`.
 
 ## Common gotchas learned the hard way
+
+- **A bare `card` field is a payment *method*, not a card number.** `payby: {"cash": 100}` /
+  `{"card": 60}` breaks an order's amount down by method, so a secret-field pattern matching
+  bare `card` turns a legitimate payment breakdown into `card=[REDACTED]`. The patterns in
+  `app/security/field_policy.py` require a qualifier (`card_number`, `credit_card`,
+  `cardholder`) for exactly this reason.
+- **Datetimes reach the report layer as strings, not datetimes** — `app/db/executor.py`'s
+  `_to_jsonable` stringifies them on the way out of Mongo. `str(datetime)` is
+  `"2026-09-07 20:14:38.461897+00:00"`: microseconds nobody asked for plus an always-UTC offset,
+  in the widest column of the table. `tabular.render_cell` re-parses and trims that; it handles
+  both the string and the object form.
+- **"order" is too generic to match a column on.** `_mentioned_in` filters
+  `_GENERIC_HEADER_WORDS` before matching, because "Order Type" and "Order Payment" both contain
+  it and so does nearly every question — matching on it marks every column as mentioned and
+  collapses the chart dimension back to a pure cardinality tie-break.
 
 - **`$limit` can only be pushed down past a *leading* run of `$match` stages, and only when
   every stage after it is 1:1** (`app/db/executor.py::_build_pipeline`). Two traps: putting it

@@ -31,6 +31,7 @@ requirement today and a generic planner would be speculative machinery for cases
 exist yet.
 """
 
+import logging
 import time
 
 from langgraph.graph import END, START, StateGraph
@@ -38,6 +39,7 @@ from langgraph.types import Send
 
 from app.agents.classifier import Classification, classify_question
 from app.agents.domains import DOMAINS, allowed_collections, geo_allowed_fields, merge_forced_filter
+from app.agents.enrichment import enrich_rows_with_names
 from app.agents.query_agents import generate_domain_query_spec
 from app.agents.state import GraphState
 from app.config import settings
@@ -47,6 +49,8 @@ from app.llm.circuit_breaker import CircuitBreakerOpenError
 from app.llm.gemini_client import GeminiClient, is_rate_limited
 from app.rag.query_spec import GeoNear, QueryError, QuerySpec
 from app.rag.validator import QueryValidationError, validate_query_spec
+
+logger = logging.getLogger("audit")
 
 
 def _friendly_generation_error(exc: Exception) -> str:
@@ -328,6 +332,19 @@ def _domain_agent_node(gemini: GeminiClient):
             id_filter=id_filter,
             spec_cache=state.get("spec_cache"),
         )
+
+        if rows:
+            # Resolve customer_id/vendor_id -> names so a report can show who an order is for
+            # instead of an opaque id. A no-op (and no query) when the rows carry no such ids,
+            # e.g. an aggregation grouped by status. Never fatal: the rows are already a correct
+            # answer, and losing the whole question over a failed name lookup would be a worse
+            # outcome than a report that shows ids.
+            try:
+                rows = enrich_rows_with_names(
+                    get_db(), rows, timeout_ms=settings.mongodb_query_timeout_ms
+                )
+            except Exception:  # noqa: BLE001 -- enrichment is presentation, not correctness
+                logger.warning("name_enrichment_failed", extra={"event": {"domain": domain_name}})
 
         elapsed = round((time.perf_counter() - start) * 1000, 2)
         update: dict = {
