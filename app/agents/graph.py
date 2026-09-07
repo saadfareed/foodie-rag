@@ -283,10 +283,24 @@ def _fan_out(state: GraphState) -> list[Send]:
 
 def _orders_id_filter(state: GraphState) -> dict | None:
     forced: dict = {}
-    if state.get("resolved_vendor_ids"):
+
+    # RBAC: Restrict vendor to their own orders
+    auth_vendor = state.get("authenticated_vendor_id")
+    if auth_vendor:
+        forced["vendor_id"] = auth_vendor
+    elif state.get("resolved_vendor_ids"):
         forced["vendor_id"] = {"$in": state["resolved_vendor_ids"]}
+
     if state.get("resolved_customer_ids"):
         forced["customer_id"] = {"$in": state["resolved_customer_ids"]}
+    return forced or None
+
+
+def _vendors_id_filter(state: GraphState) -> dict | None:
+    forced: dict = {}
+    auth_vendor = state.get("authenticated_vendor_id")
+    if auth_vendor:
+        forced["user_id"] = auth_vendor
     return forced or None
 
 
@@ -299,7 +313,12 @@ def _domain_agent_node(gemini: GeminiClient):
         geo_override_location = (
             state.get("resolved_customer_location") if domain_name == "vendors" else None
         )
-        id_filter = _orders_id_filter(state) if domain_name == "orders" else None
+
+        id_filter = None
+        if domain_name == "orders":
+            id_filter = _orders_id_filter(state)
+        elif domain_name == "vendors":
+            id_filter = _vendors_id_filter(state)
 
         spec, rows, error, out_of_scope = _generate_validate_execute(
             gemini,

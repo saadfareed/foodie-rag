@@ -15,11 +15,14 @@ graph TD
     Main[app/main.py<br/>main] -->|configure_logging, pool_size_warning,<br/>ensure_indexes, constructs once, injects| Handlers[app/slack/handlers.py<br/>register_handlers]
     Main -->|SIGTERM/SIGINT| Shutdown[handler.close + close_client]
 
-    Slack[Slack: /ask, @mention, DM] --> Handlers
+    Slack[Slack: /ask, @mention, DM, /login, /logout] --> Handlers
     Handlers --> AccessControl[app/slack/access_control.py]
-    Handlers --> Pipeline[app/rag/pipeline.py<br/>answer_question]
+    Handlers --> Auth[app/slack/auth.py<br/>TTL-bounded /login vendor sessions]
+    Handlers --> Pipeline[app/rag/pipeline.py<br/>answer_question -> AnswerResult]
+    Handlers -->|files_upload_v2, falls back to text| SlackFiles[(Slack file upload)]
 
-    Pipeline --> AnswerCache[app/rag/answer_cache.py<br/>per-channel TTL+LRU<br/>checked first -- a hit skips everything below]
+    Pipeline --> IntentRouter[app/services/intent_router.py<br/>regex only, no Gemini:<br/>explicit format + policy refusals]
+    Pipeline --> AnswerCache[app/rag/answer_cache.py<br/>TTL+LRU keyed by<br/>channel + vendor scope + format + question<br/>checked first -- a hit skips everything below]
     Pipeline --> RateLimiter[app/rag/rate_limiter.py<br/>per-(channel,user) sliding window<br/>checked before any Gemini/Mongo work]
     Pipeline --> Quota[app/llm/quota.py<br/>quota_tracker -- shared daily budget]
     Pipeline --> ClarificationCache[app/rag/clarification_cache.py<br/>per-(channel,user) pending-clarification state]
@@ -32,9 +35,19 @@ graph TD
     Graph --> Domains[app/agents/domains.py<br/>domain registry + forced scoping]
     Graph --> QueryAgents[app/agents/query_agents.py<br/>per-domain query generation]
     Graph --> Validator[app/rag/validator.py<br/>validate_query_spec]
-    Graph --> Executor[app/db/executor.py<br/>execute_query_spec]
+    Graph --> Executor[app/db/executor.py<br/>execute_query_spec<br/>+ sanitize_rows on every path out]
 
-    QueryAgents --> SchemaCtx[app/rag/schema_context.py<br/>build_domain_schema_context<br/>mtime-cached]
+    Pipeline --> Generators[app/generators/<br/>csv / xlsx / pdf]
+    Generators --> Tabular[app/generators/tabular.py<br/>bounded ReportTable]
+    Generators --> Charts[app/generators/charts.py<br/>rule-based pie/bar/line<br/>Figure API, never pyplot]
+    Generators --> RenderPool[app/generators/render_pool.py<br/>bounded pool + timeout]
+    Pipeline --> OutputScanner[app/security/output_scanner.py<br/>last-resort scan of the prose]
+
+    FieldPolicy[app/security/field_policy.py<br/>THE field allow/deny policy] --> SchemaCtx
+    FieldPolicy --> Validator
+    FieldPolicy --> Executor
+
+    QueryAgents --> SchemaCtx[app/rag/schema_context.py<br/>build_domain_schema_context<br/>mtime-cached, internal fields hidden]
     SchemaCtx --> SummaryFile[(schema_summary.json)]
     SchemaCtx --> AnnotationsFile[(schema_annotations.json)]
 
@@ -78,6 +91,54 @@ cost per question. `answer_question`'s `gemini=None` default exists only so test
 pass a stub — production code always passes the shared instance. `MongoClient` is likewise a
 process-wide singleton (`app/db/mongo.py::get_client`) with explicit connection timeouts, a
 bounded pool, and `close_client()` used on graceful shutdown.
+
+## The field policy: three layers, in order
+
+`app/security/field_policy.py` is the single source of truth for which document fields may leave
+the system. It distinguishes two actions: **drop** (storage plumbing — `_id`, `__v`, index
+fields — removed key and value) and **redact** (credential *values* — card numbers, CVVs,
+passwords, tokens — key kept, value replaced).
+
+It is enforced at three points, and the order matters:
+
+| Layer | Where | What it does | Why it isn't enough alone |
+|---|---|---|---|
+| 1. Hide | `app/rag/schema_context.py` | Filters denied fields out of the schema shown to each domain agent | A model can guess a field name it was never shown |
+| 2. Refuse | `app/rag/validator.py::_find_secret_field_reference` | Rejects a spec that references a secret-valued field | Only covers secrets, not internal fields (see below) |
+| 3. Strip | `app/db/executor.py` | `sanitize_rows` on every return path | — this is the backstop that cannot be bypassed |
+
+Layer 3 is deliberately at the *entrance* to the application rather than near the user. Every
+downstream consumer — the answer prompt, CSV/XLSX/PDF exports, the answer cache, the audit log —
+reads what the executor returns, so sanitizing there covers all of them by construction,
+including paths added later. The earlier design sanitized after synthesis, which meant the model
+had already been handed raw `_id`s and card numbers by the time the filter ran.
+
+Layer 2 checks `is_secret_field` only, **not** the broader `is_denied_field`. `_id` is legitimate
+pipeline syntax — a `$group` key is literally named `_id`, and `{"$project": {"_id": 0}}` is the
+idiomatic way to exclude it — so rejecting internal fields there would refuse most valid
+aggregations while protecting nothing layer 3 doesn't already handle.
+
+## Report generation
+
+One question produces at most one file. The format is resolved before the graph runs where the
+user named it explicitly (regex, `app/services/intent_router.py`) and otherwise comes from
+`Classification.output_format`, which rides on the classify call that was happening anyway — no
+dedicated Gemini round trip for either the format or a policy refusal.
+
+All three formats share `app/generators/tabular.py`, which fixes column order, applies the
+row/column caps, and flattens values once — so a CSV, an XLSX and a PDF of the same question show
+the same columns in the same order. Caps that actually bite are stated in the output rather than
+truncating silently.
+
+The PDF template is fixed, not model-authored: **title → key insights → chart → data table**. The
+insights block reuses the answer the pipeline already synthesized rather than making a second
+call, so the document and the on-screen reply cannot disagree. Chart type is chosen by rule from
+the data's shape (`charts.py::choose_chart`), with the question used only to prefer a dimension
+the user actually named.
+
+Rendering runs on `render_pool.py`, a bounded thread pool with a timeout — WeasyPrint is the
+heaviest CPU on the request path, and unbounded it lets every Socket Mode worker render at once.
+A render failure is non-fatal: the text answer ships regardless.
 
 ## The agent graph in detail
 

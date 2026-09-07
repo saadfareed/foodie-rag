@@ -39,15 +39,28 @@ class _FakeDb(dict):
         return dict.__getitem__(self, name)
 
 
-def test_to_jsonable_converts_objectid_and_datetime():
+def test_to_jsonable_converts_datetime_and_drops_internal_id():
     collection = _FakeCollection([{"_id": ObjectId(), "created_at": datetime(2024, 1, 1)}])
     db = _FakeDb(orders=collection)
     spec = QuerySpec(collection="orders", operation="find")
 
     rows = execute_query_spec(db, spec)
 
-    assert isinstance(rows[0]["_id"], str)
     assert isinstance(rows[0]["created_at"], str)
+    # _id is storage plumbing, dropped by the field policy on the way out of the executor -- see
+    # app/security/field_policy.py. It never reaches the model, a file, or the user.
+    assert "_id" not in rows[0]
+
+
+def test_secret_valued_fields_are_redacted_not_returned():
+    collection = _FakeCollection([{"user_id": "USR-1", "card_number": "4111111111111111"}])
+    db = _FakeDb(users=collection)
+    spec = QuerySpec(collection="users", operation="find")
+
+    rows = execute_query_spec(db, spec)
+
+    assert rows[0]["user_id"] == "USR-1"
+    assert "4111" not in str(rows[0]["card_number"])
 
 
 def test_find_without_geo_near_uses_filter_unchanged():

@@ -105,8 +105,11 @@ one enforces, and the tradeoffs behind them.
    - `AUDIT_LOG_LEVEL=INFO`
    - `GEMINI_MAX_RETRIES=3`, `GEMINI_RETRY_BASE_DELAY_SECONDS=1.0` -- retries now also cover
      client-side HTTP timeouts, not just Gemini-returned 429/5xx responses.
-   - `GEMINI_MAX_RETRY_SECONDS=20.0` -- hard wall-clock ceiling on retry backoff, independent of
+   - `GEMINI_MAX_RETRY_SECONDS=8.0` -- hard wall-clock ceiling on retry backoff, independent of
      `GEMINI_MAX_RETRIES`, so a question can't stall indefinitely on repeated transient errors.
+     Note this is a ceiling *per call*, and one question makes several (classify, per-domain
+     fan-out, synthesize) -- at the old 20.0 a single question could sit in backoff for over a
+     minute while holding a Socket Mode worker thread.
    - `GEMINI_REQUEST_TIMEOUT_MS=15000` -- client-side HTTP timeout per Gemini call. If this fires
      it's now retried (see above) instead of failing the question outright on the first slow
      response.
@@ -126,20 +129,45 @@ one enforces, and the tradeoffs behind them.
      `MONGODB_SOCKET_TIMEOUT_MS=8000` -- pymongo's own default for server selection is 30s; left
      unset, a slow/unreachable Mongo can silently eat up to 30s of a request before the query even
      starts. These give it an explicit, much lower ceiling.
-   - `MONGODB_MAX_POOL_SIZE=30` -- should stay at or above
-     `SLACK_SOCKET_MODE_CONCURRENCY * AGENT_MAX_FAN_OUT` (worst case: every worker thread running
-     a question that fans out to every domain agent at once) or DB connections become the
-     concurrency bottleneck. `app.main` checks this relationship at startup and logs a warning if
-     it doesn't hold (see `Settings.pool_size_warning` in [app/config.py](app/config.py)).
+   - `MONGODB_MAX_POOL_SIZE=40` -- should stay at or above
+     `SLACK_SOCKET_MODE_CONCURRENCY * (AGENT_MAX_FAN_OUT + 1)` or DB connections become the
+     concurrency bottleneck. Worst case is every worker thread running a question that fans out
+     to every domain agent at once; the `+ 1` covers the anchor-resolution queries
+     `_resolve_anchors_node` issues *before* the fan-out on cross-domain geo questions, which the
+     old `concurrency * fan_out` sizing left no headroom for. `app.main` checks this relationship
+     at startup and logs a warning if it doesn't hold (see `Settings.pool_size_warning` in
+     [app/config.py](app/config.py)).
    - `SLACK_SOCKET_MODE_CONCURRENCY=10` -- thread pool size for the Socket Mode client (this is
      `slack_sdk`'s own default; made explicit here so it's tuned deliberately, not left implicit).
    - `SLACK_ALLOWED_CHANNEL_IDS`, `SLACK_ALLOWED_USER_IDS` (comma-separated; empty = open to all)
-   - `USER_RATE_LIMIT_PER_MINUTE=0` (0 = disabled), `USER_RATE_LIMIT_WINDOW_SECONDS=60.0` -- caps
+   - `USER_RATE_LIMIT_PER_MINUTE=10` (0 = disabled), `USER_RATE_LIMIT_WINDOW_SECONDS=60.0` -- caps
      how many questions one (channel, user) pair may ask per window
      ([app/rag/rate_limiter.py](app/rag/rate_limiter.py)). Independent of
      `GEMINI_DAILY_CALL_BUDGET`, which is a *shared* ceiling across every user -- this stops one
      chatty user from consuming that shared budget (or the underlying Gemini free-tier quota)
-     alone before anyone else gets a turn.
+     alone before anyone else gets a turn. **On by default** (it previously defaulted to
+     disabled): one question costs several Gemini calls against a free-tier daily quota measured
+     in tens, so an unbounded user can exhaust the whole workspace's budget in under a minute.
+
+   Report generation ([app/generators/](app/generators/)):
+   - `REPORT_MAX_ROWS=1000`, `REPORT_MAX_COLUMNS=12` -- caps per generated table. Bounds render
+     cost and file size, and keeps a wide Mongo document from rendering an unreadable table.
+     Whenever a cap actually bites, the file says so explicitly rather than truncating silently.
+   - `REPORT_MAX_PIE_SLICES=8` -- above this many categories a pie becomes a bar chart.
+   - `REPORT_RENDER_CONCURRENCY=2` -- bounded pool for PDF/XLSX rendering, so document rendering
+     can't saturate every Socket Mode worker at once (WeasyPrint is the heaviest CPU on the
+     request path).
+   - `REPORT_RENDER_TIMEOUT_SECONDS=25.0` -- wall-clock ceiling on one render; past it the user
+     gets the text answer rather than waiting indefinitely.
+   - `REPORT_TITLE="Data Report"` -- title shown on generated documents.
+
+   Security ([app/security/](app/security/)):
+   - `SECURITY_EXTRA_DENIED_FIELDS` (comma-separated, empty by default) -- extra field names to
+     drop from every row, on top of the built-in internal/secret patterns in
+     [app/security/field_policy.py](app/security/field_policy.py).
+   - `VENDOR_SESSION_TTL_SECONDS=3600` -- how long a `/login` vendor session stays valid. Bounded
+     so an abandoned session can't keep a scoped identity alive indefinitely in a long-lived
+     process (a stale identity silently changes which rows a question returns).
    - `GEMINI_CIRCUIT_BREAKER_THRESHOLD=5`, `GEMINI_CIRCUIT_BREAKER_COOLDOWN_SECONDS=30.0` (0
      threshold disables it) -- after this many *consecutive* Gemini failures, every call fails
      immediately for the cooldown period instead of paying the full retry/timeout cost per

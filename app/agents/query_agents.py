@@ -7,6 +7,8 @@ overwritten by code before validation, so nothing this chain generates can escap
 even if the prompt itself is defeated.
 """
 
+from datetime import datetime, timezone
+
 from langchain_core.prompts import PromptTemplate
 
 from app.agents.domains import DomainConfig, scope_spec_to_domain
@@ -15,6 +17,7 @@ from app.rag.query_spec import QueryError, QuerySpec
 from app.rag.schema_context import build_domain_schema_context
 
 _PROMPT = PromptTemplate.from_template(
+    "Today's date (UTC): {today}\n\n"
     "You translate a question into a single structured MongoDB query against the '{collection}' "
     "collection, scoped to the '{domain}' domain.\n\n"
     "Schema (only the fields relevant to this domain):\n{schema_context}\n\n"
@@ -36,6 +39,8 @@ _PROMPT = PromptTemplate.from_template(
     "  }}\n"
     "- If the question implies a date range, restrict it in filter/pipeline AND set "
     "start_date/end_date to describe that same range.\n"
+    '- Date values in filter/pipeline MUST be ISO-8601 strings (e.g. "2026-09-01T00:00:00Z") '
+    "-- MongoDB will compare them correctly against stored datetimes.\n"
     "- Never use $where, $function, $accumulator, $merge, or $out.\n"
     "- Never filter or set anything on a 'usertype' field yourself -- that's applied "
     "automatically for this domain.\n"
@@ -69,7 +74,9 @@ def generate_domain_query_spec(
     gemini: GeminiClient, domain: DomainConfig, question: str
 ) -> QuerySpec | QueryError:
     schema_context = build_domain_schema_context(domain.collection, domain.schema_fields)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prompt = _PROMPT.format(
+        today=today,
         collection=domain.collection,
         domain=domain.name,
         schema_context=schema_context,

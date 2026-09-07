@@ -6,6 +6,7 @@ from app.rag.answer_cache import AnswerCache
 from app.rag.context_switch_cache import ContextSwitchCache
 from app.rag.conversation_context import ConversationContextCache
 from app.rag.rate_limiter import rate_limiter
+from app.slack import auth
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +62,16 @@ def _reset_rate_limiter(monkeypatch):
     monkeypatch, keeping that state from leaking into unrelated tests via run order."""
     monkeypatch.setattr(rate_limiter, "_limit", 0)
     monkeypatch.setattr(rate_limiter, "_calls", type(rate_limiter._calls)())
+
+
+@pytest.fixture(autouse=True)
+def _reset_vendor_sessions():
+    """app/slack/auth.py holds `/login` sessions in a module-level dict with no TTL short enough
+    to expire within a test run -- a session created by one test would otherwise scope another
+    test's questions to that vendor and silently change which rows it sees."""
+    auth.clear_all()
+    yield
+    auth.clear_all()
 
 
 @pytest.fixture(autouse=True)

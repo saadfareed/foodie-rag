@@ -14,6 +14,7 @@ class GraphState(TypedDict, total=False):
     question: str
     user_id: str | None
     channel_id: str | None
+    authenticated_vendor_id: str | None
     # The previous turn's resolved_question for this (channel, user), from
     # app/rag/conversation_context.py -- None for a fresh conversation or when the answer_cache/
     # clarification path already short-circuited. Read only by _classify_node, which decides

@@ -30,6 +30,7 @@ from app.llm.gemini_client import GeminiClient
 
 DomainName = Literal["orders", "customers", "vendors"]
 ContextMode = Literal["new_topic", "followup"]
+OutputFormat = Literal["text", "csv", "xlsx", "pdf"]
 
 
 class Classification(BaseModel):
@@ -37,6 +38,16 @@ class Classification(BaseModel):
     needs_geo: bool = False
     confidence: float = 0.0
     clarification_question: str | None = None
+    # Which format the user asked their answer back in. Carried on this existing call rather
+    # than a dedicated one: a separate "classify the intent" round trip cost a full Gemini call
+    # (against a free-tier daily quota measured in tens) to return a single word, on the hot
+    # path of every question. The classifier is already reading the question closely enough to
+    # decide domains; deciding format at the same time is free.
+    #
+    # An explicit phrase ("as csv", "excel file") is matched deterministically before this call
+    # runs and overrides whatever the model says -- see app/services/intent_router.py. This
+    # field is for the implicit cases the regex can't catch, like "put together a report".
+    output_format: OutputFormat = "text"
     # Whether resolved_question needed the previous turn's question to make sense. Defaults to
     # "new_topic" so a Classification built without ever mentioning context (e.g. every existing
     # test, or a call site that never passes previous_question) reads as standalone.
@@ -64,6 +75,12 @@ _PROMPT = PromptTemplate.from_template(
     '"vendors near a customer with pending orders" needs all three because it names a '
     "customer, a vendor, and an order condition together.\n"
     "- needs_geo: true if the question asks for something near/nearby/within a distance.\n"
+    '- output_format: the format the user wants the answer in. "text" unless they asked for a '
+    'file or a document. "csv" for a raw data dump or export, "xlsx" for a spreadsheet or '
+    'workbook, "pdf" for a report, a document, or anything asking for charts/graphs/visuals. '
+    'When someone asks for a "report" or a "breakdown with a chart" without naming a file type, '
+    'that is "pdf". A plain question -- even one whose answer happens to be a list -- is '
+    '"text".\n'
     "- confidence: your confidence (0-1) that the listed domains are correct and sufficient.\n"
     "- clarification_question: if the question is ambiguous, missing a location for a geo "
     "question, or doesn't clearly map to any domain, a short question to ask the user; "

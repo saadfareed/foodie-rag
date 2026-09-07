@@ -10,6 +10,7 @@ from app.audit.logger import configure_logging
 from app.config import settings
 from app.db.indexes import ensure_indexes
 from app.db.mongo import close_client, get_db
+from app.generators.render_pool import shutdown as shutdown_render_pool
 from app.llm.gemini_client import GeminiClient
 from app.slack.handlers import register_handlers
 
@@ -42,6 +43,7 @@ def main() -> None:
         def _shutdown(signum: int, _frame: object) -> None:
             logger.info("shutdown_signal_received", extra={"event": {"signal": signum}})
             handler.close()
+            shutdown_render_pool()
             close_client()
             raise SystemExit(0)
 
@@ -53,6 +55,7 @@ def main() -> None:
         logger.exception("Fatal error starting the Slack bot")
         raise
     finally:
+        shutdown_render_pool()
         close_client()
 
 

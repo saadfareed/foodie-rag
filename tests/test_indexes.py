@@ -18,14 +18,37 @@ def test_ensure_indexes_covers_orders_hot_fields():
     db = _FakeDb()
     ensure_indexes(db)
 
-    assert db["orders"].created == ["customer_id", "vendor_id", "status", "created_at"]
+    # Compound, equality-then-range: real questions filter on an id/status *and* a date range,
+    # which two single-field indexes can only serve by intersection.
+    assert db["orders"].created == [
+        [("customer_id", 1), ("created_at", -1)],
+        [("vendor_id", 1), ("created_at", -1)],
+        [("status", 1), ("created_at", -1)],
+        [("created_at", -1)],
+    ]
+
+
+def test_orders_compound_indexes_cover_their_single_field_prefixes():
+    """A compound index serves any prefix of itself, so the standalone single-field indexes it
+    subsumes are redundant -- and a redundant index still costs write throughput and memory."""
+    db = _FakeDb()
+    ensure_indexes(db)
+
+    leading_fields = {keys[0][0] for keys in db["orders"].created}
+    assert {"customer_id", "vendor_id", "status", "created_at"} <= leading_fields
+    assert not any(isinstance(keys, str) for keys in db["orders"].created)
 
 
 def test_ensure_indexes_covers_users_hot_fields_and_geo():
     db = _FakeDb()
     ensure_indexes(db)
 
-    assert db["users"].created == ["user_id", "usertype", [("location", "2dsphere")]]
+    assert db["users"].created == [
+        "user_id",
+        [("usertype", 1), ("city", 1)],
+        [("usertype", 1), ("status", 1)],
+        [("location", "2dsphere")],
+    ]
 
 
 def test_ensure_indexes_is_safe_to_call_repeatedly():
@@ -34,4 +57,4 @@ def test_ensure_indexes_is_safe_to_call_repeatedly():
     ensure_indexes(db)
 
     assert len(db["orders"].created) == 8
-    assert len(db["users"].created) == 6
+    assert len(db["users"].created) == 8
