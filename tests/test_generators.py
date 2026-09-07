@@ -351,3 +351,220 @@ def test_pdf_insights_drop_markdown_table_lines():
 
 def test_pdf_handles_no_data():
     assert generate_pdf({"orders": []}, question="q", answer="Nothing found.")[:5] == b"%PDF-"
+
+
+# --- chart rendering branches --------------------------------------------------------------
+
+
+def test_bar_chart_renders():
+    table = build_table("orders", [{"city": f"C{i}", "n": i + 1} for i in range(20)])
+    spec = choose_chart(table)
+
+    assert spec.kind == "bar"
+    assert render_chart_png(table, spec).startswith(b"\x89PNG")
+
+
+def test_line_chart_renders():
+    rows = [{"day": datetime(2026, 9, d), "amount": d * 10} for d in range(1, 6)]
+    table = build_table("orders", rows)
+    spec = choose_chart(table)
+
+    assert spec.kind == "line"
+    assert render_chart_png(table, spec).startswith(b"\x89PNG")
+
+
+def test_render_chart_base64_returns_none_when_no_chart_suits_the_table():
+    table = build_table("orders", [{"a": "x", "b": "y"}, {"a": "p", "b": "q"}])
+
+    from app.generators.charts import render_chart_base64
+
+    assert render_chart_base64(table) is None
+
+
+def test_a_plotting_failure_costs_the_chart_not_the_document(monkeypatch):
+    """The chart is a nice-to-have on a report whose table is the actual answer."""
+    from app.generators import charts
+
+    monkeypatch.setattr(
+        charts, "render_chart_png", lambda *a, **kw: (_ for _ in ()).throw(ValueError("bad"))
+    )
+    table = build_table("orders", _ORDER_ROWS)
+
+    assert charts.render_chart_base64(table) is None
+
+
+def test_extract_series_skips_rows_with_a_non_numeric_measure():
+    table = build_table("orders", [{"k": "a", "v": 1}, {"k": "b", "v": None}, {"k": "c", "v": 3}])
+    spec = choose_chart(table)
+
+    assert dict(extract_series(table, spec)) == {"a": 1.0, "c": 3.0}
+
+
+# --- value flattening ----------------------------------------------------------------------
+
+
+def test_flatten_value_renders_a_nested_document_compactly():
+    from app.generators.tabular import flatten_value
+
+    assert flatten_value({"wallet": 40, "card": 60}) == "wallet=40, card=60"
+
+
+def test_flatten_value_joins_a_list():
+    from app.generators.tabular import flatten_value
+
+    assert flatten_value(["a", "b"]) == "a, b"
+
+
+def test_flatten_value_keeps_numbers_native_for_the_spreadsheet():
+    """XLSX needs real numbers to sort and format them; the chart layer needs them to do
+    arithmetic."""
+    from app.generators.tabular import flatten_value
+
+    assert flatten_value(12.5) == 12.5
+    assert flatten_value(True) is True
+    assert flatten_value(None) is None
+
+
+def test_columns_fall_back_to_first_seen_order_without_a_declared_preference():
+    """`build_table` is also used for ad-hoc names that aren't registered domains."""
+    table = build_table("unknown_domain", [{"z": 1, "a": 2}])
+
+    assert table.headers == ["Z", "A"]
+
+
+# --- truncation is visible in every format ---------------------------------------------------
+#
+# A reader who isn't told will treat a capped table as the complete result set. Each writer
+# emits the note separately, so each needs its own check.
+
+
+def test_csv_states_when_rows_were_capped(monkeypatch):
+    monkeypatch.setattr("app.generators.tabular.settings.report_max_rows", 3)
+
+    text = generate_csv({"orders": _ORDER_ROWS}).decode("utf-8-sig")
+
+    assert "Showing first 3 of 12 rows" in text
+
+
+def test_xlsx_states_when_rows_were_capped(monkeypatch):
+    monkeypatch.setattr("app.generators.tabular.settings.report_max_rows", 3)
+
+    sheet = load_workbook(io.BytesIO(generate_xlsx({"orders": _ORDER_ROWS})))["Orders"]
+    values = [row[0] for row in sheet.iter_rows(values_only=True)]
+
+    assert any(v and "Showing first 3 of 12 rows" in str(v) for v in values)
+
+
+def test_pdf_states_when_rows_were_capped(monkeypatch):
+    monkeypatch.setattr("app.generators.tabular.settings.report_max_rows", 3)
+    captured = {}
+    import app.generators.pdf_generator as pdf_module
+
+    original = pdf_module._TEMPLATE.render
+    monkeypatch.setattr(
+        pdf_module._TEMPLATE, "render", lambda **kw: captured.update(kw) or original(**kw)
+    )
+
+    generate_pdf({"orders": _ORDER_ROWS}, question="q", answer="a")
+
+    assert "Showing first 3 of 12 rows" in captured["tables"][0]["note"]
+
+
+def test_xlsx_disambiguates_colliding_sheet_names():
+    """Excel rejects duplicate sheet names outright, so a collision must be renamed, not raised."""
+    long_name = "a" * 40
+    workbook = load_workbook(
+        io.BytesIO(generate_xlsx({long_name: [{"a": 1}], long_name + "b": [{"a": 2}]}))
+    )
+
+    assert len(workbook.sheetnames) == 2
+    assert len(set(workbook.sheetnames)) == 2
+    assert all(len(name) <= 31 for name in workbook.sheetnames)
+
+
+# --- defensive branches ----------------------------------------------------------------------
+
+
+def test_build_table_returns_none_for_rows_with_no_columns():
+    assert build_table("orders", [{}, {}]) is None
+
+
+def test_render_cell_handles_native_date_and_datetime_objects():
+    from datetime import date, timezone
+
+    assert render_cell(datetime(2026, 9, 7, 20, 11, tzinfo=timezone.utc)) == "2026-09-07 20:11"
+    assert render_cell(date(2026, 9, 7)) == "2026-09-07"
+
+
+def test_render_cell_leaves_an_unparseable_datetime_like_string_alone():
+    """Shape-matches the ISO pattern but isn't a real date -- better shown as-is than crashing
+    the whole report."""
+    assert render_cell("2026-13-45 99:99:99") == "2026-13-45 99:99:99"
+
+
+def test_flatten_value_stringifies_an_unknown_type():
+    from decimal import Decimal
+
+    from app.generators.tabular import flatten_value
+
+    assert flatten_value(Decimal("1.5")) == "1.5"
+
+
+def test_humanize_header_preserves_an_acronym():
+    """Title-casing an already-uppercase word would turn VAT into "Vat"."""
+    assert humanize_header("VAT amount") == "VAT Amount"
+    assert humanize_header("gps") == "Gps"
+
+
+def test_chart_ignores_a_column_that_is_entirely_null():
+    """An all-null column has no values to rank, so it can't be the dimension."""
+    table = build_table("orders", [{"k": None, "s": "a", "n": 1}, {"k": None, "s": "b", "n": 2}])
+    spec = choose_chart(table)
+
+    assert table.headers[spec.label_column] == "S"
+
+
+def test_render_chart_png_rejects_a_table_with_nothing_plottable():
+    from app.generators.charts import ChartSpec
+
+    table = build_table("orders", [{"a": "x", "b": "y"}, {"a": "p", "b": "q"}])
+    spec = ChartSpec(kind="bar", label_column=0, value_column=1, title="t")
+
+    with pytest.raises(ValueError, match="no plottable pairs"):
+        render_chart_png(table, spec)
+
+
+def test_pdf_insights_are_empty_when_there_is_no_answer():
+    from app.generators.pdf_generator import _insight_paragraphs
+
+    assert _insight_paragraphs("") == []
+    assert _insight_paragraphs(None) == []
+
+
+def test_no_chart_when_aggregation_collapses_to_one_category():
+    """Two rows sharing a dimension value sum into a single bar, which compares nothing."""
+    table = build_table("orders", [{"s": "pending", "n": 1}, {"s": "pending", "n": 2}])
+
+    assert choose_chart(table) is None
+
+
+def test_no_chart_when_only_one_row_has_a_usable_measure():
+    """Two distinct categories, but only one carries a number -- after aggregation there is a
+    single bar, which compares nothing."""
+    table = build_table("orders", [{"s": "a", "n": 1}, {"s": "b", "n": None}])
+
+    assert choose_chart(table) is None
+
+
+def test_extract_series_skips_a_short_row():
+    """Rows are built column-by-column, but a defensive guard keeps a ragged row from raising
+    IndexError mid-render."""
+    from app.generators.charts import ChartSpec, extract_series
+    from app.generators.tabular import ReportTable
+
+    table = ReportTable(
+        name="orders", headers=["S", "N"], rows=[["a", 1], ["b"]], total_row_count=2
+    )
+    spec = ChartSpec(kind="bar", label_column=0, value_column=1, title="t")
+
+    assert extract_series(table, spec) == [("a", 1.0)]

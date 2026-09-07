@@ -317,3 +317,47 @@ def test_logout_clears_the_vendor_scope(monkeypatch):
 
     assert "Signed out" in responses[0]
     assert calls[0]["authenticated_vendor_id"] is None
+
+
+def test_dm_from_an_unauthorized_user_gets_no_reply(monkeypatch):
+    app, _gemini, calls = _register(monkeypatch, authorized=False)
+    say_calls = []
+
+    app.events["message"](
+        {"channel": "D1", "user": "U1", "text": "how many orders?", "channel_type": "im"},
+        lambda **kw: say_calls.append(kw),
+        _FakeSlackClient(),
+    )
+
+    assert calls == []
+    assert say_calls == []
+
+
+def test_login_without_a_vendor_id_explains_the_usage(monkeypatch):
+    app, _gemini, _calls = _register(monkeypatch)
+    responses = []
+
+    app.commands["/login"](
+        ack=lambda: None,
+        respond=lambda text: responses.append(text),
+        command={"user_id": "U1", "text": "   "},
+    )
+
+    assert "USR-00031" in responses[0]
+    from app.slack.auth import get_authenticated_vendor
+
+    assert get_authenticated_vendor("U1") is None
+
+
+def test_logout_when_not_signed_in_says_so(monkeypatch):
+    """Reporting success would leave the user believing a scope was cleared that never existed."""
+    app, _gemini, _calls = _register(monkeypatch)
+    responses = []
+
+    app.commands["/logout"](
+        ack=lambda: None,
+        respond=lambda text: responses.append(text),
+        command={"user_id": "U-never-logged-in"},
+    )
+
+    assert responses == ["You weren't signed in as a vendor."]

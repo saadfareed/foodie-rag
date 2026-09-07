@@ -247,3 +247,162 @@ def test_a_render_failure_still_delivers_the_text_answer(monkeypatch):
     assert result.file_bytes is None
     assert "Most orders are pending." in result.text
     assert "couldn't build the CSV" in result.text
+
+
+# --- report title ----------------------------------------------------------------------------
+
+
+def _title_of_csv(result):
+    return result.file_bytes.decode("utf-8-sig").splitlines()[0]
+
+
+def test_the_report_is_titled_after_the_request():
+    """A generic "Data Report" on a specific request makes the document feel like it wasn't
+    actually about what was asked."""
+
+    class _TitledGemini(_StubGemini):
+        def generate_structured(self, prompt, schema):
+            self.classify_calls += 1
+            return Classification(
+                domains=["orders"],
+                confidence=0.9,
+                output_format="csv",
+                report_title="Last 10 Incomplete Order Details",
+            )
+
+    result = answer_question(
+        "I need last 10 incomplete order details in csv",
+        _TitledGemini(),
+        channel_id="C1",
+        user_id="U1",
+    )
+
+    assert _title_of_csv(result) == "Last 10 Incomplete Order Details"
+
+
+def test_the_configured_title_is_used_when_the_model_has_no_opinion(monkeypatch):
+    monkeypatch.setattr("app.rag.pipeline.settings.report_title", "Data Report")
+
+    result = answer_question("csv of orders", _StubGemini(), channel_id="C1", user_id="U1")
+
+    assert _title_of_csv(result) == "Data Report"
+
+
+def test_a_blank_model_title_falls_back_rather_than_titling_the_file_empty(monkeypatch):
+    monkeypatch.setattr("app.rag.pipeline.settings.report_title", "Data Report")
+
+    class _BlankTitleGemini(_StubGemini):
+        def generate_structured(self, prompt, schema):
+            self.classify_calls += 1
+            return Classification(
+                domains=["orders"], confidence=0.9, output_format="csv", report_title="   "
+            )
+
+    result = answer_question("csv of orders", _BlankTitleGemini(), channel_id="C1", user_id="U1")
+
+    assert _title_of_csv(result) == "Data Report"
+
+
+def test_the_pdf_carries_the_same_title(monkeypatch):
+    captured = {}
+    import app.generators.pdf_generator as pdf_module
+
+    original = pdf_module._TEMPLATE.render
+    monkeypatch.setattr(
+        pdf_module._TEMPLATE, "render", lambda **kw: captured.update(kw) or original(**kw)
+    )
+
+    class _TitledGemini(_StubGemini):
+        def generate_structured(self, prompt, schema):
+            self.classify_calls += 1
+            return Classification(
+                domains=["orders"],
+                confidence=0.9,
+                output_format="pdf",
+                report_title="Last 10 Incomplete Order Details",
+            )
+
+    answer_question("orders report", _TitledGemini(), channel_id="C1", user_id="U1")
+
+    assert captured["title"] == "Last 10 Incomplete Order Details"
+
+
+# --- report generation edge cases ------------------------------------------------------------
+
+
+def test_no_file_is_built_when_the_query_returned_nothing(monkeypatch):
+    """An empty CSV is worse than no CSV -- the text answer already says nothing was found."""
+    monkeypatch.setattr("app.agents.graph.get_db", lambda: _FakeDb(orders=_FakeCollection([])))
+
+    result = answer_question("csv of orders", _StubGemini(), channel_id="C1", user_id="U1")
+
+    assert result.file_bytes is None
+
+
+def test_an_unknown_output_format_degrades_to_text():
+    """Defence in depth: the field is enum-constrained, but a format with no builder must not
+    take the answer down with it."""
+    result = answer_question(
+        "orders", _StubGemini(output_format="text"), channel_id="C1", user_id="U1"
+    )
+
+    assert result.file_bytes is None
+    assert result.text
+
+
+def test_a_render_timeout_still_delivers_the_text_answer(monkeypatch):
+    """A pathological table must not leave the user waiting, or empty-handed."""
+    from app.generators.render_pool import RenderTimeout
+
+    def _timeout(fn, description=""):
+        raise RenderTimeout(description)
+
+    monkeypatch.setattr("app.rag.pipeline.run_render", _timeout)
+
+    result = answer_question("csv of orders", _StubGemini(), channel_id="C1", user_id="U1")
+
+    assert result.file_bytes is None
+    assert "Most orders are pending." in result.text
+    assert "couldn't build the CSV" in result.text
+
+
+def test_build_file_returns_nothing_for_a_text_answer():
+    """Defensive: the caller already guards on this, but _build_file must not try to render a
+    document for a format that has none."""
+    from app.rag.pipeline import _build_file
+
+    assert _build_file("text", {"orders": [{"a": 1}]}, "q", "a", "T") is None
+
+
+def test_build_file_returns_nothing_for_a_format_with_no_builder():
+    from app.rag.pipeline import _build_file
+
+    assert _build_file("docx", {"orders": [{"a": 1}]}, "q", "a", "T") is None
+
+
+# --- RBAC end to end ---------------------------------------------------------------------
+
+
+def test_a_logged_in_vendors_question_is_scoped_to_their_own_rows(monkeypatch):
+    """End-to-end companion to the graph-level RBAC tests: the vendor id has to survive the
+    whole pipeline -> graph -> Send-payload -> query path, and it previously did not."""
+    captured = {}
+
+    class _CapturingCollection(_FakeCollection):
+        def find(self, filter_=None, *args, **kwargs):
+            captured["filter"] = filter_
+            return _FakeCursor(self._rows)
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db", lambda: _FakeDb(orders=_CapturingCollection(_ROWS))
+    )
+
+    answer_question(
+        "how many orders do i have?",
+        _StubGemini(),
+        channel_id="C1",
+        user_id="U1",
+        authenticated_vendor_id="USR-42",
+    )
+
+    assert "USR-42" in str(captured["filter"])

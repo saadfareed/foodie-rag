@@ -91,3 +91,23 @@ def test_input_rows_are_not_mutated():
     enrich_rows_with_names(_FakeDb(_USERS), rows)
 
     assert rows == [{"customer_id": "USR-1"}]
+
+
+def test_non_dict_rows_pass_through_untouched():
+    """`_rows_for_prompt` can append a string marker row, and an aggregation can return scalars.
+    Enrichment must step over anything that isn't a document rather than crash the question."""
+    rows = [{"customer_id": "USR-1"}, "…3 more rows omitted", 42]
+
+    result = enrich_rows_with_names(_FakeDb(_USERS), rows)
+
+    assert result[0]["customer_name"] == "Ayesha Khan"
+    assert result[1] == "…3 more rows omitted"
+    assert result[2] == 42
+
+
+def test_a_user_row_without_any_name_is_skipped():
+    """A malformed user document shouldn't produce a blank "Customer Name" column."""
+    rows = [{"customer_id": "USR-9"}]
+    db = _FakeDb([{"user_id": "USR-9"}])
+
+    assert enrich_rows_with_names(db, rows)[0] == {"customer_id": "USR-9"}

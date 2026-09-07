@@ -101,3 +101,22 @@ def test_extra_denied_fields_from_config_are_honoured(monkeypatch):
 
     assert is_internal_field("margin")
     assert "margin" not in sanitize_document({"margin": 0.4, "city": "Karachi"})
+
+
+def test_non_dict_rows_pass_through_sanitization_untouched():
+    """Result sets aren't always uniform documents -- a scalar or marker row must survive."""
+    assert sanitize_rows([{"_id": "x", "a": 1}, "marker", 7]) == [{"a": 1}, "marker", 7]
+
+
+def test_a_bare_card_field_is_a_payment_method_not_a_number():
+    """`payby: {"card": 60}` breaks an order's amount down by method. Redacting it destroys a
+    legitimate payment breakdown -- the qualified forms are what carry a PAN."""
+    assert not is_secret_field("card")
+    assert sanitize_document({"payby": {"cash": 100, "card": 60}}) == {
+        "payby": {"cash": 100, "card": 60}
+    }
+
+
+def test_qualified_card_fields_are_still_redacted():
+    for field in ("card_number", "cardNumber", "credit_card", "cardholder_name", "card_details"):
+        assert is_secret_field(field), field

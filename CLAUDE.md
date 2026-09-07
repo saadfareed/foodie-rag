@@ -323,8 +323,14 @@ Lint (must pass before any PR, also pre-commit/CI gated): `ruff check .`, `ruff 
   `isinstance`, and not "handlers list is non-empty."
 - **LangGraph `Send(...)` payloads are a fresh dict, not the full graph state.** A fanned-out node
   (`domain_agent`) only sees what `_fan_out` explicitly puts in its payload — see how
-  `resolved_customer_location`/`resolved_vendor_ids`/`spec_cache` are threaded through
-  deliberately in `app/agents/graph.py::_fan_out`, not implicitly inherited.
+  `resolved_customer_location`/`resolved_vendor_ids`/`spec_cache`/`authenticated_vendor_id` are
+  threaded through deliberately in `app/agents/graph.py::_fan_out`, not implicitly inherited.
+  **This has already caused one silent security bug**: `authenticated_vendor_id` was set on the
+  top-level state but never added to the payload, so `_orders_id_filter`/`_vendors_id_filter`
+  read it from their own node's state, found nothing, and forced no vendor scoping — every
+  `/login` user saw every vendor's rows. Nothing raised; the answers were just wrong. Anything a
+  fanned-out node reads from state needs a test that asserts the *effect* (see
+  `tests/test_graph.py`'s RBAC tests), because a missing key here fails silently by design.
 - **A `QuerySpec` fetched from `spec_cache` must be deep-copied before mutation** — the same
   cached object is reused across call sites (anchor resolution and the real fan-out) that apply
   different `limit`/geo/id-filter overrides; mutating the shared instance would leak one site's

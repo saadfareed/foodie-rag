@@ -502,3 +502,278 @@ def test_fan_out_is_capped_at_agent_max_fan_out(monkeypatch):
     result = app.invoke(_base_state("orders and vendors"))
 
     assert set(result["rows_by_domain"]) == {"orders"}
+
+
+# --- name enrichment in the fan-out ----------------------------------------------------------
+#
+# Wiring tests. app/agents/enrichment.py's own behaviour is covered in tests/test_enrichment.py;
+# what matters here is that the domain agent actually calls it, and that a failure to resolve
+# names never costs the user their answer.
+
+
+class _EnrichableDb(dict):
+    """Serves order rows carrying ids, plus the `users` lookup that resolves them."""
+
+    def __init__(self, order_rows, user_rows=None, users_raises=False):
+        super().__init__()
+        self._order_rows = order_rows
+        self._user_rows = user_rows if user_rows is not None else []
+        self._users_raises = users_raises
+
+    def __getitem__(self, name):
+        if name == "users":
+            if self._users_raises:
+                raise RuntimeError("users lookup exploded")
+            return _FakeCollection(self._user_rows)
+        return _FakeCollection(self._order_rows)
+
+
+class _OrdersGemini:
+    def generate_structured(self, prompt, schema):
+        return Classification(domains=["orders"], needs_geo=False, confidence=0.9)
+
+    def generate_structured_or_error(self, prompt, schema):
+        return QuerySpec(collection="orders", operation="find")
+
+    def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+        return "answered"
+
+
+def test_order_rows_are_enriched_with_customer_and_vendor_names(monkeypatch):
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _EnrichableDb(
+            [{"order_id": "ORD-1", "customer_id": "USR-1", "vendor_id": "USR-2"}],
+            [
+                {"user_id": "USR-1", "name": "Ayesha Khan"},
+                {"user_id": "USR-2", "name": "Bilal Aslam", "business_name": "Al-Noor Restaurant"},
+            ],
+        ),
+    )
+    graph = build_graph(_OrdersGemini())
+
+    result = graph.invoke(_base_state("last 10 orders"))
+
+    row = result["rows_by_domain"]["orders"][0]
+    assert row["customer_name"] == "Ayesha Khan"
+    assert row["vendor_name"] == "Al-Noor Restaurant"
+    assert "customer_id" not in row
+
+
+def test_a_failed_name_lookup_still_answers_the_question(monkeypatch, caplog):
+    """The rows are already a correct answer. Losing the whole question over a presentation-only
+    lookup would be a worse outcome than a report that shows ids."""
+    import logging
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _EnrichableDb([{"order_id": "ORD-1", "customer_id": "USR-1"}], users_raises=True),
+    )
+    graph = build_graph(_OrdersGemini())
+
+    with caplog.at_level(logging.WARNING, logger="audit"):
+        result = graph.invoke(_base_state("last 10 orders"))
+
+    assert result["answer"] == "answered"
+    assert result["rows_by_domain"]["orders"][0]["customer_id"] == "USR-1"
+    assert "name_enrichment_failed" in caplog.text
+
+
+def test_rows_without_ids_are_passed_through_untouched(monkeypatch):
+    """An aggregation grouped by status has nothing to resolve."""
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _EnrichableDb([{"status": "pending", "count": 4}], users_raises=True),
+    )
+    graph = build_graph(_OrdersGemini())
+
+    result = graph.invoke(_base_state("orders by status"))
+
+    assert result["rows_by_domain"]["orders"] == [{"status": "pending", "count": 4}]
+
+
+def test_a_validation_failure_surfaces_as_a_domain_error_not_a_crash(monkeypatch):
+    """A spec the validator refuses (here: a filter on a restricted field) must come back as a
+    scoped error the user can be told about, not escape and fail the whole question."""
+    monkeypatch.setattr(
+        "app.agents.graph.get_db", lambda: _FakeDb(orders=_FakeCollection([{"a": 1}]))
+    )
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=["orders"], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            return QuerySpec(
+                collection="orders", operation="find", filter={"card_number": {"$exists": True}}
+            )
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            raise AssertionError("synthesize should not be asked to describe zero rows")
+
+    result = build_graph(StubGemini()).invoke(_base_state("show me card numbers"))
+
+    assert "card_number" in result["errors_by_domain"]["orders"]
+    assert result["rows_by_domain"]["orders"] == []
+    assert "ran into a problem" in result["answer"]
+
+
+def test_a_model_requested_clarification_routes_to_clarify(monkeypatch):
+    """High confidence, a real domain -- but the model still asked a question, so answering
+    anyway would ignore the one signal that says it isn't sure."""
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(
+                domains=["orders"],
+                needs_geo=False,
+                confidence=0.95,
+                clarification_question="which vendor did you mean?",
+            )
+
+        def generate_structured_or_error(self, prompt, schema):
+            raise AssertionError("no query should be generated before clarifying")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            raise AssertionError("no answer should be synthesized before clarifying")
+
+    result = build_graph(StubGemini()).invoke(_base_state("orders for that vendor"))
+
+    assert result["needs_clarification"] is True
+    assert result["answer"] == "which vendor did you mean?"
+
+
+# --- RBAC: an authenticated vendor only sees their own rows ----------------------------------
+#
+# The forced filter is the whole point of `/login`. Untested, a refactor could drop it and every
+# vendor would silently see the entire workspace's data.
+
+
+def _capture_spec_gemini(domains):
+    class StubGemini:
+        def __init__(self):
+            self.specs = []
+
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=domains, needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            return QuerySpec(collection="orders", operation="find")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            return "answered"
+
+    return StubGemini()
+
+
+def test_an_authenticated_vendor_only_sees_their_own_orders(monkeypatch):
+    captured = {}
+
+    class _CapturingCollection(_FakeCollection):
+        def find(self, filter_=None, *args, **kwargs):
+            captured["filter"] = filter_
+            return _FakeCursor(self._rows)
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(orders=_CapturingCollection([{"order_id": "ORD-1"}])),
+    )
+
+    build_graph(_capture_spec_gemini(["orders"])).invoke(
+        _base_state("how many orders do i have?", authenticated_vendor_id="USR-42")
+    )
+
+    assert "USR-42" in str(captured["filter"]), captured["filter"]
+
+
+def test_an_authenticated_vendor_only_sees_their_own_vendor_record(monkeypatch):
+    captured = {}
+
+    class _CapturingCollection(_FakeCollection):
+        def find(self, filter_=None, *args, **kwargs):
+            captured["filter"] = filter_
+            return _FakeCursor(self._rows)
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(users=_CapturingCollection([{"user_id": "USR-42"}])),
+    )
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=["vendors"], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            return QuerySpec(collection="users", operation="find")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            return "answered"
+
+    build_graph(StubGemini()).invoke(
+        _base_state("what's my rating?", authenticated_vendor_id="USR-42")
+    )
+
+    assert "USR-42" in str(captured["filter"]), captured["filter"]
+
+
+def test_an_unauthenticated_question_is_not_vendor_scoped(monkeypatch):
+    captured = {}
+
+    class _CapturingCollection(_FakeCollection):
+        def find(self, filter_=None, *args, **kwargs):
+            captured["filter"] = filter_
+            return _FakeCursor(self._rows)
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(orders=_CapturingCollection([{"order_id": "ORD-1"}])),
+    )
+
+    build_graph(_capture_spec_gemini(["orders"])).invoke(_base_state("how many orders?"))
+
+    assert "vendor_id" not in str(captured["filter"])
+
+
+def test_multiple_out_of_scope_domains_are_all_named(monkeypatch):
+    """With one refusal the model's own wording is shown verbatim; with several the answer has
+    to say which domain said what, or it reads as one incoherent sentence."""
+    monkeypatch.setattr("app.agents.graph.get_db", lambda: _FakeDb())
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=["orders", "vendors"], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            return QueryError(error="no such field here")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            raise AssertionError("nothing to synthesize")
+
+    answer = build_graph(StubGemini()).invoke(_base_state("something odd"))["answer"]
+
+    assert "orders:" in answer and "vendors:" in answer
+
+
+def test_a_rate_limited_generation_gets_a_clean_per_domain_message(monkeypatch):
+    """A mid-fan-out failure should read the way a whole-question failure does, not leak
+    Google's raw quota payload into the Slack answer."""
+    from google.genai import errors
+
+    monkeypatch.setattr("app.agents.graph.get_db", lambda: _FakeDb())
+
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=["orders"], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            raise errors.ClientError(
+                429, {"error": {"code": 429, "message": "Quota exceeded", "status": "RESOURCE"}}
+            )
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            raise AssertionError("nothing to synthesize")
+
+    answer = build_graph(StubGemini()).invoke(_base_state("how many orders?"))["answer"]
+
+    assert "rate limit reached" in answer
+    assert "RESOURCE" not in answer

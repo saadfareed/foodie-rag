@@ -269,6 +269,13 @@ def _fan_out(state: GraphState) -> list[Send]:
         payload: dict = {
             "question": _effective_question(state),
             "domain": domain_name,
+            # Threaded explicitly because a Send payload is a fresh dict, NOT the graph state:
+            # a fanned-out node sees only what is put here. Omitting this silently disabled the
+            # whole `/login` guardrail -- _orders_id_filter/_vendors_id_filter read it from
+            # their node's state, found nothing, and forced no vendor scoping at all, so an
+            # authenticated vendor saw every vendor's rows. Nothing failed; the answers were
+            # just wrong.
+            "authenticated_vendor_id": state.get("authenticated_vendor_id"),
             # Shared with _resolve_anchors_node so a domain already queried while resolving a
             # cross-domain anchor (customers/vendors, in the geo composite pattern) doesn't pay
             # for an identical Gemini generation call a second time here.

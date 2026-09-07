@@ -81,12 +81,6 @@ def is_secret_field(field: str) -> bool:
     return _matches_any(_SECRET_FIELD_PATTERNS, field)
 
 
-def is_denied_field(field: str) -> bool:
-    """True if a generated query must not reference `field` at all. Used by the validator to
-    reject a projection/sort/filter that names something the model was never shown."""
-    return is_internal_field(field) or is_secret_field(field)
-
-
 def sanitize_value(value: Any) -> Any:
     """Recursively sanitize a value, applying the field policy to any nested document keys.
 

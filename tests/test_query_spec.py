@@ -45,3 +45,9 @@ def test_genuinely_optional_fields_still_accept_null():
     )
     assert spec.projection is None
     assert spec.geo_near is None
+
+
+def test_non_dict_input_passes_through_the_null_coercion_unchanged():
+    """The validator runs before Pydantic in some paths; the coercion hook must tolerate a
+    non-dict rather than raising on it."""
+    assert QuerySpec._coerce_explicit_nulls_to_defaults("not a dict") == "not a dict"

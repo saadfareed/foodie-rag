@@ -67,7 +67,7 @@ def _find_secret_field_reference(spec: QuerySpec) -> str | None:
     stripped afterwards. Refusing is what makes the redaction honest: the query never runs, so
     the value is never read off disk at all.
 
-    Deliberately checks `is_secret_field`, not the broader `is_denied_field`. Internal fields
+    Deliberately checks `is_secret_field` only, and NOT `is_internal_field`. Internal fields
     like `_id` are structural Mongo syntax in a pipeline -- a `$group` key is literally named
     `_id`, and `{"$project": {"_id": 0}}` is the idiomatic way to *exclude* it -- so rejecting
     them here would refuse most legitimate aggregations while protecting nothing. Internal

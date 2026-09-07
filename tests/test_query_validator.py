@@ -247,3 +247,96 @@ def test_spec_without_geo_near_is_unaffected_by_geo_validation():
 
 def test_default_max_geo_radius_m_constant_is_50000():
     assert MAX_GEO_RADIUS_M == 50_000
+
+
+# --- restricted field references -----------------------------------------------------------
+#
+# Layer three of the field policy (app/security/field_policy.py). Layers one and two hide these
+# names from the prompt and strip them from results; this refuses the query outright, so a
+# secret value is never read off disk at all.
+
+
+def test_a_filter_on_a_secret_field_is_rejected():
+    spec = QuerySpec(
+        collection="orders", operation="find", filter={"card_number": {"$exists": True}}
+    )
+
+    with pytest.raises(QueryValidationError, match="card_number"):
+        validate_query_spec(spec, allowed_collections=["orders"])
+
+
+def test_a_group_key_on_a_secret_field_is_rejected():
+    """Mongo names fields two ways -- dict keys and $-prefixed string values. Both are checked,
+    or a `{"$group": {"_id": "$card_number"}}` would slip straight through."""
+    spec = QuerySpec(
+        collection="orders",
+        operation="aggregate",
+        pipeline=[{"$group": {"_id": "$payment.card_number"}}],
+    )
+
+    with pytest.raises(QueryValidationError, match="card_number"):
+        validate_query_spec(spec, allowed_collections=["orders"])
+
+
+def test_a_projection_of_a_secret_field_is_rejected():
+    spec = QuerySpec(collection="users", operation="find", projection={"cvv": 1})
+
+    with pytest.raises(QueryValidationError, match="cvv"):
+        validate_query_spec(spec, allowed_collections=["users"])
+
+
+def test_a_sort_on_a_secret_field_is_rejected():
+    spec = QuerySpec(collection="users", operation="find", sort={"api_key": -1})
+
+    with pytest.raises(QueryValidationError, match="api_key"):
+        validate_query_spec(spec, allowed_collections=["users"])
+
+
+def test_an_ordinary_aggregation_grouping_on_id_is_allowed():
+    """A $group key is *literally* named `_id`. Rejecting internal fields here would refuse
+    most legitimate aggregations while protecting nothing the executor doesn't already strip."""
+    spec = QuerySpec(
+        collection="orders",
+        operation="aggregate",
+        pipeline=[{"$group": {"_id": "$vendor_id", "n": {"$sum": 1}}}],
+    )
+
+    assert validate_query_spec(spec, allowed_collections=["orders"]) is spec
+
+
+def test_excluding_id_in_a_projection_is_allowed():
+    """`{"$project": {"_id": 0}}` is the idiomatic way to drop it."""
+    spec = QuerySpec(
+        collection="orders", operation="aggregate", pipeline=[{"$project": {"_id": 0, "amount": 1}}]
+    )
+
+    assert validate_query_spec(spec, allowed_collections=["orders"]) is spec
+
+
+def test_a_payment_method_breakdown_is_not_mistaken_for_a_card_number():
+    """`payby` breaks an amount down by method, so a bare `card` key is a method label. A
+    pattern matching it would refuse a perfectly ordinary payments query."""
+    spec = QuerySpec(collection="orders", operation="find", filter={"payby.card": {"$gt": 0}})
+
+    assert validate_query_spec(spec, allowed_collections=["orders"]) is spec
+
+
+def test_a_banned_operator_nested_deep_inside_a_pipeline_is_found():
+    """The scan recurses: a $where buried in a nested expression is exactly as dangerous as a
+    top-level one, and is what an evasive generation would look like."""
+    spec = QuerySpec(
+        collection="orders",
+        operation="aggregate",
+        pipeline=[{"$match": {"$and": [{"a": 1}, {"$expr": {"$where": "1==1"}}]}}],
+    )
+
+    with pytest.raises(QueryValidationError, match=r"\$where"):
+        validate_query_spec(spec, allowed_collections=["orders"])
+
+
+def test_an_operation_outside_the_allow_list_is_rejected():
+    spec = QuerySpec(collection="orders", operation="find")
+    object.__setattr__(spec, "operation", "deleteMany")
+
+    with pytest.raises(QueryValidationError, match="operation"):
+        validate_query_spec(spec, allowed_collections=["orders"])
