@@ -34,6 +34,7 @@ path.
 ```
 app/
   config.py        Settings singleton -- every env var this app reads, validated at import time
+  messages.py      EVERY user-facing non-answer string: failures, no-data, refusals, notes
   agents/          Multi-domain LangGraph agent: classify -> resolve anchors -> fan out -> synthesize
     classifier.py    question -> domain(s) + confidence + clarification + context_mode/resolved_question
                      + output_format (all enum-constrained, all from ONE Gemini call)
@@ -154,6 +155,16 @@ Every Gemini call funnels through `GeminiClient._call_with_retry`:
   later. The validator checks only `is_secret_field`, not `is_denied_field`: `_id` is legitimate
   pipeline *syntax* (`$group` keys, `{"$project": {"_id": 0}}`), so rejecting it there would
   refuse most valid aggregations while protecting nothing the executor doesn't already strip.
+- **A raw exception never reaches a user.** `app/messages.py` owns every non-answer string; the
+  raw text goes to the audit log (`error_detail`) and the user gets the catalogue's phrasing plus
+  a reference code (`E-4F2A9C`) that ties the two together. Interpolating `{exc}` into a reply
+  put pymongo tracebacks and Google's quota payload into a Slack channel — an error message is
+  an output channel like any other, and it was the only one without a policy. New failure paths
+  add a `Failure` member, not a new string literal; `tests/test_messages.py` asserts mechanically
+  that no message names an internal.
+- **"No data" is not an error.** It gets its own message naming what was searched, and no
+  reference code. Telling someone "something went wrong" when the honest answer is "there are
+  none" sends them hunting a bug that doesn't exist.
 - **The answer cache key must include the authenticated vendor scope.** A vendor-scoped answer
   contains only that vendor's rows; a key without the scope replays one vendor's data to the
   next person asking the same words in the same channel. That is a cross-tenant leak, not a
@@ -263,6 +274,12 @@ ever makes a real Slack/Mongo/Gemini call. Patterns to follow (don't introduce n
   `Settings` construction itself and does use `monkeypatch.setenv`).
 - `caplog.at_level(logging.INFO, logger="audit")` for anything that audit-logs.
 - One test per validator rule, both the pass and fail case (`tests/test_query_validator.py`).
+- `tests/test_negative.py` is the adversarial suite, organised by *where the bad input comes
+  from* (question / model output / database rows / infrastructure / boundaries), because that's
+  what determines which guardrail should catch it. Its `assert_clean()` helper checks every reply
+  against a list of internals that have actually leaked before — add to that list rather than
+  writing a one-off assertion. New failure paths belong here as well as in their unit test: this
+  is the suite that proves the bot explains rather than crashes.
 
 Run the suite:
 ```bash

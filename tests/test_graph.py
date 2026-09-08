@@ -309,8 +309,10 @@ def test_execution_error_surfaces_as_a_problem_message(monkeypatch):
     app = build_graph(StubGemini())
     result = app.invoke(_base_state("how many orders"))
 
-    assert "ran into a problem" in result["answer"]
-    assert "orders" in result["errors_by_domain"]
+    assert "Something went wrong" in result["answer"]
+    # The raw driver text stays in the audit log and out of the reply.
+    assert "connection refused" in result["errors_by_domain"]["orders"]
+    assert "connection refused" not in result["answer"]
 
 
 def test_generation_time_exception_is_a_domain_error_not_a_friendly_rejection(monkeypatch):
@@ -334,8 +336,9 @@ def test_generation_time_exception_is_a_domain_error_not_a_friendly_rejection(mo
     app = build_graph(StubGemini())
     result = app.invoke(_base_state("how many orders"))
 
-    assert "ran into a problem" in result["answer"]
+    assert "Something went wrong" in result["answer"]
     assert "orders" in result["errors_by_domain"]
+    assert "validation error" not in result["answer"]
     assert "orders" not in result.get("out_of_scope_by_domain", {})
 
 
@@ -363,9 +366,13 @@ def test_circuit_breaker_error_during_generation_gets_the_friendly_message():
     app = build_graph(StubGemini())
     result = app.invoke(_base_state("how many orders"))
 
-    assert result["errors_by_domain"]["orders"] == (
-        "Gemini is temporarily unavailable -- please try again shortly."
-    )
+    # The raw breaker text is kept for the audit log, and the *kind* is recorded alongside it so
+    # synthesize doesn't have to re-derive it by string-matching (which is how a Gemini rate
+    # limit once came out phrased as a database error).
+    assert "circuit breaker" in result["errors_by_domain"]["orders"]
+    assert result["error_kinds_by_domain"]["orders"] == "upstream_unavailable"
+
+    assert "can't reach the service" in result["answer"]
     assert "circuit breaker" not in result["answer"]
     assert "consecutive failures" not in result["answer"]
 
@@ -615,7 +622,9 @@ def test_a_validation_failure_surfaces_as_a_domain_error_not_a_crash(monkeypatch
 
     assert "card_number" in result["errors_by_domain"]["orders"]
     assert result["rows_by_domain"]["orders"] == []
-    assert "ran into a problem" in result["answer"]
+    assert "wasn't one I'm allowed to run" in result["answer"]
+    # The rejected field name is internal -- it belongs in the log, not the reply.
+    assert "card_number" not in result["answer"]
 
 
 def test_a_model_requested_clarification_routes_to_clarify(monkeypatch):
@@ -775,5 +784,5 @@ def test_a_rate_limited_generation_gets_a_clean_per_domain_message(monkeypatch):
 
     answer = build_graph(StubGemini()).invoke(_base_state("how many orders?"))["answer"]
 
-    assert "rate limit reached" in answer
+    assert "rate-limited" in answer
     assert "RESOURCE" not in answer

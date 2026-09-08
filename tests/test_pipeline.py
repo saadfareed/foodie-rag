@@ -148,7 +148,7 @@ def test_empty_results_short_circuit_without_calling_generate_answer(monkeypatch
 
     result = answer_question("orders from Mars?", gemini)
 
-    assert "didn't find any data" in result.text
+    assert "nothing matched that" in result.text
     assert gemini.answer_calls == []
 
 
@@ -178,7 +178,7 @@ def test_query_generation_failure_still_returns_a_graceful_message(monkeypatch, 
     with caplog.at_level(logging.INFO, logger="audit"):
         result = answer_question("how many cash orders?", _SlowFailingGemini())
 
-    assert "couldn't process that question" in result.text
+    assert "Something went wrong" in result.text
     event = caplog.records[-1].event
     assert "graph_ms" in event["timings"]
 
@@ -203,9 +203,7 @@ def test_rate_limit_error_gives_a_clean_message_not_the_raw_api_payload(monkeypa
 
     result = answer_question("how many orders?", _RateLimitedGemini())
 
-    assert result.text == (
-        "I'm getting rate-limited by Gemini right now -- please try again shortly."
-    )
+    assert "rate-limited" in result.text
     assert "RESOURCE_EXHAUSTED" not in result.text
     assert "generate_content_free_tier_requests" not in result.text
 
@@ -226,7 +224,7 @@ def test_answer_generation_failure_is_handled_gracefully(monkeypatch, caplog):
             _FailsOnAnswerGemini(query_result=QuerySpec(collection="orders", operation="find")),
         )
 
-    assert "couldn't process that question" in result.text
+    assert "Something went wrong" in result.text
 
 
 def test_repeated_question_in_same_channel_is_served_from_cache(monkeypatch):
@@ -708,9 +706,7 @@ def test_circuit_breaker_open_gives_a_clean_message_not_the_raw_exception(monkey
 
     result = answer_question("how many orders?", _BrokenCircuitGemini())
 
-    assert result.text == (
-        "I'm having trouble reaching Gemini right now -- please try again shortly."
-    )
+    assert "can't reach the service" in result.text
 
 
 def test_rate_limited_user_gets_a_clean_message_without_reaching_gemini(monkeypatch):

@@ -13,6 +13,7 @@ half-remembered copy of the field policy is exactly how the two drift apart.
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from math import isfinite
 from typing import Any
 
 from app.agents.domains import report_columns_for, report_hidden_columns_for
@@ -83,6 +84,12 @@ def flatten_value(value: Any) -> Any:
     Numbers and dates pass through as native types so XLSX keeps them numeric/sortable and the
     chart layer can still do arithmetic on them; everything structural becomes a compact string.
     """
+    if isinstance(value, float) and not isfinite(value):
+        # inf/nan reach here from aggregations that divided by zero. Excel has no
+        # representation for them, and openpyxl writes a *silently blank cell* -- so the CSV
+        # said "inf" while the spreadsheet said nothing at all. Rendering them as text keeps all
+        # three formats agreeing and keeps a real value from vanishing.
+        return str(value)
     if value is None or isinstance(value, (str, int, float, bool, datetime, date)):
         return value
     if isinstance(value, dict):

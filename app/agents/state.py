@@ -51,6 +51,11 @@ class GraphState(TypedDict, total=False):
     # surface it as a plain, friendly rejection rather than an "I ran into a problem" framing.
     out_of_scope_by_domain: Annotated[dict[str, str], _merge_dicts]
     errors_by_domain: Annotated[dict[str, str], _merge_dicts]
+    # domain -> app/messages.py::Failure value. Kept separate from errors_by_domain, which holds
+    # the RAW exception text for the audit log: the failing node already knows what kind of
+    # failure it hit, and re-deriving that downstream by string-matching a driver message is how
+    # a Gemini rate limit came out phrased as a database error.
+    error_kinds_by_domain: Annotated[dict[str, str], _merge_dicts]
     timings: Annotated[dict[str, float], _merge_dicts]
 
     answer: str

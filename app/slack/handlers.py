@@ -6,6 +6,7 @@ import re
 from slack_bolt import App
 
 from app.llm.gemini_client import GeminiClient
+from app.messages import upload_failure_note
 from app.rag.pipeline import AnswerResult, answer_question
 from app.slack.access_control import is_authorized
 from app.slack.auth import get_authenticated_vendor, login_vendor, logout_vendor
@@ -26,26 +27,17 @@ def _strip_mention(text: str) -> str:
     return _MENTION_RE.sub("", text).strip()
 
 
-def _upload_failure_note(exc: Exception, file_type: str) -> str:
-    """Why the file didn't arrive, phrased so the reader can act on it.
+def _missing_scope_from(exc: Exception) -> str | None:
+    """The scope Slack said was missing, or None if this failure was something else.
 
-    A missing scope is worth calling out by name. It is a one-time install fix, it will fail
-    identically on every future report until someone makes it, and "couldn't upload it" alone
-    reads like a transient glitch worth retrying -- which it never is.
+    SlackApiError.response is a SlackResponse (payload on `.data`) in real use, but the API also
+    permits a plain dict -- unwrap whichever this is rather than assuming.
     """
-    label = file_type.upper()
-    # SlackApiError.response is a SlackResponse (payload on `.data`) in real use, but the API
-    # also permits a plain dict -- unwrap whichever this is rather than assuming.
     response = getattr(exc, "response", None)
     error = getattr(response, "data", response) or {}
     if isinstance(error, dict) and error.get("error") == "missing_scope":
-        needed = error.get("needed") or "files:write"
-        return (
-            f"(I built the {label} report but this app can't upload files: its Slack token is "
-            f"missing the `{needed}` scope. An admin can add it under OAuth & Permissions and "
-            "reinstall the app.)"
-        )
-    return f"(I generated a {label} file but couldn't upload it to this channel.)"
+        return error.get("needed") or "files:write"
+    return None
 
 
 def _send_response(
@@ -81,7 +73,7 @@ def _send_response(
                 "slack_file_upload_failed",
                 extra={"event": {"channel_id": channel_id, "file_type": result.file_type}},
             )
-            text = f"{text}\n\n_{_upload_failure_note(exc, result.file_type)}_"
+            text = f"{text}\n\n_{upload_failure_note(result.file_type, _missing_scope_from(exc))}_"
 
     if say:
         say(text=text, thread_ts=thread_ts)

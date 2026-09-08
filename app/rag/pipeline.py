@@ -35,9 +35,16 @@ from app.generators.csv_generator import generate_csv
 from app.generators.pdf_generator import generate_pdf
 from app.generators.render_pool import RenderTimeout, run_render
 from app.generators.xlsx_generator import generate_xlsx
-from app.llm.circuit_breaker import CircuitBreakerOpenError
-from app.llm.gemini_client import GeminiClient, is_rate_limited
+from app.llm.gemini_client import GeminiClient
 from app.llm.quota import quota_tracker
+from app.messages import (
+    Failure,
+    classify_exception,
+    failure_message,
+    needs_reference,
+    new_reference,
+    report_render_note,
+)
 from app.rag.answer_cache import CachedResult, answer_cache
 from app.rag.clarification_cache import PendingClarification, clarification_cache
 from app.rag.context_switch_cache import PendingContextSwitch, context_switch_cache
@@ -280,15 +287,15 @@ def answer_question(
     rate_limit_key = rate_limiter.make_key(channel_id, user_id)
     if not rate_limiter.allow(rate_limit_key):
         return _plain(
-            "You're asking faster than I can keep up -- please wait a bit and try again.",
-            error="rate_limited",
+            failure_message(Failure.USER_RATE_LIMITED),
+            error=Failure.USER_RATE_LIMITED.value,
         )
 
     # Ahead of every Gemini call, so an over-budget request costs nothing to refuse.
     if quota_tracker.is_over_budget():
         return _plain(
-            "I've hit my daily question budget -- please try again tomorrow.",
-            error="daily_budget_exceeded",
+            failure_message(Failure.DAILY_BUDGET_EXCEEDED),
+            error=Failure.DAILY_BUDGET_EXCEEDED.value,
         )
 
     gemini = gemini or GeminiClient()
@@ -324,13 +331,18 @@ def answer_question(
                 }
             )
     except Exception as exc:
-        if isinstance(exc, CircuitBreakerOpenError):
-            answer = "I'm having trouble reaching Gemini right now -- please try again shortly."
-        elif is_rate_limited(exc):
-            answer = "I'm getting rate-limited by Gemini right now -- please try again shortly."
-        else:
-            answer = f"Sorry, I couldn't process that question right now ({exc})."
-        return _plain(answer, error=str(exc))
+        # The raw exception goes to the audit log, never to Slack: it has carried pymongo
+        # tracebacks and Google's quota payload (metric names, doc links, a nested JSON blob)
+        # straight into a channel. The reference code is what ties the two together.
+        failure = classify_exception(exc)
+        reference = new_reference() if needs_reference(failure) else None
+        _log(
+            error=failure.value,
+            error_detail=str(exc),
+            error_reference=reference,
+            answer=failure_message(failure, reference),
+        )
+        return AnswerResult(text=failure_message(failure, reference), error=failure.value)
 
     timings.update(result.get("timings", {}))
     answer = result["answer"]
@@ -403,7 +415,10 @@ def answer_question(
             )
 
     if output_format != "text" and file_result is None and row_count > 0:
-        answer = f"{answer}\n\n_(I couldn't build the {output_format.upper()} file this time.)_"
+        # Appended rather than replacing the answer: the prose is correct and complete, and the
+        # only thing missing is the attachment. Saying "something went wrong" here would throw
+        # away a good answer over a formatting problem.
+        answer = f"{answer}\n\n_{report_render_note(output_format)}_"
 
     result_obj = AnswerResult(
         text=answer,
