@@ -10,6 +10,37 @@ from app.slack import auth
 
 
 @pytest.fixture(autouse=True)
+def _no_real_database(monkeypatch, request):
+    """Fail loudly if a test reaches a real MongoDB instead of a fake.
+
+    Nothing here is supposed to touch the network (see CLAUDE.md's testing conventions), but
+    "supposed to" was doing the enforcing, and two rate-limit tests had quietly started relying
+    on a live database: they passed on a developer machine with seeded data and failed in CI,
+    which is the worst possible arrangement -- green where it's cheap to investigate, red where
+    it isn't.
+
+    Patching `get_client` rather than `get_db` puts the tripwire at the actual network boundary,
+    so the many tests that legitimately patch `app.agents.graph.get_db` with a fake are
+    unaffected and only genuinely-unmocked access trips it.
+
+    `@pytest.mark.uses_mongo_client` opts out, for the one module whose *subject* is
+    `get_client` itself (tests/test_mongo.py) -- it stubs the driver a layer lower.
+    """
+    if request.node.get_closest_marker("uses_mongo_client"):
+        return
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError(
+            "This test reached a real MongoDB. Patch app.agents.graph.get_db with a fake "
+            "(see the _FakeDb/_FakeCollection classes in tests/test_pipeline.py). A test that "
+            "depends on a live database passes or fails according to what happens to be seeded "
+            "on the machine running it."
+        )
+
+    monkeypatch.setattr("app.db.mongo.get_client", _refuse)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_answer_cache(monkeypatch):
     """app.rag.pipeline.answer_cache is a module-level singleton; without this, tests that reuse
     the same question text (with the default channel_id=None) would leak cached answers into each

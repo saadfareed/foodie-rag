@@ -1,4 +1,11 @@
+import pytest
+
 from app.db import mongo
+
+# This module's subject *is* get_client, and it stubs the driver a layer lower (MongoClient
+# itself), so the conftest tripwire that refuses real client construction would replace the
+# very function under test.
+pytestmark = pytest.mark.uses_mongo_client
 
 
 class _FakeMongoClient:

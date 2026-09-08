@@ -711,6 +711,9 @@ def test_circuit_breaker_open_gives_a_clean_message_not_the_raw_exception(monkey
 
 def test_rate_limited_user_gets_a_clean_message_without_reaching_gemini(monkeypatch):
     _patch_shared_caches(monkeypatch)
+    # This test needs the first question to actually succeed, so it needs rows -- without a fake
+    # db it reached a real MongoDB and passed or failed on whatever happened to be seeded there.
+    monkeypatch.setattr("app.agents.graph.get_db", lambda: _fake_db([{"amount": 10}]))
     monkeypatch.setattr(rate_limiter, "_limit", 1)
 
     gemini = _StubGemini()
@@ -725,6 +728,7 @@ def test_rate_limited_user_gets_a_clean_message_without_reaching_gemini(monkeypa
 
 def test_rate_limit_is_scoped_per_user_not_shared_across_the_channel(monkeypatch):
     _patch_shared_caches(monkeypatch)
+    monkeypatch.setattr("app.agents.graph.get_db", lambda: _fake_db([{"amount": 10}]))
     monkeypatch.setattr(rate_limiter, "_limit", 1)
 
     gemini = _StubGemini()

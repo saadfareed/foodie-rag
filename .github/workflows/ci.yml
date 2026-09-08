@@ -20,6 +20,22 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: pip install -r requirements-dev.txt
       - run: pytest -v
+        # app/config.py builds its Settings singleton at import time and _require()s these, so
+        # `import app.anything` -- including tests/conftest.py -- fails without them. Locally a
+        # .env supplies them; CI has none, so they're spelled out here.
+        #
+        # The values are deliberately obvious placeholders. Nothing in the suite makes a real
+        # Slack, Gemini or MongoDB call (every one is stubbed), so these only have to be
+        # non-empty to get past validation -- they are not secrets and must never become real
+        # ones. If a test ever needs a genuine credential, that's a sign it stopped being a
+        # unit test.
+        env:
+          SLACK_BOT_TOKEN: ci-placeholder-not-a-real-token
+          SLACK_APP_TOKEN: ci-placeholder-not-a-real-token
+          SLACK_SIGNING_SECRET: ci-placeholder-not-a-real-secret
+          GEMINI_API_KEY: ci-placeholder-not-a-real-key
+          MONGODB_URI: mongodb://localhost:27017
+          MONGODB_DB_NAME: ci_test_db
 
   lint:
     name: Lint & format

@@ -263,6 +263,15 @@ ever makes a real Slack/Mongo/Gemini call. Patterns to follow (don't introduce n
 - `_StubGemini` / `_FakeDb` / `_FakeCollection` / `_FakeCursor` classes, redefined per test file
   (see `tests/test_pipeline.py`, `tests/test_graph.py`) — minimal fakes exposing only the methods
   exercised, not a shared mocking framework.
+- **`tests/conftest.py` refuses real `MongoClient` construction** (`_no_real_database`, autouse).
+  A test that reaches a live database passes or fails according to what happens to be seeded on
+  the machine running it — two rate-limit tests had quietly come to depend on that, staying green
+  locally and failing only in CI. Patch `app.agents.graph.get_db` with a fake; the one module
+  whose subject *is* the client opts out with `@pytest.mark.uses_mongo_client`.
+- **CI has no `.env`**, and `app/config.py` `_require()`s six variables while building its
+  Settings singleton *at import time* — so `import app.anything` fails without them. The Tests
+  job in `.github/workflows/ci.yml` supplies obvious placeholders; they only need to be non-empty,
+  and must never become real credentials.
 - `tests/conftest.py` has **autouse** fixtures that reset every module-level singleton
   (`answer_cache`, `quota_tracker`, `rate_limiter`, `gemini_circuit_breaker`) to a disabled/clean
   state before each test — these singletons persist across the whole test run otherwise, and
