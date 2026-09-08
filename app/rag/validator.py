@@ -3,6 +3,7 @@
 from datetime import date
 
 from app.rag.query_spec import QuerySpec
+from app.security.field_policy import is_secret_field
 
 BANNED_OPERATORS = {"$where", "$function", "$accumulator", "$merge", "$out"}
 ALLOWED_OPERATIONS = {"find", "aggregate", "count"}
@@ -37,9 +38,61 @@ def _find_violation(value: object, allowed_collections: list[str]) -> str | None
     return None
 
 
+def _referenced_fields(value: object) -> set[str]:
+    """Every field name a spec fragment refers to, from both sides of Mongo's two conventions:
+    dict *keys* (`{"card_number": {"$exists": true}}`) and `$`-prefixed string *values*
+    (`{"$group": {"_id": "$card_number"}}`). Operator keys and dotted paths are normalized to
+    the leaf-most path component so `payment._id` is caught as `_id`.
+    """
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, val in value.items():
+            if not key.startswith("$"):
+                found.update(part for part in key.split(".") if part)
+            found.update(_referenced_fields(val))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(_referenced_fields(item))
+    elif isinstance(value, str) and value.startswith("$") and len(value) > 1:
+        found.update(part for part in value[1:].split(".") if part)
+    return found
+
+
+def _find_secret_field_reference(spec: QuerySpec) -> str | None:
+    """The third layer of the field policy (see app/security/field_policy.py).
+
+    Layer one hides secret field names from the prompt, so a well-behaved model never emits one.
+    This layer assumes it did anyway -- a model can guess `card_number` without being shown it,
+    and a filter or `$group` keyed on it should be refused outright rather than executed and
+    stripped afterwards. Refusing is what makes the redaction honest: the query never runs, so
+    the value is never read off disk at all.
+
+    Deliberately checks `is_secret_field` only, and NOT `is_internal_field`. Internal fields
+    like `_id` are structural Mongo syntax in a pipeline -- a `$group` key is literally named
+    `_id`, and `{"$project": {"_id": 0}}` is the idiomatic way to *exclude* it -- so rejecting
+    them here would refuse most legitimate aggregations while protecting nothing. Internal
+    fields are handled where they actually matter: hidden from the prompt, and dropped from
+    every row by app/db/executor.py regardless of what the query asked for.
+    """
+    references = (
+        _referenced_fields(spec.filter)
+        | _referenced_fields(spec.pipeline)
+        | _referenced_fields(spec.projection or {})
+        | _referenced_fields(spec.sort or {})
+    )
+    for field in sorted(references):
+        if is_secret_field(field):
+            return field
+    return None
+
+
 def _parse_iso_date(value: str, field_name: str) -> date:
+    # LLMs often emit full ISO-8601 datetimes (e.g. "2025-05-01T00:00:00Z" or
+    # "2025-05-01 00:00:00").  We only need the date part for range-checking, so
+    # strip everything from the first 'T' or space before parsing.
+    date_part = value.split("T")[0].split(" ")[0]
     try:
-        return date.fromisoformat(value)
+        return date.fromisoformat(date_part)
     except ValueError as exc:
         raise QueryValidationError(
             f"invalid {field_name} '{value}': must be an ISO date (YYYY-MM-DD)"
@@ -119,6 +172,12 @@ def validate_query_spec(
     )
     if violation:
         raise QueryValidationError(violation)
+
+    secret_field = _find_secret_field_reference(spec)
+    if secret_field:
+        raise QueryValidationError(
+            f"query references restricted field '{secret_field}', which cannot be read"
+        )
 
     _validate_date_range(spec, max_date_range_days)
     _validate_geo_near(spec, geo_allowed_fields or {}, max_geo_radius_m)

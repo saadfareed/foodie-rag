@@ -6,3 +6,8 @@ python-dotenv>=1.0
 pydantic>=2.7
 langgraph>=0.2
 langchain-core>=0.3
+# Report generation (app/generators/): charts, spreadsheets, PDFs.
+matplotlib>=3.7
+openpyxl>=3.1
+Jinja2>=3.1
+weasyprint>=61.0

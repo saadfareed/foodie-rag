@@ -1,29 +1,79 @@
-"""Entry point for answering a question: clarification-cache check -> the multi-domain LangGraph
-agent (app/agents/graph.py) -> audit/answer-cache/quota integration.
+"""Entry point for answering a question: deterministic pre-checks -> the multi-domain LangGraph
+agent (app/agents/graph.py) -> audit/answer-cache/quota integration -> the requested deliverable.
 
-This module used to run a single-shot "one Gemini call picks a collection and writes a query"
-pipeline directly; that's now the graph's job (classify -> per-domain agents -> validate ->
-execute -> synthesize). What stays here is everything that isn't specific to any one domain:
-the daily call budget gate, the per-channel answer cache, the per-(channel,user) clarification
-cache, and structured audit logging.
+What stays here is everything that isn't specific to any one domain: the daily call budget gate,
+the per-channel answer cache, the per-(channel,user) clarification cache, deterministic refusals,
+structured audit logging, and turning the graph's rows into whatever format the user asked for.
+
+**Ordering is the design.** Every gate that costs nothing runs before every gate that costs
+something, and nothing reaches Gemini until all of them have passed:
+
+    reset command / context-switch reply   -- pure string comparison
+    deterministic refusal                  -- regex
+    explicit format detection              -- regex
+    answer cache                           -- dict lookup
+    per-user rate limit                    -- deque trim
+    shared daily Gemini budget             -- counter
+    ... only now does anything call a model
+
+That order is load-bearing rather than cosmetic. The budget check in particular used to sit
+*after* an intent-classification Gemini call, so every request made while over budget spent a
+real quota unit to report that the quota was exhausted.
 """
 
+import logging
 import time
 import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from app.agents.graph import build_graph
 from app.audit.logger import log_query_event
 from app.config import settings
-from app.llm.circuit_breaker import CircuitBreakerOpenError
-from app.llm.gemini_client import GeminiClient, is_rate_limited
+from app.generators.csv_generator import generate_csv
+from app.generators.pdf_generator import generate_pdf
+from app.generators.render_pool import RenderTimeout, run_render
+from app.generators.xlsx_generator import generate_xlsx
+from app.llm.gemini_client import GeminiClient
 from app.llm.quota import quota_tracker
+from app.messages import (
+    Failure,
+    classify_exception,
+    failure_message,
+    needs_reference,
+    new_reference,
+    report_render_note,
+)
 from app.rag.answer_cache import CachedResult, answer_cache
 from app.rag.clarification_cache import PendingClarification, clarification_cache
 from app.rag.context_switch_cache import PendingContextSwitch, context_switch_cache
 from app.rag.conversation_context import conversation_context_cache
 from app.rag.rate_limiter import rate_limiter
+from app.security.output_scanner import scan_output_for_pii
+from app.services.intent_router import detect_explicit_format, refusal_reason
+
+logger = logging.getLogger("audit")
+
+
+@dataclass(frozen=True)
+class AnswerResult:
+    """One answer, in whatever shape the user asked for.
+
+    A single result type -- rather than "a str, except sometimes a dict when there's a file" --
+    is what lets the answer cache round-trip a generated report intact. The earlier dual return
+    type is why a cached PDF request replayed as bare prose with the attachment silently gone.
+    """
+
+    text: str
+    file_bytes: bytes | None = None
+    file_type: str | None = None
+    #: Machine-readable reason this wasn't a normal answer (rate_limited, refused, ...).
+    error: str | None = None
+
+    @property
+    def has_file(self) -> bool:
+        return bool(self.file_bytes and self.file_type)
 
 
 def _normalize_command(question: str) -> str:
@@ -90,13 +140,51 @@ def _timed_stage(timings: dict[str, float], name: str) -> Iterator[None]:
         timings[name] = round((time.perf_counter() - start) * 1000, 2)
 
 
+def _build_file(
+    output_format: str,
+    rows_by_domain: dict[str, list[dict]],
+    question: str,
+    answer: str,
+    title: str,
+) -> tuple[bytes, str] | None:
+    """Render the requested deliverable, or None if it can't be produced.
+
+    Runs on the bounded render pool (app/generators/render_pool.py) so document rendering can't
+    saturate every Socket Mode worker at once. A failure here is deliberately non-fatal: the text
+    answer is already correct and complete, and handing it over beats failing the whole question
+    because a chart didn't fit.
+    """
+    if output_format == "text":
+        return None
+    if not any(rows for rows in rows_by_domain.values()):
+        return None
+
+    builders = {
+        "csv": lambda: generate_csv(rows_by_domain, title=title),
+        "xlsx": lambda: generate_xlsx(rows_by_domain, title=title),
+        "pdf": lambda: generate_pdf(rows_by_domain, question=question, answer=answer, title=title),
+    }
+    builder = builders.get(output_format)
+    if builder is None:
+        return None
+
+    try:
+        return run_render(builder, description=f"{output_format} report"), output_format
+    except RenderTimeout:
+        return None
+    except Exception:
+        logger.exception("report_generation_failed", extra={"event": {"format": output_format}})
+        return None
+
+
 def answer_question(
     question: str,
     gemini: GeminiClient | None = None,
     *,
     user_id: str | None = None,
     channel_id: str | None = None,
-) -> str:
+    authenticated_vendor_id: str | None = None,
+) -> AnswerResult:
     start = time.perf_counter()
     timings: dict[str, float] = {}
 
@@ -110,6 +198,10 @@ def answer_question(
             **kwargs,
         )
 
+    def _plain(answer: str, *, error: str | None = None) -> AnswerResult:
+        _log(error=error, answer=answer)
+        return AnswerResult(text=answer, error=error)
+
     if _is_reset_command(question):
         # Ahead of answer_cache deliberately -- caching this reply would mean a second "reset"
         # from a different user in the same channel gets served the confirmation text without
@@ -118,12 +210,11 @@ def answer_question(
         clarification_cache.clear(clarification_cache.make_key(channel_id, user_id))
         conversation_context_cache.clear(conversation_context_cache.make_key(channel_id, user_id))
         context_switch_cache.clear(context_switch_cache.make_key(channel_id, user_id))
-        answer = (
+        return _plain(
             "Got it -- I've cleared our conversation context. Ask me something new whenever "
-            "you're ready."
+            "you're ready.",
+            error="context_reset",
         )
-        _log(error="context_reset", answer=answer)
-        return answer
 
     # A pending confirmation means the *previous* answer asked "should I clear that context and
     # answer this as a new question?" (app/agents/graph.py's confirm_context_switch node) --
@@ -144,9 +235,10 @@ def answer_question(
             question = pending_switch.candidate_question
         elif _is_negative(question):
             context_switch_cache.clear(switch_key)
-            answer = "Okay, sticking with our current conversation -- go ahead."
-            _log(error="context_switch_declined", answer=answer)
-            return answer
+            return _plain(
+                "Okay, sticking with our current conversation -- go ahead.",
+                error="context_switch_declined",
+            )
         else:
             # Neither a clear yes nor no -- the user moved on without answering, so whatever
             # context prompted the question is already stale. Drop both the pending prompt and
@@ -158,27 +250,55 @@ def answer_question(
                 conversation_context_cache.make_key(channel_id, user_id)
             )
 
-    cache_key = answer_cache.make_key(channel_id, question)
+    # Policy refusal, decided in code (app/services/intent_router.py). Free, and ahead of the
+    # cache because the answer never depends on the data -- there is nothing to look up and
+    # nothing worth caching.
+    refusal = refusal_reason(question)
+    if refusal:
+        return _plain(refusal, error="refused_restricted_request")
+
+    # The format the user named outright. Resolved before the cache so the cache key can include
+    # it; the classifier's inferred format (for questions that don't name one) is folded in
+    # after the graph runs.
+    explicit_format = detect_explicit_format(question)
+
+    # Scoping the key by the authenticated vendor is a correctness requirement, not a tuning
+    # knob: a vendor-scoped answer contains only that vendor's rows, so replaying it to a
+    # different asker in the same channel would leak across tenants.
+    cache_key = answer_cache.make_key(
+        channel_id,
+        question,
+        vendor_scope=authenticated_vendor_id,
+        output_format=explicit_format or "text",
+    )
     cached = answer_cache.get(cache_key)
     if cached is not None:
         _log(error=cached.error, answer=cached.answer, cache_hit=True)
-        return cached.answer
+        return AnswerResult(
+            text=cached.answer,
+            file_bytes=cached.file_bytes,
+            file_type=cached.file_type,
+            error=cached.error,
+        )
 
     # Checked before touching Gemini/Mongo/the shared daily budget at all -- a cache hit above
     # is free and shouldn't count against this user's own rate, but everything past this point
     # spends a real resource one user could otherwise monopolize.
     rate_limit_key = rate_limiter.make_key(channel_id, user_id)
     if not rate_limiter.allow(rate_limit_key):
-        answer = "You're asking faster than I can keep up -- please wait a bit and try again."
-        _log(error="rate_limited", answer=answer)
-        return answer
+        return _plain(
+            failure_message(Failure.USER_RATE_LIMITED),
+            error=Failure.USER_RATE_LIMITED.value,
+        )
+
+    # Ahead of every Gemini call, so an over-budget request costs nothing to refuse.
+    if quota_tracker.is_over_budget():
+        return _plain(
+            failure_message(Failure.DAILY_BUDGET_EXCEEDED),
+            error=Failure.DAILY_BUDGET_EXCEEDED.value,
+        )
 
     gemini = gemini or GeminiClient()
-
-    if quota_tracker.is_over_budget():
-        answer = "I've hit my daily question budget -- please try again tomorrow."
-        _log(error="daily_budget_exceeded", answer=answer)
-        return answer
 
     # A pending clarification for this (channel, user) means the *previous* answer was itself a
     # clarifying question -- treat this message as the follow-up, not a fresh question, by
@@ -207,17 +327,22 @@ def answer_question(
                     "previous_question": previous_question,
                     "user_id": user_id,
                     "channel_id": channel_id,
+                    "authenticated_vendor_id": authenticated_vendor_id,
                 }
             )
     except Exception as exc:
-        if isinstance(exc, CircuitBreakerOpenError):
-            answer = "I'm having trouble reaching Gemini right now -- please try again shortly."
-        elif is_rate_limited(exc):
-            answer = "I'm getting rate-limited by Gemini right now -- please try again shortly."
-        else:
-            answer = f"Sorry, I couldn't process that question right now ({exc})."
-        _log(error=str(exc), answer=answer)
-        return answer
+        # The raw exception goes to the audit log, never to Slack: it has carried pymongo
+        # tracebacks and Google's quota payload (metric names, doc links, a nested JSON blob)
+        # straight into a channel. The reference code is what ties the two together.
+        failure = classify_exception(exc)
+        reference = new_reference() if needs_reference(failure) else None
+        _log(
+            error=failure.value,
+            error_detail=str(exc),
+            error_reference=reference,
+            answer=failure_message(failure, reference),
+        )
+        return AnswerResult(text=failure_message(failure, reference), error=failure.value)
 
     timings.update(result.get("timings", {}))
     answer = result["answer"]
@@ -236,8 +361,7 @@ def answer_question(
                 clarification_key,
                 PendingClarification(original_question=effective_question, rounds=rounds),
             )
-        _log(error="clarification_needed", answer=answer)
-        return answer
+        return _plain(answer, error="clarification_needed")
 
     if result.get("needs_context_confirmation"):
         # The classifier decided this message doesn't fit the still-live context but didn't
@@ -247,8 +371,7 @@ def answer_question(
         context_switch_cache.set(
             switch_key, PendingContextSwitch(candidate_question=effective_question)
         )
-        _log(error="context_switch_confirmation_needed", answer=answer)
-        return answer
+        return _plain(answer, error="context_switch_confirmation_needed")
 
     clarification_cache.clear(clarification_key)
     # Stores resolved_question (the context-folded rewrite when this was itself a follow-up, or
@@ -259,12 +382,62 @@ def answer_question(
     )
 
     specs = list(result.get("specs_by_domain", {}).values())
-    row_count = sum(len(rows) for rows in result.get("rows_by_domain", {}).values())
+    # Already sanitized -- app/db/executor.py applies the field policy as rows leave the
+    # database, so nothing here (or in the answer prompt, or in a generated file) has ever seen
+    # a raw `_id` or card number.
+    rows_by_domain = result.get("rows_by_domain", {})
+    row_count = sum(len(rows) for rows in rows_by_domain.values())
     errors_by_domain = {
         **(result.get("out_of_scope_by_domain") or {}),
         **(result.get("errors_by_domain") or {}),
     } or None
 
+    # An explicitly named format wins over the classifier's inference: if the user typed "csv",
+    # no model judgement should be able to hand them something else.
+    classification = result.get("classification")
+    output_format = explicit_format or getattr(classification, "output_format", "text")
+
+    # Belt-and-braces over the field policy: the rows were sanitized on the way out of Mongo, but
+    # the answer text is model-generated prose, and a model can restate a number it was shown.
+    answer = scan_output_for_pii(answer)
+
+    # The classifier's title restates the request ("Last 10 Incomplete Order Details"); the
+    # configured REPORT_TITLE is the fallback when it had no opinion.
+    report_title = (
+        getattr(classification, "report_title", "") or ""
+    ).strip() or settings.report_title
+
+    file_result = None
+    if output_format != "text":
+        with _timed_stage(timings, "render_ms"):
+            file_result = _build_file(
+                output_format, rows_by_domain, effective_question, answer, report_title
+            )
+
+    if output_format != "text" and file_result is None and row_count > 0:
+        # Appended rather than replacing the answer: the prose is correct and complete, and the
+        # only thing missing is the attachment. Saying "something went wrong" here would throw
+        # away a good answer over a formatting problem.
+        answer = f"{answer}\n\n_{report_render_note(output_format)}_"
+
+    result_obj = AnswerResult(
+        text=answer,
+        file_bytes=file_result[0] if file_result else None,
+        file_type=file_result[1] if file_result else None,
+    )
+
     _log(specs=specs, row_count=row_count, errors_by_domain=errors_by_domain, answer=answer)
-    answer_cache.set(cache_key, CachedResult(answer=answer))
-    return answer
+    # Stored under exactly the key that was looked up, so a repeat of this question replays the
+    # same deliverable -- file included -- rather than re-rendering it. Rebuilding the key from
+    # the *resolved* format instead would write to a key the next identical request never reads:
+    # the lookup happens before the graph runs, so it can only ever know the explicitly named
+    # format, and an inferred "pdf" would be filed under a key nothing looks for.
+    answer_cache.set(
+        cache_key,
+        CachedResult(
+            answer=answer,
+            file_bytes=result_obj.file_bytes,
+            file_type=result_obj.file_type,
+        ),
+    )
+    return result_obj

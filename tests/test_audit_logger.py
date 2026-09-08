@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 
 import pytest
 
@@ -163,3 +164,25 @@ def test_json_formatter_produces_valid_json():
     assert parsed["answer"] == "there"
     assert parsed["level"] == "INFO"
     assert "timestamp" in parsed
+
+
+def test_an_exception_is_serialized_into_the_audit_record(caplog):
+    """Audit records are JSON lines; a traceback has to land inside the payload, not be dropped
+    because the formatter only looked at `event`."""
+    import json
+    import logging
+
+    from app.audit.logger import _JsonFormatter
+
+    formatter = _JsonFormatter()
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            "audit", logging.ERROR, __file__, 1, "failed", None, sys.exc_info()
+        )
+
+    payload = json.loads(formatter.format(record))
+
+    assert "ValueError: boom" in payload["exception"]
+    assert payload["message"] == "failed"

@@ -65,15 +65,25 @@ class Settings:
         )
         self.mongodb_connect_timeout_ms = _int("MONGODB_CONNECT_TIMEOUT_MS", "3000")
         self.mongodb_socket_timeout_ms = _int("MONGODB_SOCKET_TIMEOUT_MS", "8000")
-        # Default bumped 20 -> 30: a single question can now fan out to up to
-        # AGENT_MAX_FAN_OUT parallel domain queries instead of always issuing exactly one, so
-        # the pool needs to cover slack_socket_mode_concurrency (10) * AGENT_MAX_FAN_OUT (3)
-        # rather than just slack_socket_mode_concurrency, or requests start queuing on the pool.
+        # Default bumped 30 -> 40: a single question fans out to up to AGENT_MAX_FAN_OUT
+        # parallel domain queries *and* may issue anchor-resolution queries ahead of them, so
+        # the pool needs to cover slack_socket_mode_concurrency (10) * (AGENT_MAX_FAN_OUT + 1)
+        # rather than just concurrency * fan_out, or requests start queuing on the pool.
         # See pool_size_warning() below, which checks this relationship still holds at startup.
-        self.mongodb_max_pool_size = _int("MONGODB_MAX_POOL_SIZE", "30")
+        self.mongodb_max_pool_size = _int("MONGODB_MAX_POOL_SIZE", "40")
         # Clamp on geo_near.max_distance_m, mirroring how MAX_DATE_RANGE_DAYS clamps date spans --
         # keeps a "nearby" question from silently becoming an unbounded/full-scan geo query.
         self.mongodb_max_geo_radius_m = _float("MONGODB_MAX_GEO_RADIUS_M", "50000")
+
+        # Connection-level timeouts so a slow/unreachable Mongo doesn't stall a request for
+        # pymongo's 30s default server-selection window. maxPoolSize should stay >=
+        # slack_socket_mode_concurrency so DB connections don't become the concurrency ceiling.
+        self.mongodb_server_selection_timeout_ms = int(
+            os.environ.get("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "3000")
+        )
+        self.mongodb_connect_timeout_ms = int(os.environ.get("MONGODB_CONNECT_TIMEOUT_MS", "3000"))
+        self.mongodb_socket_timeout_ms = int(os.environ.get("MONGODB_SOCKET_TIMEOUT_MS", "8000"))
+        self.mongodb_max_pool_size = int(os.environ.get("MONGODB_MAX_POOL_SIZE", "20"))
 
         self.audit_log_level = os.environ.get("AUDIT_LOG_LEVEL", "INFO")
         # Optional second logging sink alongside stdout -- empty (default) means stdout only.
@@ -87,7 +97,14 @@ class Settings:
         self.gemini_retry_base_delay_seconds = _float("GEMINI_RETRY_BASE_DELAY_SECONDS", "1.0")
         # Hard wall-clock ceiling on retry backoff, independent of gemini_max_retries, so a
         # question can't stall indefinitely on repeated transient errors.
-        self.gemini_max_retry_seconds = _float("GEMINI_MAX_RETRY_SECONDS", "20.0")
+        #
+        # Lowered 20.0 -> 8.0 because this is a *per-call* ceiling and one question makes
+        # several calls (classify, per-domain fan-out, synthesize). At 20s a single question
+        # could sit in backoff for over a minute while holding a Socket Mode worker thread --
+        # the ceiling was doing its job per call and still allowing an unbounded-feeling wait
+        # per question. 8s keeps two retries' worth of headroom while bounding the worst case
+        # to something a user will wait through.
+        self.gemini_max_retry_seconds = _float("GEMINI_MAX_RETRY_SECONDS", "8.0")
         # Client-side HTTP timeout for Gemini API calls (ms) -- bounds a hung request that would
         # otherwise never fail on its own. A slow-but-transient response past this point is now
         # retried (see _is_retryable), not just failed outright.
@@ -165,8 +182,43 @@ class Settings:
         # Per-(channel,user) sliding-window rate limit (app/rag/rate_limiter.py) -- independent of
         # gemini_daily_call_budget (a *shared* ceiling): this bounds one user's request rate so a
         # single chatty user can't burn through that shared daily budget alone. 0 disables it.
-        self.user_rate_limit_per_minute = _int("USER_RATE_LIMIT_PER_MINUTE", "0")
+        # Default is deliberately ON (was 0/disabled): a single question costs several Gemini
+        # calls against a free-tier daily quota, so an unbounded user can exhaust the whole
+        # workspace's budget -- and the Socket Mode thread pool -- on their own in under a minute.
+        self.user_rate_limit_per_minute = _int("USER_RATE_LIMIT_PER_MINUTE", "10")
         self.user_rate_limit_window_seconds = _float("USER_RATE_LIMIT_WINDOW_SECONDS", "60.0")
+
+        # --- Report generation (app/generators/) ---------------------------------------------
+        # Row cap for a generated CSV/XLSX/PDF export. Bounds both the render cost (WeasyPrint
+        # and openpyxl are the most expensive CPU on the request path) and the size of the file
+        # pushed to Slack. Separate from mongodb_max_result_limit, which bounds what's fetched.
+        self.report_max_rows = _int("REPORT_MAX_ROWS", "1000")
+        # Column cap per table. A wide Mongo document renders an unreadable table and a huge PDF;
+        # this keeps the deterministic column ordering in app/generators/tabular.py bounded.
+        self.report_max_columns = _int("REPORT_MAX_COLUMNS", "12")
+        # Max distinct categories plotted before a pie chart is rejected in favour of a bar
+        # chart -- a pie with 30 slices communicates nothing.
+        self.report_max_pie_slices = _int("REPORT_MAX_PIE_SLICES", "8")
+        # Bounded pool for PDF/XLSX rendering, so heavy CPU work is capped independently of
+        # slack_socket_mode_concurrency. Without this, every Socket Mode worker can be inside
+        # WeasyPrint at once and the box thrashes. See app/generators/render_pool.py.
+        self.report_render_concurrency = _int("REPORT_RENDER_CONCURRENCY", "2")
+        # Wall-clock ceiling on a single render, after which the user gets the text answer
+        # instead of waiting indefinitely on a pathological table.
+        self.report_render_timeout_seconds = _float("REPORT_RENDER_TIMEOUT_SECONDS", "25.0")
+        self.report_title = os.environ.get("REPORT_TITLE", "Data Report")
+
+        # --- Security (app/security/) -------------------------------------------------------
+        # Extra field names (comma-separated) to drop from every row before it reaches the LLM,
+        # a generated file, the cache, or the audit log -- on top of the built-in internal/secret
+        # patterns in app/security/field_policy.py. Names are matched case-insensitively.
+        self.security_extra_denied_fields = _parse_list(
+            os.environ.get("SECURITY_EXTRA_DENIED_FIELDS", "")
+        )
+        # How long a `/login` vendor session stays valid (app/slack/auth.py). Bounded so an
+        # abandoned session can't keep a scoped identity alive indefinitely in a long-lived
+        # process.
+        self.vendor_session_ttl_seconds = _int("VENDOR_SESSION_TTL_SECONDS", "3600")
 
     def pool_size_warning(self) -> str | None:
         """None if mongodb_max_pool_size comfortably covers worst-case concurrent DB usage,
@@ -175,13 +227,19 @@ class Settings:
         queries -- if the pool is smaller than that, requests start queuing on pool checkout,
         silently reintroducing the latency these timeouts were meant to bound. Checked explicitly
         at startup (see app/main.py) rather than asserted in __init__, since a too-small pool is a
-        performance warning, not something that should crash the process."""
-        required = self.slack_socket_mode_concurrency * self.agent_max_fan_out
+        performance warning, not something that should crash the process.
+
+        The `+ 1` covers app/agents/graph.py::_resolve_anchors_node, which issues its own
+        customer/vendor lookups *before* the fan-out on cross-domain geo questions. Sizing the
+        pool at exactly concurrency * fan_out left zero headroom for those, so the worst case
+        genuinely exceeded the pool and checkouts queued silently."""
+        required = self.slack_socket_mode_concurrency * (self.agent_max_fan_out + 1)
         if self.mongodb_max_pool_size >= required:
             return None
         return (
             f"MONGODB_MAX_POOL_SIZE ({self.mongodb_max_pool_size}) is below "
-            f"SLACK_SOCKET_MODE_CONCURRENCY * AGENT_MAX_FAN_OUT ({required}) -- DB connections "
+            f"SLACK_SOCKET_MODE_CONCURRENCY * (AGENT_MAX_FAN_OUT + 1) ({required}) -- DB "
+            "connections "
             "may become the concurrency bottleneck under load. Raise MONGODB_MAX_POOL_SIZE to "
             f"at least {required}."
         )

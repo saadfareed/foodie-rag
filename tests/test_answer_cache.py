@@ -34,5 +34,43 @@ def test_lru_eviction_drops_least_recently_used():
 
 
 def test_make_key_normalizes_question_and_defaults_channel():
-    assert AnswerCache.make_key("C1", "  How Many Orders?  ") == ("C1", "how many orders?")
-    assert AnswerCache.make_key(None, "hi") == ("", "hi")
+    assert AnswerCache.make_key("C1", "  How Many Orders?  ") == (
+        "C1",
+        "",
+        "text",
+        "how many orders?",
+    )
+    assert AnswerCache.make_key(None, "hi") == ("", "", "text", "hi")
+
+
+def test_make_key_separates_vendor_scopes():
+    """A vendor-authenticated answer contains only that vendor's rows. Sharing a cache entry
+    across identities would replay one vendor's data to another -- a cross-tenant leak, not a
+    stale-answer annoyance."""
+    shared_question = "how many orders do i have?"
+    vendor_a = AnswerCache.make_key("C1", shared_question, vendor_scope="USR-1")
+    vendor_b = AnswerCache.make_key("C1", shared_question, vendor_scope="USR-2")
+    anonymous = AnswerCache.make_key("C1", shared_question)
+
+    assert vendor_a != vendor_b != anonymous
+    assert vendor_a != anonymous
+
+
+def test_make_key_separates_output_formats():
+    """The same words asked as text and as a spreadsheet are different deliverables."""
+    assert AnswerCache.make_key("C1", "orders", output_format="text") != AnswerCache.make_key(
+        "C1", "orders", output_format="xlsx"
+    )
+
+
+def test_cached_result_round_trips_a_generated_file():
+    """A cache that dropped the file replayed a report request as bare prose with the
+    attachment silently missing."""
+    cache = AnswerCache(ttl_seconds=60, max_entries=10)
+    key = AnswerCache.make_key("C1", "orders report", output_format="pdf")
+    cache.set(key, CachedResult(answer="Here it is.", file_bytes=b"%PDF-1.7", file_type="pdf"))
+
+    hit = cache.get(key)
+
+    assert hit.file_bytes == b"%PDF-1.7"
+    assert hit.file_type == "pdf"

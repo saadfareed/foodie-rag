@@ -31,6 +31,7 @@ requirement today and a generic planner would be speculative machinery for cases
 exist yet.
 """
 
+import logging
 import time
 
 from langgraph.graph import END, START, StateGraph
@@ -38,28 +39,25 @@ from langgraph.types import Send
 
 from app.agents.classifier import Classification, classify_question
 from app.agents.domains import DOMAINS, allowed_collections, geo_allowed_fields, merge_forced_filter
+from app.agents.enrichment import enrich_rows_with_names
 from app.agents.query_agents import generate_domain_query_spec
 from app.agents.state import GraphState
 from app.config import settings
 from app.db.executor import execute_query_spec
 from app.db.mongo import get_db
-from app.llm.circuit_breaker import CircuitBreakerOpenError
-from app.llm.gemini_client import GeminiClient, is_rate_limited
+from app.llm.gemini_client import GeminiClient
+from app.messages import (
+    Failure,
+    classify_exception,
+    failure_message,
+    new_reference,
+    no_data_message,
+    out_of_scope_message,
+)
 from app.rag.query_spec import GeoNear, QueryError, QuerySpec
 from app.rag.validator import QueryValidationError, validate_query_spec
 
-
-def _friendly_generation_error(exc: Exception) -> str:
-    """Mirrors the top-level framing in app/rag/pipeline.py for the same exception types -- a
-    per-domain generation failure (mid-fan-out, after classification already ran) should read
-    the same way a whole-question failure would, not leak internal exception text (e.g. "Gemini
-    circuit breaker open after 5 consecutive failures -- failing fast instead of retrying.")
-    just because it happened to surface here instead of escaping the whole graph."""
-    if isinstance(exc, CircuitBreakerOpenError):
-        return "Gemini is temporarily unavailable -- please try again shortly."
-    if is_rate_limited(exc):
-        return "Gemini rate limit reached -- please try again shortly."
-    return str(exc)
+logger = logging.getLogger("audit")
 
 
 _DEFAULT_CLARIFICATION = (
@@ -77,7 +75,7 @@ def _generate_validate_execute(
     id_filter: dict | None = None,
     limit_override: int | None = None,
     spec_cache: dict[tuple[str, str], QuerySpec | QueryError] | None = None,
-) -> tuple[QuerySpec | None, list[dict], str | None, bool]:
+) -> tuple[QuerySpec | None, list[dict], str | None, bool, Failure | None]:
     """Shared by the real per-domain agent node and the anchor-resolution step below -- both
     need "generate a spec for this domain, force in whatever code already knows, validate,
     execute" and shouldn't drift into two slightly different implementations of the same
@@ -91,11 +89,17 @@ def _generate_validate_execute(
     cached hit still runs its own validate/execute (never cached) and deep-copies the spec before
     mutating it, so each call site's overrides can't leak into the other's.
 
-    Returns (spec, rows, error, out_of_scope). out_of_scope distinguishes the domain agent's own
-    deliberate "can't answer this" (QueryError) from an actual failure -- confirmed in
-    production: the model can emit a QuerySpec shape Pydantic rejects (e.g. an explicit
-    "limit": null that used to hard-fail validation), and a raw exception there is a bug/model
-    hiccup, not a friendly rejection, so it must not be presented the same way."""
+    Returns (spec, rows, error, out_of_scope, failure). `error` is the RAW text, for the audit
+    log only; `failure` is the classified kind that decides what the user is told. Keeping those
+    two separate is the point: the raw text has carried pymongo tracebacks and validator internals
+    into Slack, and re-deriving the kind by string-matching that text downstream was worse -- a
+    Gemini 429 caught during generation came out phrased as a database error.
+
+    out_of_scope distinguishes the domain agent's own deliberate "can't answer this"
+    (QueryError) from an actual failure -- confirmed in production: the model can emit a
+    QuerySpec shape Pydantic rejects (e.g. an explicit "limit": null that used to hard-fail
+    validation), and a raw exception there is a bug/model hiccup, not a friendly rejection, so
+    it must not be presented the same way."""
     domain = DOMAINS[domain_name]
     cache_key = (domain_name, question)
     if spec_cache is not None and cache_key in spec_cache:
@@ -104,12 +108,12 @@ def _generate_validate_execute(
         try:
             result = generate_domain_query_spec(gemini, domain, question)
         except Exception as exc:  # noqa: BLE001 -- a generation-time failure, not this domain's fault
-            return None, [], _friendly_generation_error(exc), False
+            return None, [], str(exc), False, classify_exception(exc)
         if spec_cache is not None:
             spec_cache[cache_key] = result
 
     if isinstance(result, QueryError):
-        return None, [], result.error, True
+        return None, [], result.error, True, None
 
     spec = result.model_copy(deep=True)
     if geo_override_location is not None and domain.geo_field is not None:
@@ -133,14 +137,14 @@ def _generate_validate_execute(
             max_geo_radius_m=settings.mongodb_max_geo_radius_m,
         )
     except QueryValidationError as exc:
-        return spec, [], str(exc), False
+        return spec, [], str(exc), False, Failure.QUERY_REJECTED
 
     try:
         rows = execute_query_spec(get_db(), validated, timeout_ms=settings.mongodb_query_timeout_ms)
     except Exception as exc:  # noqa: BLE001 -- surfaced to the user as a domain-scoped error
-        return validated, [], str(exc), False
+        return validated, [], str(exc), False, classify_exception(exc)
 
-    return validated, rows, None, False
+    return validated, rows, None, False, None
 
 
 def _classify_node(gemini: GeminiClient):
@@ -223,7 +227,7 @@ def _resolve_anchors_node(gemini: GeminiClient):
         start = time.perf_counter()
         customer_location: dict | None = None
         if "customers" in domains:
-            _, rows, _, _ = _generate_validate_execute(
+            _, rows, _, _, _ = _generate_validate_execute(
                 gemini, "customers", question, limit_override=5, spec_cache=spec_cache
             )
             if rows:
@@ -238,7 +242,7 @@ def _resolve_anchors_node(gemini: GeminiClient):
 
         if customer_location and "orders" in domains:
             start = time.perf_counter()
-            _, vendor_rows, _, _ = _generate_validate_execute(
+            _, vendor_rows, _, _, _ = _generate_validate_execute(
                 gemini,
                 "vendors",
                 question,
@@ -265,6 +269,13 @@ def _fan_out(state: GraphState) -> list[Send]:
         payload: dict = {
             "question": _effective_question(state),
             "domain": domain_name,
+            # Threaded explicitly because a Send payload is a fresh dict, NOT the graph state:
+            # a fanned-out node sees only what is put here. Omitting this silently disabled the
+            # whole `/login` guardrail -- _orders_id_filter/_vendors_id_filter read it from
+            # their node's state, found nothing, and forced no vendor scoping at all, so an
+            # authenticated vendor saw every vendor's rows. Nothing failed; the answers were
+            # just wrong.
+            "authenticated_vendor_id": state.get("authenticated_vendor_id"),
             # Shared with _resolve_anchors_node so a domain already queried while resolving a
             # cross-domain anchor (customers/vendors, in the geo composite pattern) doesn't pay
             # for an identical Gemini generation call a second time here.
@@ -283,10 +294,24 @@ def _fan_out(state: GraphState) -> list[Send]:
 
 def _orders_id_filter(state: GraphState) -> dict | None:
     forced: dict = {}
-    if state.get("resolved_vendor_ids"):
+
+    # RBAC: Restrict vendor to their own orders
+    auth_vendor = state.get("authenticated_vendor_id")
+    if auth_vendor:
+        forced["vendor_id"] = auth_vendor
+    elif state.get("resolved_vendor_ids"):
         forced["vendor_id"] = {"$in": state["resolved_vendor_ids"]}
+
     if state.get("resolved_customer_ids"):
         forced["customer_id"] = {"$in": state["resolved_customer_ids"]}
+    return forced or None
+
+
+def _vendors_id_filter(state: GraphState) -> dict | None:
+    forced: dict = {}
+    auth_vendor = state.get("authenticated_vendor_id")
+    if auth_vendor:
+        forced["user_id"] = auth_vendor
     return forced or None
 
 
@@ -299,9 +324,14 @@ def _domain_agent_node(gemini: GeminiClient):
         geo_override_location = (
             state.get("resolved_customer_location") if domain_name == "vendors" else None
         )
-        id_filter = _orders_id_filter(state) if domain_name == "orders" else None
 
-        spec, rows, error, out_of_scope = _generate_validate_execute(
+        id_filter = None
+        if domain_name == "orders":
+            id_filter = _orders_id_filter(state)
+        elif domain_name == "vendors":
+            id_filter = _vendors_id_filter(state)
+
+        spec, rows, error, out_of_scope, failure = _generate_validate_execute(
             gemini,
             domain_name,
             question,
@@ -309,6 +339,19 @@ def _domain_agent_node(gemini: GeminiClient):
             id_filter=id_filter,
             spec_cache=state.get("spec_cache"),
         )
+
+        if rows:
+            # Resolve customer_id/vendor_id -> names so a report can show who an order is for
+            # instead of an opaque id. A no-op (and no query) when the rows carry no such ids,
+            # e.g. an aggregation grouped by status. Never fatal: the rows are already a correct
+            # answer, and losing the whole question over a failed name lookup would be a worse
+            # outcome than a report that shows ids.
+            try:
+                rows = enrich_rows_with_names(
+                    get_db(), rows, timeout_ms=settings.mongodb_query_timeout_ms
+                )
+            except Exception:  # noqa: BLE001 -- enrichment is presentation, not correctness
+                logger.warning("name_enrichment_failed", extra={"event": {"domain": domain_name}})
 
         elapsed = round((time.perf_counter() - start) * 1000, 2)
         update: dict = {
@@ -321,7 +364,10 @@ def _domain_agent_node(gemini: GeminiClient):
             if out_of_scope:
                 update["out_of_scope_by_domain"] = {domain_name: error}
             else:
+                # Raw text for the audit log, classified kind for the reply -- see
+                # _generate_validate_execute's docstring for why these are kept apart.
                 update["errors_by_domain"] = {domain_name: error}
+                update["error_kinds_by_domain"] = {domain_name: (failure or Failure.UNKNOWN).value}
         return update
 
     return node
@@ -337,17 +383,19 @@ def _synthesize_node(gemini: GeminiClient):
 
         if total_rows == 0:
             if errors_by_domain:
-                domain, error = next(iter(errors_by_domain.items()))
-                answer = f"I ran into a problem answering that ({domain}: {error})."
+                # errors_by_domain holds raw validator/pymongo text for the audit log. What the
+                # user gets is the catalogue's phrasing for the kind the failing node already
+                # classified, plus a reference code -- the raw text used to be interpolated
+                # straight into the reply, putting driver messages into a Slack channel.
+                kinds = state.get("error_kinds_by_domain", {})
+                kind = next(iter(kinds.values()), Failure.UNKNOWN.value)
+                answer = failure_message(Failure(kind), new_reference())
             elif out_of_scope_by_domain:
-                if len(out_of_scope_by_domain) == 1:
-                    answer = next(iter(out_of_scope_by_domain.values()))
-                else:
-                    answer = "; ".join(
-                        f"{domain}: {reason}" for domain, reason in out_of_scope_by_domain.items()
-                    )
+                # The model's own refusal is more specific than anything generic we could say,
+                # so it's shown as written -- this is a deliberate answer, not a fault.
+                answer = out_of_scope_message(out_of_scope_by_domain)
             else:
-                answer = "I didn't find any data matching that question."
+                answer = no_data_message(list(rows_by_domain) or state["classification"].domains)
         else:
             skipped = {**out_of_scope_by_domain, **errors_by_domain}
             answer = gemini.generate_answer(

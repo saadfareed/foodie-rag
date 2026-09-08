@@ -55,7 +55,9 @@ def test_defaults_are_sane(monkeypatch):
 
     settings = Settings()
 
-    assert settings.user_rate_limit_per_minute == 0  # disabled by default
+    # Enabled by default: one question costs several Gemini calls against a free-tier daily
+    # quota, so an unbounded user can exhaust the whole workspace's budget on their own.
+    assert settings.user_rate_limit_per_minute == 10
     assert settings.gemini_circuit_breaker_threshold == 5
     assert settings.gemini_circuit_breaker_cooldown_seconds == 30.0
     assert settings.audit_log_file == ""
@@ -65,9 +67,26 @@ def test_pool_size_warning_none_when_pool_covers_worst_case(monkeypatch):
     _set_required_env(monkeypatch)
     monkeypatch.setenv("SLACK_SOCKET_MODE_CONCURRENCY", "10")
     monkeypatch.setenv("AGENT_MAX_FAN_OUT", "3")
-    monkeypatch.setenv("MONGODB_MAX_POOL_SIZE", "30")
+    # concurrency * (fan_out + 1) -- the +1 is the anchor-resolution query that runs ahead of
+    # the fan-out on cross-domain geo questions.
+    monkeypatch.setenv("MONGODB_MAX_POOL_SIZE", "40")
 
     assert Settings().pool_size_warning() is None
+
+
+def test_pool_size_warning_accounts_for_anchor_resolution_queries(monkeypatch):
+    """A pool sized at exactly concurrency * fan_out left no headroom for the anchor-resolution
+    queries _resolve_anchors_node issues before the fan-out, so the real worst case exceeded the
+    pool and checkouts queued silently."""
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("SLACK_SOCKET_MODE_CONCURRENCY", "10")
+    monkeypatch.setenv("AGENT_MAX_FAN_OUT", "3")
+    monkeypatch.setenv("MONGODB_MAX_POOL_SIZE", "30")
+
+    warning = Settings().pool_size_warning()
+
+    assert warning is not None
+    assert "40" in warning
 
 
 def test_pool_size_warning_flags_an_undersized_pool(monkeypatch):
@@ -80,4 +99,4 @@ def test_pool_size_warning_flags_an_undersized_pool(monkeypatch):
 
     assert warning is not None
     assert "MONGODB_MAX_POOL_SIZE" in warning
-    assert "30" in warning
+    assert "40" in warning

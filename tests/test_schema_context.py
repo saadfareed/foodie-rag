@@ -2,7 +2,7 @@ import json
 import os
 
 from app.rag import schema_context
-from app.rag.schema_context import build_schema_context
+from app.rag.schema_context import build_domain_schema_context, build_schema_context
 
 SUMMARY = [
     {
@@ -124,3 +124,44 @@ def test_editing_summary_file_invalidates_the_cache(tmp_path):
 
     assert "new_field" in second
     assert "status" not in second
+
+
+def test_domain_context_reports_an_unknown_collection_clearly(tmp_path):
+    """Better an explicit "no schema for X" in the prompt than a silently empty section the
+    model fills in by guessing."""
+    summary_path = tmp_path / "schema_summary.json"
+    summary_path.write_text(json.dumps(SUMMARY))
+
+    result = build_domain_schema_context(
+        "not_a_collection",
+        summary_path=str(summary_path),
+        annotations_path=str(tmp_path / "missing.json"),
+    )
+
+    assert "not_a_collection" in result
+    assert "No schema information" in result
+
+
+def test_editing_the_summary_invalidates_the_rendered_domain_context(tmp_path):
+    """The rendered text is memoized separately from the parsed JSON; if only the parse were
+    invalidated, a re-run of introspect.py would never reach the prompt."""
+    summary_path = tmp_path / "schema_summary.json"
+    annotations_path = tmp_path / "missing.json"
+    summary_path.write_text(json.dumps(SUMMARY))
+    collection = SUMMARY[0]["collection"]
+
+    first = build_domain_schema_context(
+        collection, summary_path=str(summary_path), annotations_path=str(annotations_path)
+    )
+
+    updated = [{**SUMMARY[0], "fields": {"brand_new_field": {"types": ["str"], "examples": ["x"]}}}]
+    summary_path.write_text(json.dumps(updated))
+    future = os.path.getmtime(summary_path) + 5
+    os.utime(summary_path, (future, future))
+
+    second = build_domain_schema_context(
+        collection, summary_path=str(summary_path), annotations_path=str(annotations_path)
+    )
+
+    assert "brand_new_field" in second
+    assert second != first

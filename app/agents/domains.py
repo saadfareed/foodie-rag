@@ -34,12 +34,47 @@ class DomainConfig(BaseModel):
     # Fields to show a domain-scoped agent for a shared collection; None means "show the whole
     # collection's schema" (used by `orders`, which isn't shared with anything).
     schema_fields: list[str] | None = None
+    # Preferred left-to-right column order for a generated CSV/XLSX/PDF table. Columns listed
+    # here come first, in this order, when present on the row; anything else follows in
+    # first-seen order. Columns absent from the rows are simply skipped.
+    #
+    # This exists because Mongo document key order is an implementation detail, not a reading
+    # order. A reader scanning an order report wants to see who it's for and which order it is
+    # before the payment internals, and that ordering shouldn't change because a projection
+    # happened to emit keys differently.
+    report_columns: list[str] | None = None
+    # Columns that are correct data but noise in a human-facing report -- storage-level
+    # encodings of something already shown in a friendlier form. Hidden from generated
+    # CSV/XLSX/PDF tables only; the model still sees them, so it can still answer questions
+    # about them.
+    #
+    # This is a *display* list, deliberately separate from app/security/field_policy.py: those
+    # fields are withheld because showing them would be unsafe, these because showing them would
+    # be unhelpful. Conflating the two would mean either leaking secrets or losing the ability
+    # to answer questions about payment internals.
+    report_hidden_columns: list[str] | None = None
 
 
 DOMAINS: dict[str, DomainConfig] = {
     "orders": DomainConfig(
         name="orders",
         collection="orders",
+        # customer_name/vendor_name are not stored on an order -- they're resolved from
+        # customer_id/vendor_id by app/agents/enrichment.py before the report is built.
+        report_columns=[
+            "customer_name",
+            "order_id",
+            "amount",
+            "order_type",
+            "status",
+            "vendor_name",
+            "payment_method",
+            "created_at",
+        ],
+        # onlinepaymentmethod (1/2) and isWallet are the storage encoding that payment_method
+        # already names in words; payby is its per-method amount breakdown. All three are
+        # answerable but none belong in a column a person reads.
+        report_hidden_columns=["onlinepaymentmethod", "isWallet", "payby"],
     ),
     "customers": DomainConfig(
         name="customers",
@@ -48,6 +83,7 @@ DOMAINS: dict[str, DomainConfig] = {
         geo_capable=True,
         geo_field="location",
         schema_fields=[*SHARED_USER_FIELDS, "loyalty_tier"],
+        report_columns=["name", "user_id", "status", "city", "loyalty_tier", "last_active_at"],
     ),
     "vendors": DomainConfig(
         name="vendors",
@@ -56,6 +92,14 @@ DOMAINS: dict[str, DomainConfig] = {
         geo_capable=True,
         geo_field="location",
         schema_fields=[*SHARED_USER_FIELDS, "business_name", "category", "rating"],
+        report_columns=[
+            "business_name",
+            "user_id",
+            "category",
+            "rating",
+            "status",
+            "city",
+        ],
     ),
 }
 
@@ -73,6 +117,18 @@ def geo_allowed_fields() -> dict[str, set[str]]:
 
 def allowed_collections() -> list[str]:
     return sorted({domain.collection for domain in DOMAINS.values()})
+
+
+def report_columns_for(domain_name: str) -> list[str] | None:
+    """Preferred report column order for a domain, or None if it has no preference."""
+    domain = DOMAINS.get(domain_name)
+    return domain.report_columns if domain else None
+
+
+def report_hidden_columns_for(domain_name: str) -> set[str]:
+    """Columns to omit from a generated report table for a domain (may be empty)."""
+    domain = DOMAINS.get(domain_name)
+    return set(domain.report_hidden_columns or []) if domain else set()
 
 
 def merge_forced_filter(spec: QuerySpec, forced: dict) -> QuerySpec:

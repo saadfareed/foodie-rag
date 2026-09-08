@@ -498,3 +498,76 @@ def test_fallback_attempt_drops_thinking_config_but_keeps_it_for_primary():
     assert captured_configs["primary"].thinking_config.thinking_budget == 0
     assert captured_configs["fallback"].thinking_config is None
     assert captured_configs["fallback"].response_mime_type == "application/json"
+
+
+# --- answer-prompt pruning -----------------------------------------------------------------
+#
+# The row cap bounds how many rows go into the answer prompt; these bound how *wide* each row
+# is. Without both, 30 documents carrying a long description or an embedded array each are
+# still an enormous prompt on the single largest call in the request.
+
+
+def test_a_long_string_field_is_truncated():
+    from app.llm.gemini_client import _prune_value
+
+    pruned = _prune_value("x" * 500, max_chars=200)
+
+    assert len(pruned) == 201  # 200 chars plus the ellipsis
+    assert pruned.endswith("…")
+
+
+def test_a_short_string_is_left_alone():
+    from app.llm.gemini_client import _prune_value
+
+    assert _prune_value("cash", max_chars=200) == "cash"
+
+
+def test_a_long_list_is_summarized():
+    from app.llm.gemini_client import _prune_value
+
+    pruned = _prune_value(list(range(20)), max_chars=200)
+
+    assert pruned[:5] == [0, 1, 2, 3, 4]
+    assert pruned[-1] == "…15 more"
+
+
+def test_a_wide_nested_document_is_capped():
+    """A GeoJSON polygon or an embedded audit trail contributes thousands of tokens and nothing
+    the answer needs."""
+    from app.llm.gemini_client import _prune_value
+
+    pruned = _prune_value({f"k{i}": i for i in range(20)}, max_chars=200)
+
+    assert len(pruned) == 8
+
+
+def test_numbers_and_none_pass_through_unchanged():
+    from app.llm.gemini_client import _prune_value
+
+    assert _prune_value(42, max_chars=200) == 42
+    assert _prune_value(3.5, max_chars=200) == 3.5
+    assert _prune_value(None, max_chars=200) is None
+
+
+def test_prune_value_recurses_into_a_short_list_without_summarizing_it():
+    from app.llm.gemini_client import _prune_value
+
+    assert _prune_value(["a", "y" * 500], max_chars=10) == ["a", "y" * 10 + "…"]
+
+
+def test_generate_structured_or_error_returns_the_schema_when_there_is_no_error():
+    """The error branch is the notable one, but the happy path is what every domain agent
+    actually takes."""
+    from app.rag.query_spec import QuerySpec
+
+    class _Stub(GeminiClient):
+        def __init__(self):
+            pass
+
+        def _generate_json(self, prompt):
+            return {"collection": "orders", "operation": "find"}
+
+    result = _Stub().generate_structured_or_error("prompt", QuerySpec)
+
+    assert isinstance(result, QuerySpec)
+    assert result.collection == "orders"

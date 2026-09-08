@@ -70,6 +70,12 @@ def log_query_event(
     channel_id: str | None = None,
     specs: list[QuerySpec] | None = None,
     error: str | None = None,
+    #: The raw exception text. Logged, never shown -- it has carried pymongo tracebacks and
+    #: Google's quota payload, which belong in an operator's console and nowhere else.
+    error_detail: str | None = None,
+    #: The short code shown to the user (see app/messages.py::new_reference), so a report of
+    #: "it said E-4F2A9C" can be grepped straight to this record.
+    error_reference: str | None = None,
     errors_by_domain: dict[str, str] | None = None,
     row_count: int | None = None,
     answer: str | None = None,
@@ -83,6 +89,8 @@ def log_query_event(
         "channel_id": channel_id,
         "query_specs": [spec.model_dump() for spec in specs] if specs else None,
         "error": error,
+        "error_detail": error_detail,
+        "error_reference": error_reference,
         "errors_by_domain": errors_by_domain,
         "row_count": row_count,
         "duration_ms": round(duration_ms, 2),

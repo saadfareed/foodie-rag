@@ -107,3 +107,59 @@ def test_classify_question_includes_previous_question_when_given():
     assert prompt.rstrip().endswith("Question: what about the grand total?")
     assert result.context_mode == "followup"
     assert result.resolved_question == "what is the grand total of orders vendor V1 had last week?"
+
+
+# --- output_format / report_title ----------------------------------------------------------
+#
+# Both ride on this call rather than a dedicated one. A separate "classify the intent" request
+# cost a full quota unit per question -- against a free tier measured in tens -- to return a
+# single word, so these fields are what make the format decision free.
+
+
+def test_output_format_defaults_to_text():
+    """A Classification built without mentioning format -- every pre-existing call site, and any
+    model response omitting the field -- must read as a plain text answer."""
+    assert Classification().output_format == "text"
+
+
+def test_report_title_defaults_to_empty():
+    """Empty means "no opinion"; the caller falls back to REPORT_TITLE."""
+    assert Classification().report_title == ""
+
+
+@pytest.mark.parametrize("output_format", ["text", "csv", "xlsx", "pdf"])
+def test_every_supported_format_is_accepted(output_format):
+    assert Classification(output_format=output_format).output_format == output_format
+
+
+def test_an_unknown_output_format_is_rejected_structurally():
+    """Enum-constrained like `domains`: a hallucinated format fails Pydantic validation rather
+    than reaching the report layer and being silently ignored."""
+    with pytest.raises(ValidationError):
+        Classification(output_format="powerpoint")
+
+
+def test_classify_question_passes_the_format_and_title_through():
+    expected = Classification(
+        domains=["orders"],
+        confidence=0.9,
+        output_format="csv",
+        report_title="Last 10 Incomplete Order Details",
+    )
+    gemini = _StubGemini(expected)
+
+    result = classify_question(gemini, "I need last 10 incomplete order details in csv")
+
+    assert result.output_format == "csv"
+    assert result.report_title == "Last 10 Incomplete Order Details"
+
+
+def test_the_prompt_asks_for_both_new_fields():
+    """The model can only fill in a field the prompt actually describes."""
+    gemini = _StubGemini(Classification(domains=["orders"], confidence=0.9))
+
+    classify_question(gemini, "how many orders?")
+
+    prompt = gemini.prompts[0]
+    assert "output_format" in prompt
+    assert "report_title" in prompt

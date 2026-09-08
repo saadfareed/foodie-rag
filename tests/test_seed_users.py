@@ -101,3 +101,57 @@ def test_seed_users_keep_existing_skips_delete(monkeypatch):
     seed_users(customers=1, vendors=1, clear_existing=False)
 
     assert fake_db["users"].deleted is False
+
+
+# --- real names ----------------------------------------------------------------------------
+
+
+def test_users_get_real_person_names_not_placeholders():
+    """A placeholder ("Customer 00007") is fine for a geo query and useless in a report -- and
+    it hides formatting bugs that only appear once names vary in length."""
+    from app.db.seed_users import FIRST_NAMES, LAST_NAMES
+
+    users = generate_sample_users(customers=10, vendors=5)
+
+    for user in users:
+        first, _, last = user["name"].partition(" ")
+        assert first in FIRST_NAMES
+        assert last in LAST_NAMES
+    assert not any(u["name"].startswith(("Customer ", "Vendor ")) for u in users)
+
+
+def test_names_actually_vary():
+    users = generate_sample_users(customers=20, vendors=10)
+
+    assert len({u["name"] for u in users}) > 5
+
+
+def test_vendor_business_names_are_not_derived_from_the_owners_name():
+    """A vendor column in a report should read like a business and be visibly distinct from a
+    customer name."""
+    from app.db.seed_users import BUSINESS_PREFIXES
+
+    vendors = [u for u in generate_sample_users(customers=1, vendors=10) if u["usertype"] == 2]
+
+    for vendor in vendors:
+        assert vendor["business_name"] != vendor["name"]
+        assert vendor["name"] not in vendor["business_name"]
+        assert vendor["business_name"].split()[0] in BUSINESS_PREFIXES
+
+
+def test_a_vendors_business_name_matches_its_category():
+    from app.db.seed_users import BUSINESS_SUFFIXES
+
+    vendors = [u for u in generate_sample_users(customers=1, vendors=15) if u["usertype"] == 2]
+
+    for vendor in vendors:
+        suffixes = BUSINESS_SUFFIXES[vendor["category"]]
+        assert any(vendor["business_name"].endswith(s) for s in suffixes), vendor["business_name"]
+
+
+def test_customers_have_no_business_name():
+    """Vendor-only fields are absent on a customer rather than null -- which is what lets the
+    enrichment layer fall back from business_name to name."""
+    customers = [u for u in generate_sample_users(customers=10, vendors=1) if u["usertype"] == 1]
+
+    assert all("business_name" not in c for c in customers)

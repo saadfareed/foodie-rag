@@ -35,9 +35,14 @@ _RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 
 _ANSWER_PROMPT = """Answer the user's question using only the data below.
 
-Style: get straight to the answer. 1-3 short sentences, no headers, no bullet lists, no "Domain
-status" section, no meta-commentary about what the data doesn't contain -- if a number is
-missing, just don't mention that angle instead of explaining why you can't compute it.
+Style: get straight to the answer, in 1-3 short sentences. Lead with the number or finding the
+question asked for, then at most one sentence of context (the largest contributor, a notable
+trend). Do not include meta-commentary about what the data doesn't contain.
+
+Do NOT reproduce the rows as a table or a list. Every row is already delivered to the user
+separately -- as an on-screen summary, or as a CSV/Excel/PDF attachment built from this same
+data. Restating them here duplicates the attachment, and truncating them mid-way (only some of
+the rows are shown below) would contradict it. Summarize; never transcribe.
 
 Data is grouped by domain (orders / customers / vendors) -- fields with the same name can mean
 different things in different domains (e.g. `status` on an order vs. on a vendor account), so
@@ -103,19 +108,48 @@ def _is_model_unavailable(exc: Exception) -> bool:
     return isinstance(exc, errors.APIError) and exc.code in (429, 404)
 
 
-def _rows_for_prompt(rows_by_domain: dict[str, list[dict]], max_rows: int) -> str:
+def _prune_value(value: object, max_chars: int) -> object:
+    """Shorten one field value so a single huge blob can't dominate the prompt.
+
+    Nested documents and arrays are summarized rather than serialized in full: a GeoJSON
+    polygon or an embedded audit trail contributes thousands of tokens and nothing the answer
+    needs, since the question was about the row, not its internals.
+    """
+    if isinstance(value, str) and len(value) > max_chars:
+        return value[:max_chars] + "…"
+    if isinstance(value, list):
+        if len(value) > 5:
+            return [_prune_value(v, max_chars) for v in value[:5]] + [f"…{len(value) - 5} more"]
+        return [_prune_value(v, max_chars) for v in value]
+    if isinstance(value, dict):
+        return {k: _prune_value(v, max_chars) for k, v in list(value.items())[:8]}
+    return value
+
+
+def _rows_for_prompt(
+    rows_by_domain: dict[str, list[dict]], max_rows: int, max_field_chars: int = 200
+) -> str:
     """Cap the rows serialized into the answer prompt so payload size (and Gemini latency) stays
     bounded regardless of how many rows the query returned -- the cap applies per domain, so one
-    chatty domain can't crowd the others out of the prompt entirely."""
-    capped = {}
+    chatty domain can't crowd the others out of the prompt entirely.
+
+    The row cap alone bounded the row *count* but not the row *width*: 30 documents with a long
+    description or an embedded array each are still an enormous prompt, on the single largest
+    call in the request. `_prune_value` bounds each field as well, so the prompt is bounded in
+    both dimensions.
+    """
+    capped: dict[str, list] = {}
     for domain, rows in rows_by_domain.items():
-        if len(rows) <= max_rows:
-            capped[domain] = rows
-        else:
-            capped[domain] = [
-                *rows[:max_rows],
-                f"...{len(rows) - max_rows} more row(s) omitted for brevity...",
-            ]
+        visible = rows[:max_rows]
+        pruned: list = [
+            {k: _prune_value(v, max_field_chars) for k, v in row.items()}
+            if isinstance(row, dict)
+            else row
+            for row in visible
+        ]
+        if len(rows) > max_rows:
+            pruned.append(f"...{len(rows) - max_rows} more row(s) omitted for brevity...")
+        capped[domain] = pruned
     return json.dumps(capped, default=str)
 
 

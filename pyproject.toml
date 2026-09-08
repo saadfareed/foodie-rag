@@ -1,5 +1,8 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "uses_mongo_client: opts out of the conftest tripwire that refuses real MongoClient construction",
+]
 
 [tool.ruff]
 line-length = 100

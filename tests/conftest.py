@@ -6,6 +6,38 @@ from app.rag.answer_cache import AnswerCache
 from app.rag.context_switch_cache import ContextSwitchCache
 from app.rag.conversation_context import ConversationContextCache
 from app.rag.rate_limiter import rate_limiter
+from app.slack import auth
+
+
+@pytest.fixture(autouse=True)
+def _no_real_database(monkeypatch, request):
+    """Fail loudly if a test reaches a real MongoDB instead of a fake.
+
+    Nothing here is supposed to touch the network (see CLAUDE.md's testing conventions), but
+    "supposed to" was doing the enforcing, and two rate-limit tests had quietly started relying
+    on a live database: they passed on a developer machine with seeded data and failed in CI,
+    which is the worst possible arrangement -- green where it's cheap to investigate, red where
+    it isn't.
+
+    Patching `get_client` rather than `get_db` puts the tripwire at the actual network boundary,
+    so the many tests that legitimately patch `app.agents.graph.get_db` with a fake are
+    unaffected and only genuinely-unmocked access trips it.
+
+    `@pytest.mark.uses_mongo_client` opts out, for the one module whose *subject* is
+    `get_client` itself (tests/test_mongo.py) -- it stubs the driver a layer lower.
+    """
+    if request.node.get_closest_marker("uses_mongo_client"):
+        return
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError(
+            "This test reached a real MongoDB. Patch app.agents.graph.get_db with a fake "
+            "(see the _FakeDb/_FakeCollection classes in tests/test_pipeline.py). A test that "
+            "depends on a live database passes or fails according to what happens to be seeded "
+            "on the machine running it."
+        )
+
+    monkeypatch.setattr("app.db.mongo.get_client", _refuse)
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +93,16 @@ def _reset_rate_limiter(monkeypatch):
     monkeypatch, keeping that state from leaking into unrelated tests via run order."""
     monkeypatch.setattr(rate_limiter, "_limit", 0)
     monkeypatch.setattr(rate_limiter, "_calls", type(rate_limiter._calls)())
+
+
+@pytest.fixture(autouse=True)
+def _reset_vendor_sessions():
+    """app/slack/auth.py holds `/login` sessions in a module-level dict with no TTL short enough
+    to expire within a test run -- a session created by one test would otherwise scope another
+    test's questions to that vendor and silently change which rows it sees."""
+    auth.clear_all()
+    yield
+    auth.clear_all()
 
 
 @pytest.fixture(autouse=True)
