@@ -105,9 +105,13 @@ def _write_sheet(workbook: Workbook, table: ReportTable, used_titles: set[str]) 
     sheet.auto_filter.ref = f"A{header_row_index}:{last_column}{sheet.max_row}"
 
 
-def generate_xlsx(rows_by_domain: dict[str, list[dict]], title: str | None = None) -> bytes:
+def generate_xlsx(
+    rows_by_domain: dict[str, list[dict]],
+    title: str | None = None,
+    max_rows: int | None = None,
+) -> bytes:
     """Render every non-empty domain as its own styled worksheet."""
-    tables = build_tables(rows_by_domain)
+    tables = build_tables(rows_by_domain, max_rows=max_rows)
 
     workbook = Workbook()
     # Workbook() ships with one default sheet; the per-domain sheets are created explicitly.

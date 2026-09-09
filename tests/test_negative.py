@@ -31,6 +31,13 @@ from app.rag.context_switch_cache import ContextSwitchCache
 from app.rag.conversation_context import ConversationContextCache
 from app.rag.pipeline import answer_question
 from app.rag.query_spec import QueryError, QuerySpec
+from app.security.roles import admin
+
+#: These tests exercise formats, caching and bad input -- not authorization -- so they run as
+#: an operator. Stated explicitly rather than inherited: answer_question defaults to ANONYMOUS,
+#: which can read nothing, so a forgotten principal fails loudly instead of seeing everything.
+ADMIN = admin()
+
 
 _ROWS = [{"order_id": "ORD-1", "amount": 10.0, "status": "pending"}]
 
@@ -108,7 +115,9 @@ def _isolated(monkeypatch):
 
 
 def _ask(question, gemini=None, **kwargs):
-    return answer_question(question, gemini or _StubGemini(), channel_id="C1", **kwargs)
+    return answer_question(
+        question, gemini or _StubGemini(), channel_id="C1", **kwargs, principal=ADMIN
+    )
 
 
 # =============================================================================================

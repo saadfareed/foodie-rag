@@ -1,0 +1,12 @@
+{
+  "name": "supabase-chat-plugin-example",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Sample web application: Supabase for identity, the data-chat plugin embedded as a chatbot.",
+  "engines": { "node": ">=20.6" },
+  "scripts": {
+    "start": "node --env-file=.env server.mjs",
+    "demo": "DEMO_MODE=true node --env-file=.env server.mjs"
+  }
+}

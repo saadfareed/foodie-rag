@@ -81,6 +81,10 @@ _PROMPT = PromptTemplate.from_template(
     "them. Only include multiple domains when the question itself explicitly connects them, e.g. "
     '"vendors near a customer with pending orders" needs all three because it names a '
     "customer, a vendor, and an order condition together.\n"
+    "- Asking for orders together with the customer's or vendor's own details (their name, city, "
+    "loyalty tier, category, rating) is still ONLY orders: those columns are attached to each "
+    "order automatically. Adding customers or vendors for them buys a second query that answers "
+    "nothing and a refusal, because order status is not in the people collection.\n"
     "- needs_geo: true if the question asks for something near/nearby/within a distance.\n"
     '- output_format: the format the user wants the answer in. "text" unless they asked for a '
     'file or a document. "csv" for a raw data dump or export, "xlsx" for a spreadsheet or '
@@ -115,6 +119,8 @@ _PROMPT = PromptTemplate.from_template(
     "nothing here asks about people, only payments)\n"
     '- "active vendors in Karachi" -> domains: [vendors] (not customers -- the question names '
     "vendors specifically)\n"
+    '- "incomplete orders with the customer details in pdf" -> domains: [orders] (not customers '
+    "-- the customer's name/city/tier ride along on each order automatically)\n"
     '- "vendors near customer USR-1 with pending orders" -> domains: [orders, customers, '
     "vendors] (all three named/connected explicitly)\n"
     '- Previous question: "how many orders did vendor USR-2 have last week?" Current question: '

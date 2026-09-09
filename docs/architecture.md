@@ -1,70 +1,100 @@
 # Architecture & request flow
 
 This traces exactly what happens for a real question end to end: which function calls which, in
-order, for both entry points (`/ask` slash command and `@mention`/DM). Generated from the actual
-import graph in `app/`, not from memory.
+order, for every entry point. Generated from the actual import graph in `app/`, not from memory.
+
+There are **two adapters** onto one pipeline — `app/slack/` and `app/api/` — and nothing below
+`app/rag/pipeline.py::answer_question` knows which one a question arrived through. Both can run at
+once against one database.
 
 **If you only read one section**, read [Component map](#component-map) and
 [The agent graph in detail](#the-agent-graph-in-detail) — everything else is detail on top of
-those two.
+those two. For the two policies that decide what an answer may contain, read
+[The field policy](#the-field-policy-three-layers-in-order) and
+[The row policy](#the-row-policy-roles) — they answer different questions and are enforced in
+different places.
 
 ## Component map
 
 ```mermaid
 graph TD
-    Main[app/main.py<br/>main] -->|configure_logging, pool_size_warning,<br/>ensure_indexes, constructs once, injects| Handlers[app/slack/handlers.py<br/>register_handlers]
-    Main -->|SIGTERM/SIGINT| Shutdown[handler.close + close_client]
+    SlackMain[app/main.py<br/>Socket Mode entrypoint] -->|constructs once, injects| Handlers[app/slack/handlers.py<br/>register_handlers]
+    ApiMain[app/api/main.py<br/>gateway entrypoint] -->|constructs once, injects| Server[app/api/server.py<br/>create_app -- FastAPI]
 
     Slack[Slack: /ask, @mention, DM, /login, /logout] --> Handlers
+    Browser[Browser: the embedded widget] --> Server
+
     Handlers --> AccessControl[app/slack/access_control.py]
-    Handlers --> Auth[app/slack/auth.py<br/>TTL-bounded /login vendor sessions]
-    Handlers --> Pipeline[app/rag/pipeline.py<br/>answer_question -> AnswerResult]
+    Handlers --> Auth[app/slack/auth.py<br/>mock /login sessions -> a vendor Principal]
     Handlers -->|files_upload_v2, falls back to text| SlackFiles[(Slack file upload)]
 
+    Server --> Tokens[app/api/tokens.py<br/>host-app keys vs browser session tokens;<br/>role + conversation id come from the TOKEN]
+    Server --> Identity[app/db/identity.py<br/>the ONE path allowed to read users.email/password_hash]
+    Server --> Files[app/api/files.py<br/>bounded TTL store for a generated report]
+    Server --> Stream[app/rag/stream.py<br/>QueueSink -> Server-Sent Events]
+
+    Handlers --> Pipeline[app/rag/pipeline.py<br/>answer_question -> AnswerResult]
+    Server --> Pipeline
+
     Pipeline --> IntentRouter[app/services/intent_router.py<br/>regex only, no Gemini:<br/>explicit format + policy refusals]
-    Pipeline --> AnswerCache[app/rag/answer_cache.py<br/>TTL+LRU keyed by<br/>channel + vendor scope + format + question<br/>checked first -- a hit skips everything below]
-    Pipeline --> RateLimiter[app/rag/rate_limiter.py<br/>per-(channel,user) sliding window<br/>checked before any Gemini/Mongo work]
+    Pipeline --> AnswerCache[app/rag/answer_cache.py<br/>keyed by channel + PRINCIPAL SCOPE + format + question<br/>checked first -- a hit skips everything below]
+    Pipeline --> RateLimiter[app/rag/rate_limiter.py<br/>sliding window per identity, role-aware<br/>+ DailyQuestionLimiter]
     Pipeline --> Quota[app/llm/quota.py<br/>quota_tracker -- shared daily budget]
-    Pipeline --> ClarificationCache[app/rag/clarification_cache.py<br/>per-(channel,user) pending-clarification state]
-    Pipeline --> ConversationContext[app/rag/conversation_context.py<br/>per-(channel,user) last resolved_question<br/>only read when no clarification is pending]
-    Pipeline --> ContextSwitch[app/rag/context_switch_cache.py<br/>per-(channel,user) pending "should I clear<br/>that context?" confirmation]
+    Pipeline --> ClarificationCache[app/rag/clarification_cache.py]
+    Pipeline --> ConversationContext[app/rag/conversation_context.py<br/>only read when no clarification is pending]
+    Pipeline --> ContextSwitch[app/rag/context_switch_cache.py]
     Pipeline --> Graph[app/agents/graph.py<br/>build_graph / graph.invoke<br/>-- see detail below]
-    Pipeline --> Audit[app/audit/logger.py<br/>log_query_event + timings]
+    Pipeline --> Audit[app/audit/logger.py<br/>log_query_event + role + timings]
 
     Graph --> Classifier[app/agents/classifier.py]
-    Graph --> Domains[app/agents/domains.py<br/>domain registry + forced scoping]
+    Graph --> Domains[app/agents/domains.py<br/>domain registry + forced collection/usertype scoping]
+    Graph --> Roles[app/security/roles.py<br/>THE row-level policy:<br/>role -> a forced filter per domain]
     Graph --> QueryAgents[app/agents/query_agents.py<br/>per-domain query generation]
     Graph --> Validator[app/rag/validator.py<br/>validate_query_spec]
     Graph --> Executor[app/db/executor.py<br/>execute_query_spec<br/>+ sanitize_rows on every path out]
 
     Pipeline --> Generators[app/generators/<br/>csv / xlsx / pdf]
-    Generators --> Tabular[app/generators/tabular.py<br/>bounded ReportTable]
+    Generators --> Tabular[app/generators/tabular.py<br/>bounded ReportTable, role-aware row cap]
     Generators --> Charts[app/generators/charts.py<br/>rule-based pie/bar/line<br/>Figure API, never pyplot]
     Generators --> RenderPool[app/generators/render_pool.py<br/>bounded pool + timeout]
-    Pipeline --> OutputScanner[app/security/output_scanner.py<br/>last-resort scan of the prose]
+    Pipeline --> OutputScanner[app/security/output_scanner.py<br/>scan_output_for_pii + StreamingRedactor]
 
     FieldPolicy[app/security/field_policy.py<br/>THE field allow/deny policy] --> SchemaCtx
     FieldPolicy --> Validator
     FieldPolicy --> Executor
 
-    QueryAgents --> SchemaCtx[app/rag/schema_context.py<br/>build_domain_schema_context<br/>mtime-cached, internal fields hidden]
+    QueryAgents --> SchemaCtx[app/rag/schema_context.py<br/>build_domain_schema_context<br/>mtime-cached, denied fields hidden]
     SchemaCtx --> SummaryFile[(schema_summary.json)]
     SchemaCtx --> AnnotationsFile[(schema_annotations.json)]
 
     Classifier --> Gemini[app/llm/gemini_client.py<br/>GeminiClient<br/>shared singleton, not per-request]
     QueryAgents --> Gemini
-    Graph -->|generate_answer| Gemini
+    Graph -->|generate_answer / stream_answer| Gemini
 
-    Gemini --> CircuitBreaker[app/llm/circuit_breaker.py<br/>fails fast on sustained outage]
+    Gemini --> CircuitBreaker[app/llm/circuit_breaker.py<br/>per-model, fails fast on a sustained outage]
     Gemini --> QuotaRecord[quota_tracker.record_call]
     Gemini --> GeminiAPI[(Google Gemini API<br/>client-side HTTP timeout, retried on timeout too)]
 
     Validator --> QuerySpecModel[app/rag/query_spec.py<br/>QuerySpec / QueryError]
 
     Executor --> Mongo[app/db/mongo.py<br/>get_db / close_client<br/>pooled, timeouts set]
-    Mongo --> MongoDB[(MongoDB)]
-    Main --> Indexes[app/db/indexes.py<br/>ensure_indexes -- idempotent, called at startup]
+    Identity --> Mongo
+    Mongo --> MongoDB[(MongoDB, read-only credential)]
+    SlackMain --> Indexes[app/db/indexes.py<br/>ensure_indexes -- idempotent, called at startup]
+    ApiMain --> Indexes
     Indexes --> MongoDB
+
+    AnswerCache --> State
+    RateLimiter --> State
+    Quota --> State
+    ClarificationCache --> State
+    ConversationContext --> State
+    ContextSwitch --> State
+    CircuitBreaker --> State
+    Files --> State
+    Auth --> State
+    State[app/state/<br/>StateBackend: 7 primitives, each atomic in Redis] --> Memory[InMemoryBackend<br/>default -- single replica]
+    State -.->|STATE_BACKEND=redis| Redis[(Redis<br/>shared across replicas)]
 
     Audit --> Stdout[(stdout, JSON lines)]
     Audit -.->|AUDIT_LOG_FILE, optional| AuditFile[(rotating log file)]
@@ -95,9 +125,21 @@ bounded pool, and `close_client()` used on graceful shutdown.
 ## The field policy: three layers, in order
 
 `app/security/field_policy.py` is the single source of truth for which document fields may leave
-the system. It distinguishes two actions: **drop** (storage plumbing — `_id`, `__v`, index
-fields — removed key and value) and **redact** (credential *values* — card numbers, CVVs,
-passwords, tokens — key kept, value replaced).
+the system, **for anyone**. (Which *rows* may leave it for a particular person is a separate
+policy — see [The row policy](#the-row-policy-roles).) It distinguishes two actions:
+
+- **drop** — storage plumbing (`_id`, `__v`, index fields) *and* contact details (`email`,
+  `phone`, `mobile`, anything matching `_CONTACT_FIELD_PATTERNS`). Key and value both removed.
+- **redact** — credential *values* (card numbers, CVVs, passwords, tokens). Key kept, value
+  replaced, because the column may legitimately appear in a report.
+
+Contact details are dropped rather than redacted because, unlike a card number, the column isn't
+useful either — nobody needs an `email` column full of `[REDACTED]`. They exist so a person can
+sign in (`app/db/identity.py`), and that is the only thing they are for: a model that can see a
+contact column can be asked to list it, which turns an authentication field into a
+contact-scraping endpoint with natural-language search over it. The contact patterns are
+deliberately *broader* than the secret ones — a false positive drops one column from a report, a
+false negative hands over a contact list.
 
 It is enforced at three points, and the order matters:
 
@@ -117,6 +159,85 @@ Layer 2 checks `is_secret_field` only, **not** the broader `is_denied_field`. `_
 pipeline syntax — a `$group` key is literally named `_id`, and `{"$project": {"_id": 0}}` is the
 idiomatic way to exclude it — so rejecting internal fields there would refuse most valid
 aggregations while protecting nothing layer 3 doesn't already handle.
+
+## The row policy: roles
+
+`app/security/roles.py` is the sibling of the field policy and answers a different question: not
+"which columns may leave the system" but "which records may leave it *for this person*".
+
+A `Principal` (role + user id) reaches the graph, and `_domain_filter` merges the role's forced
+filter into every generated query — in code, after generation, exactly the relationship
+`scope_spec_to_domain` has to the collection name.
+
+| | orders | customers | vendors |
+|---|---|---|---|
+| **admin** | all | all | all |
+| **vendor** | `vendor_id = self` | the customers who ordered from them | `user_id = self` |
+| **customer** | `customer_id = self` | `user_id = self` | the directory, unfiltered |
+| **anonymous** | — | — | — |
+
+Three properties are load-bearing, and all three fail *silently* if broken — the query runs, the
+answer is fluent, and it is built from rows the asker was never entitled to see:
+
+1. **The default is deny.** The previous design had one axis (`authenticated_vendor_id`) that
+   applied no filter when absent, so "not signed in" meant "sees everything". `ANONYMOUS` reads
+   nothing, and `_principal(state)` defaults to it — a `Send` payload that forgot to thread the
+   principal refuses rather than answering from every row.
+2. **An unresolved computed scope becomes `{"$in": []}`, never an absent filter.** A vendor's
+   customer set has to be *read* before it can be enforced (`_resolve_authorized_customer_ids`
+   runs a distinct aggregation over that vendor's own orders, before the fan-out). Matching
+   nothing is a visible failure; matching everything is an invisible one.
+3. **An authorization filter is never widened by a geo anchor.** A vendor asking "which of my
+   customers are nearby?" must be limited to their own orders *and* the anchor.
+
+Over `RBAC_MAX_AUTHORIZED_IDS`, the domain is **refused** rather than truncated: a truncated scope
+answers from an arbitrary subset while looking complete.
+
+Domains a role may not read at all are dropped before any Send is issued, so a refused domain
+costs no Gemini call and no Mongo round-trip; the refusal is reported through the existing
+per-domain `out_of_scope_by_domain` channel, so a two-domain question answers the half it can.
+
+See [authorization.md](authorization.md) for sign-in, session tokens and the usage limits.
+
+## The web adapter and streaming
+
+`app/api/` is a second adapter, structurally a mirror of `app/slack/handlers.py`: authorize, call
+`answer_question`, deliver. What it owns is everything Slack used to provide and a browser
+doesn't.
+
+| Slack provides | The gateway provides |
+|---|---|
+| tells the bot who is speaking | a signed session token; **role and conversation id come from it, never the request body** |
+| a channel id | `web:{tenant}:{role}:{principal}`, derived from the token |
+| `files_upload_v2` | `GET /v1/files/{id}` — signed, short-TTL, principal-bound (`app/api/files.py`) |
+| a message that appears when finished | Server-Sent Events (`POST /v1/ask/stream`) |
+
+**Streaming is a side channel, not a second path.** `answer_question(progress=sink)` takes an
+optional `StreamSink` (`app/rag/stream.py`); the graph threads it to every node — including into
+each `Send` payload — and `_synthesize_node` streams the model's tokens through it. Slack passes
+nothing, gets `NULL_SINK`, and behaves byte-identically. The returned `AnswerResult` is the same
+object either way, so the cache, the audit log and the report builder cannot diverge between
+adapters.
+
+Streamed tokens go through `StreamingRedactor`, not around it: `scan_output_for_pii` runs on
+*finished* prose, which for a stream would arrive long after a card number had been displayed, and
+re-scanning each chunk alone catches nothing because a number split across two chunks matches
+neither half. The redactor releases text only up to a character no pattern can match.
+
+## Shared state
+
+Every stateful guardrail — the answer cache, the three conversation caches, the rate limiter, the
+daily quota, the circuit breaker, the report file store, and the `/login` sessions — keeps its
+bytes behind `app/state`'s `StateBackend`. `InMemoryBackend` is the default and reproduces the
+previous in-process behaviour exactly; `RedisBackend` shares it across replicas.
+
+The primitive set is deliberately small and chosen so every operation a guardrail needs is
+**atomic in the backend**. Read-modify-write over `get`/`set` is a race: two replicas incrementing
+a call count both read 9, both write 10, and the budget is silently doubled. So counters go
+through `incr` and the sliding window through `allow_in_window`, each a single Lua script Redis
+runs to completion.
+
+See [scaling.md](scaling.md) for what breaks without it.
 
 ## Report generation
 
@@ -415,6 +536,65 @@ sequenceDiagram
     end
 ```
 
+## Flow 3: a question from the web widget
+
+```mermaid
+sequenceDiagram
+    participant B as Browser (widget.js)
+    participant App as Host application
+    participant GW as app/api/server.py
+    participant T as api/tokens.py
+    participant I as db/identity.py
+    participant P as pipeline.answer_question
+    participant S as rag/stream.py QueueSink
+    participant F as api/files.py
+
+    Note over B,App: sign-in happens once, in the host application
+    B->>App: email
+    App->>GW: POST /v1/identity/lookup (host-app key)
+    GW->>I: find_principal_by_email (exact match, active only)
+    I-->>GW: user_id + role, or the same "not found" for every failure
+    GW-->>App: {found, user_id, role, name}
+    App->>B: one-time code by email
+    B->>App: code
+    App-->>B: httpOnly session cookie (user_id + role)
+
+    Note over B,GW: every question
+    B->>App: POST /api/chat-token (cookie)
+    App->>GW: POST /v1/session (host-app key + user_id + role)
+    GW->>GW: role in WIDGET_ALLOWED_SESSION_ROLES?
+    GW->>I: principal_exists -- still a live account? (offboarding)
+    GW->>T: mint_session_token
+    T-->>App: {token, expires_in}
+    App-->>B: token (held in memory, never localStorage)
+
+    B->>GW: POST /v1/ask/stream (Bearer token)
+    GW->>T: verify_session_token
+    T-->>GW: SessionClaims -> Principal + conversation id
+    Note over GW: a role or conversation id in the request BODY is inert
+    GW->>P: answer_question(question, principal=, channel_id=, progress=sink)
+    P->>S: stage("understanding") ... stage("querying", "orders")
+    S-->>B: event: stage
+    P->>S: token(...) -- already through StreamingRedactor
+    S-->>B: event: token
+    P-->>GW: AnswerResult
+    opt a file was generated
+        GW->>F: put(bytes, principal-bound, TTL)
+        F-->>GW: id + one-file download token
+    end
+    GW->>S: finish(result)
+    S-->>B: event: result (authoritative text + file url)
+    opt download
+        B->>GW: GET /v1/files/{id}?t=...
+        GW->>F: get(id, tenant, principal)
+        F-->>B: Content-Disposition: attachment
+    end
+```
+
+Authentication failures happen *before* the stream opens, so they are ordinary 401s with a JSON
+body — not a 200 carrying bad news. A pipeline outcome (rate limited, over budget, no data) is
+HTTP 200 with `error` set, because it *is* the answer.
+
 ## Function reference
 
 Grouped by module, in call order for a typical successful request. `*` = private/internal
@@ -425,6 +605,15 @@ Grouped by module, in call order for a typical successful request. `*` = private
 |---|---|
 | `main()` | Entrypoint. Calls `configure_logging` (stdout + optional `AUDIT_LOG_FILE`), logs a warning if `settings.pool_size_warning()` returns one, calls `ensure_indexes(get_db())` (idempotent), builds the Slack `App`, constructs **one** `GeminiClient` and passes it to `register_handlers`, registers `SIGTERM`/`SIGINT` handlers that close the Socket Mode connection and the pooled `MongoClient`, then starts `SocketModeHandler` with `concurrency=settings.slack_socket_mode_concurrency`. Logs and re-raises on fatal startup errors; `close_client()` always runs on the way out via a `finally` block. |
 | `*_shutdown(signum, frame)` | Signal handler closure: logs the signal, calls `handler.close()` and `close_client()`, then raises `SystemExit(0)` to unblock `handler.start()`'s wait loop. |
+
+Both entrypoints also check `settings.state_config_error()` and refuse to start on a bad one:
+falling back to in-process state when Redis was asked for is the worst outcome available — the
+process starts, every request succeeds, and the limits silently stop being shared.
+
+### `app/api/main.py`
+| Function | Does |
+|---|---|
+| `main()` | The gateway's entrypoint (`python -m app.api.main`), doing the same startup work in the same order as `app/main.py` — logging, state-config check, index bootstrap, one shared `GeminiClient` — then `uvicorn.run`. Cleanup goes in `finally` rather than signal handlers, because uvicorn installs its own and returns from `run()` on shutdown. |
 
 ### `app/slack/handlers.py`
 | Function | Does |
@@ -440,64 +629,126 @@ Grouped by module, in call order for a typical successful request. `*` = private
 |---|---|
 | `is_authorized(channel_id, user_id)` | Returns `True` unless `SLACK_ALLOWED_CHANNEL_IDS`/`SLACK_ALLOWED_USER_IDS` are set and the caller isn't in the list. Empty lists = open to everyone. |
 
+### `app/security/roles.py` — the row policy
+| Function | Does |
+|---|---|
+| `Principal` | Frozen dataclass: `role`, `user_id`, `tenant_id`, `display_name`. `cache_scope` is `role:user_id` (what namespaces the answer cache and the daily limit); `audit_fields` is what the audit log records. |
+| `Role` / `USERTYPE_ROLES` | `admin` / `vendor` / `customer` / `anonymous`. `USERTYPE_ROLES` maps the `usertype` discriminator the data already carries (1 → customer, 2 → vendor) so identity resolved from `users` agrees with the domain registry. |
+| `may_query(principal, domain)` | Whether this role may read the domain at all. A domain missing from a role's `DOMAIN_ACCESS` set is refused **by omission**, which is the safe direction to be wrong in. |
+| `forced_filter(principal, domain, *, authorized_customer_ids=None)` | The filter merged into every generated query for this principal. `None` means unrestricted (an admin, or a customer browsing the vendor directory). A vendor asking about customers with no resolved ids gets `{"$in": []}` — **failing closed is the only acceptable direction**. |
+| `needs_authorized_customers(principal, domain)` | The one rule that needs a query to answer: a vendor's customer set. |
+| `may_see_contacts(principal, domain)` | Whether a *report* may carry contact columns. Strictly narrower than `may_query`: a customer reads `vendors` unfiltered, so contacts there would be every vendor's phone number in one download. |
+
+### `app/db/identity.py`
+| Function | Does |
+|---|---|
+| `find_principal_by_email(db, email, *, tenant_id)` | The one code path allowed to read `users.email` — a field the field policy denies to everything else. **Exact, normalised match**, never a regex: a pattern here would turn "prove you own this address" into "name anything that looks a bit like one". Fixed four-field projection. Returns `None` identically for an unknown address, a non-`active` account, and an unmapped `usertype` — any difference between them is a way to test whether an address is registered. |
+| `authenticate_password(db, email, password, *, tenant_id)` | The same lookup, plus the proof: checks `password` against `users.password_hash` (`app/security/passwords.py`) before the account's status, and hashes even when there is no row. Every failure — unknown address, wrong password, suspended account — is the same `None` **and the same cost**, or the sign-in form in front of it is an account enumeration oracle with a nicer interface. Used only by the dev playground's own sign-in; host applications authenticate their own users. |
+| `principal_exists(db, user_id, *, role)` | Whether an asserted identity is still a live account of that role. Called at every session mint (`WIDGET_VERIFY_ASSERTED_IDENTITY`), which is what makes the session TTL a revocation mechanism. `app/api/server.py` skips it for `admin`: an operator may have a row (usertype 3) or be asserted with no row at all, and both are legitimate. |
+| `fetch_contacts(db, user_ids)` | Contact columns for ids the caller has *already* established the principal may see. Deliberately dumber than the sign-in lookup: no matching, no searching, one indexed `$in`. |
+
+### `app/db/accounts.py` — the only writer
+| Function | Does |
+|---|---|
+| `next_user_id(db)` | The next `USR-#####`, from the current **maximum** rather than a count — counting reissues an id that orders still reference the moment anyone deletes a row, silently reattributing that history. |
+| `validate_signup(...)` | Name/email/password/role checks, raising `AccountError` **naming the field**. The role must be in `WIDGET_ALLOWED_SESSION_ROLES`: an account in a role the gateway won't mint a session for is an account nobody can use. |
+| `create_account(db, ...)` | Inserts one row — hashed password, role → `usertype`, `status: active`, plus the per-domain columns a report expects (`business_name`/`category`/`rating`, or `loyalty_tier`). Catches `DuplicateKeyError` from the partial unique index on `email` rather than checking first, because read-then-write is a race two sign-ups can both win. |
+| `backfill_credentials.plan_backfill(rows, ...)` | Pure: what a backfill *would* change. Never replaces an existing address (identity) or password (someone set it), and generates addresses on `example.test`, which cannot resolve. The CLI is a dry run until `--apply`. |
+
+### `app/api/` — the web adapter
+| Function | Does |
+|---|---|
+| `server.create_app(gemini=None)` | Builds the FastAPI gateway. **Refuses to boot** without `WIDGET_JWT_SECRET` or `WIDGET_API_KEYS`: a gateway missing either starts fine, serves requests, and does no identity checking at all — which looks exactly like working. Endpoints are `def`, not `async def`, because `answer_question` blocks; as `async def` one question would hold the event loop and serialise every concurrent user behind it. |
+| `POST /v1/session` | Server-to-server. Verifies a host-app key, checks the requested role against `WIDGET_ALLOWED_SESSION_ROLES` (`admin` is **not** in the default), re-checks the account via `principal_exists`, and mints a token. |
+| `POST /v1/identity/lookup` | Exchanges a host-verified email for `{user_id, role}` so a host application needs no MongoDB credential. Rate-limited per key — it is the one place an address can be probed for existence. |
+| `GET /v1/me` | Who the token says you are, plus the widget's opening line — built here because it is per-role, and a greeting written in the widget would be a second copy of `app/security/roles.py` in the one place that cannot see it. |
+| `POST /v1/ask` / `POST /v1/ask/stream` | The same answer, blocking or as SSE. Role and conversation id come from the token; the same values in the request body are inert. |
+| `GET /` | A sign-in page, then the chat for whoever signed in. The endpoint reference and embedding guide are **stripped from the HTML** unless the signed cookie says `admin` — hiding them in CSS would ship them to everyone and call it a preference. |
+| `POST /v1/dev/{login,signup,logout,session}` | The playground, off unless `WIDGET_DEV_PLAYGROUND=true` and refused for any non-loopback *peer*. `login` takes an email and a password and decides the role from the account; `signup` creates one (the only write in the request path — see `app/db/accounts.py`) and signs in as it, bounded by `WIDGET_ALLOWED_SESSION_ROLES` so it can't produce an account the gateway would then refuse; `session` mints a chat token from the resulting signed, `HttpOnly` cookie through the same `_check_session_request` a real session goes through, re-checked every time. |
+| `GET /v1/files/{id}?t=…` | One file, one principal. The token is a query parameter because the browser follows this URL itself; it is a *different* token from the session one, because a download URL lands in history, the address bar and referrers. |
+| `tokens.SessionClaims` | `tenant_id`, `principal_id`, `role`, and an optional `display_name` the host application asserted. `.principal` builds the `Principal`; `.conversation_id` is `web:{tenant}:{role}:{principal}` — **derived, never accepted** — so one user cannot attach to another's clarification state, follow-up context or answer cache by guessing a string. An unknown or missing role is a *rejected* token, never a defaulted one. |
+| `files.FileStore` | Bounded by time, count, and principal. A non-positive TTL is clamped to a short one here — the state layer reads `0` as "never expires", which is right for a `/login` session and exactly wrong for a store of customers' query results. |
+
+### `app/state/` — where the guardrails keep their state
+| Function | Does |
+|---|---|
+| `StateBackend` | Seven primitives, chosen so each is **atomic in Redis**: `get`/`set`/`delete`/`incr`/`peek`/`allow_in_window`/`clear_namespace`. A general key-value map would invite read-modify-write, which loses increments across replicas and silently permits more than the limit says. |
+| `InMemoryBackend` | The default, reproducing the previous in-process TTL + LRU exactly. `delete()` clears the value, counter *and* window maps — one namespace to the caller; a delete reaching only the value map is why `record_success()` once silently failed to reset its own counter. A non-positive TTL means "never expires", matching this codebase's convention for a zero setting. |
+| `RedisBackend` | Two Lua scripts — the atomic counter and the sliding window — because `INCR` then `EXPIRE` from the client leaves a counter that never expires if the process dies between them, and `ZCARD` then `ZADD` leaves the window a replica can race through. The window takes its clock from Redis's own `TIME`: replicas do not share a clock. |
+| `TtlStore` | The TTL+LRU algorithm, once, over those primitives. Keys are tuples joined with a unit separator and hashed past 160 characters, so an entire question doesn't end up in a key name. Unreadable stored JSON is a **miss, not a crash** — a rolling deploy where two versions write different encodings costs a recomputation, not an exception on the request path. |
+
+### `app/rag/stream.py`
+| Function | Does |
+|---|---|
+| `NULL_SINK` / `NullSink` | The default. Every method a no-op, so nothing that isn't streaming pays for streaming. |
+| `QueueSink` | Bounded queue drained by the SSE endpoint on another thread. Progress events are **dropped** rather than blocking the worker answering the question; `finish()` makes room by discarding the oldest progress rather than blocking, because a reader that has fallen behind still needs the answer. |
+
+### `app/security/output_scanner.py`
+| Function | Does |
+|---|---|
+| `scan_output_for_pii(text)` | Card- and SSN-shaped redaction over finished prose. |
+| `StreamingRedactor` | The same redaction over text arriving a chunk at a time. Releases only up to the last character **no pattern can match** (`_UNSAFE_IN_A_MATCH` — anything that isn't a digit, space or hyphen), so a match provably cannot straddle the cut. That set is derived from the patterns above it: a new pattern must use only those characters, or widen the set. |
+
 ### `app/rag/pipeline.py` — the orchestrator
 | Function | Does |
 |---|---|
-| `answer_question(question, gemini=None, *, user_id=None, channel_id=None)` | The whole request lifecycle: **exact-match reset phrase check first** (`"reset"`/`"new topic"`/`"start over"`/`"forget that"` — clears all three conversational caches and replies immediately, no Gemini call) → **pending context-switch confirmation check** (deterministic yes/no/neither reply handling, also no Gemini call — see below) → **answer_cache check** (a hit returns immediately, before `gemini` is even constructed) → **rate_limiter check** (before any Gemini/Mongo work, so a cache hit is never penalized) → daily budget check → clarification-cache merge (a pending clarification makes this message a follow-up, not a fresh question) → **conversation-context lookup** (only when no clarification is pending — the last turn's resolved question, if any and unexpired, threaded into the graph as `previous_question` for the classifier to fold in, ignore, or trigger a confirmation over) → `graph.invoke(...)` (see "The agent graph in detail") → clarification handling (asks again, or gives up after `AGENT_MAX_CLARIFICATION_ROUNDS`) → **context-switch-confirmation handling** (parks the candidate question in `context_switch_cache` instead of answering) → `conversation_context_cache.set(...)` with the graph's `resolved_question` → audit logging (including per-stage timing and `cache_hit`) → `answer_cache.set(...)` on a real answer. Never raises to the caller — every exit point returns a user-facing string, including `graph.invoke` itself raising (distinguishes `CircuitBreakerOpenError`, a Gemini 429, and everything else into three different friendly messages). Deterministic outcomes are written back into `answer_cache`; transient/infra failures, rate-limit rejections, budget-exceeded, resets, and context-switch prompts/declines are not. `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
+| `answer_question(question, gemini=None, *, user_id=None, channel_id=None, principal=None, progress=None)` | The whole request lifecycle. `principal` (`app/security/roles.py`) decides which rows the answer may be built from and **defaults to `ANONYMOUS`, which reads nothing** — a caller that forgets one gets a refusal, not everything. `progress` is an optional `StreamSink`; omitted (Slack) it is `NULL_SINK` and costs nothing. In order: **exact-match reset phrase check first** (`"reset"`/`"new topic"`/`"start over"`/`"forget that"` — clears all three conversational caches and replies immediately, no Gemini call) → **pending context-switch confirmation check** (deterministic yes/no/neither reply handling, also no Gemini call — see below) → **answer_cache check** (a hit returns immediately, before `gemini` is even constructed) → **rate_limiter check** (before any Gemini/Mongo work, so a cache hit is never penalized; the role's `RATE_LIMIT_BY_ROLE` override is passed per call) → **per-principal daily question limit** (`USER_DAILY_QUESTION_LIMIT` — the window stops a burst, this stops a slow drain) → shared daily Gemini budget check → clarification-cache merge (a pending clarification makes this message a follow-up, not a fresh question) → **conversation-context lookup** (only when no clarification is pending — the last turn's resolved question, if any and unexpired, threaded into the graph as `previous_question` for the classifier to fold in, ignore, or trigger a confirmation over) → `graph.invoke(...)` (see "The agent graph in detail") → clarification handling (asks again, or gives up after `AGENT_MAX_CLARIFICATION_ROUNDS`) → **authorization refusal handling** (`not_authorized` — no query was generated and nothing was read; returned before the cache is written, since caching a refusal would replay it to the next person, who may be allowed to see the answer) → **context-switch-confirmation handling** (parks the candidate question in `context_switch_cache` instead of answering) → `conversation_context_cache.set(...)` with the graph's `resolved_question` → audit logging (including per-stage timing and `cache_hit`) → `answer_cache.set(...)` on a real answer. Never raises to the caller — every exit point returns a user-facing string, including `graph.invoke` itself raising (distinguishes `CircuitBreakerOpenError`, a Gemini 429, and everything else into three different friendly messages). Deterministic outcomes are written back into `answer_cache`; transient/infra failures, rate-limit rejections, budget-exceeded, resets, and context-switch prompts/declines are not. `gemini` is the shared instance built once in `app.main`; the `None` default exists only for tests/scripts, not production use. |
 | `*_normalize_command(question)` / `_is_reset_command` / `_is_affirmative` / `_is_negative` | Exact-match phrase detection (strip/lowercase/trim trailing `!.?`) against `_RESET_PHRASES`/`_AFFIRMATIVE_PHRASES`/`_NEGATIVE_PHRASES` — deliberately not substring/keyword matching or an LLM call, so a real question that happens to contain "reset" or "yes" still reaches the classifier instead of being swallowed. |
 | `*_get_graph(gemini)` | Returns the compiled graph for this `GeminiClient`, building it once via `build_graph(gemini)` and caching by identity in a `WeakKeyDictionary` (not a plain `id()`-keyed dict — a plain dict would return a stale graph, built for a different already-garbage-collected client, once a short-lived client's `id()` gets reused, exactly what happened across the test suite's many stub clients). |
 | `*_timed_stage(timings, name)` | Context manager: records elapsed ms for `name` into `timings` in its `finally` block, which runs as an exception unwinds out of the `with` block — i.e. *before* any enclosing `except` clause (and therefore before `_log`) sees it. This ordering is what makes a failing stage's own duration show up in the audit log for that failure, instead of being silently dropped. |
-| `*_log(**kwargs)` | Local closure inside `answer_question`; fills in `question`/`user_id`/`channel_id`/`duration_ms`/`timings` and calls `log_query_event`. |
+| `*_log(**kwargs)` | Local closure inside `answer_question`; fills in `question`/`user_id`/`channel_id`/`duration_ms`/`timings` **and `principal.audit_fields` (`role`, `principal_id`)** — when authorization decides which rows an answer contains, the role that authorised it is what an auditor needs and it isn't recoverable afterwards. |
+| `*_with_contact_columns(rows_by_domain, principal)` | Report path only, and only when `REPORT_INCLUDE_CONTACTS` is on: adds `email`/`phone` columns, in code, after the answer, to rows the principal was already authorized to see (`roles.may_see_contacts`). The model is never shown these fields, so this cannot make the bot *answer* a contact question. |
 
 ### `app/rag/answer_cache.py`
 | Function | Does |
 |---|---|
-| `AnswerCache.__init__(ttl_seconds, max_entries)` | In-process, thread-safe (`threading.Lock`, same rationale as `QuotaTracker` — Socket Mode dispatches handlers via a thread pool) TTL + LRU store backed by `collections.OrderedDict`. |
+| `AnswerCache.__init__(ttl_seconds, max_entries, backend=None)` | TTL + LRU storage via `app/state`'s `TtlStore` — in-process by default, shared across replicas under `STATE_BACKEND=redis`. `CachedResult` round-trips through JSON with the file bytes base64-encoded, because a shared backend means a network hop and another process. |
 | `AnswerCache.get(key)` / `.set(key, value)` | Standard TTL+LRU semantics: an expired entry is evicted on lookup (not left for later eviction pressure); `set` evicts least-recently-used entries once over `max_entries`. |
-| `AnswerCache.make_key(channel_id, question)` | `(channel_id or "", question.strip().lower())` — scoped per-channel (not per-user or global — access control is already channel-scoped), keyed on exact-normalized question text, no fuzzy/semantic matching. |
-| `CachedResult` | Frozen dataclass: `answer`, `error` — everything replayed on a cache hit. |
+| `AnswerCache.make_key(channel_id, question, *, principal_scope, output_format)` | `(channel_id, principal_scope, output_format, normalized question)`. `principal_scope` is `role:user_id` — **role as well as id**, because two principals sharing a `user_id` under different roles are answered from different rows, and a key carrying only the id would replay one's answer to the other. Exact-normalized question text; no fuzzy or semantic matching (see the note on semantic caching in CONTRIBUTING.md). |
+| `CachedResult` | Frozen dataclass: `answer`, `error`, `file_bytes`, `file_type` — everything replayed on a cache hit, including a generated report, so a repeated PDF request doesn't replay as bare prose with the attachment missing. |
 | `answer_cache` | Module-level singleton, from `settings.answer_cache_ttl_seconds`/`answer_cache_max_entries` (defaults: 30 minutes, 500 entries). |
 
 ### `app/rag/clarification_cache.py`
 | Function | Does |
 |---|---|
-| `ClarificationCache.get/set/clear` | Same TTL+LRU shape as `answer_cache`, keyed by `(channel_id, user_id)` instead — a clarification round-trip is about one user's specific back-and-forth, not a question shareable across a channel. |
+| `ClarificationCache.get/set/clear` | `app/state`'s `TtlStore` (one implementation, shared by every cache here), keyed by `(channel_id, user_id)` — a clarification round-trip is about one user's specific back-and-forth, not a question shareable across a channel. |
 | `PendingClarification` | Frozen dataclass: `original_question`, `rounds` (how many unresolved clarification round-trips so far, gated by `AGENT_MAX_CLARIFICATION_ROUNDS`). |
 | `clarification_cache` | Module-level singleton, from `settings.clarification_cache_ttl_seconds` (default 300s) / max 500 entries. |
 
 ### `app/rag/conversation_context.py`
 | Function | Does |
 |---|---|
-| `ConversationContextCache.get/set/clear` | Same TTL+LRU shape as `answer_cache`/`clarification_cache`, keyed by `(channel_id, user_id)`. Stores a single `str` — the previous turn's `resolved_question` — never a list or growing transcript; `set` always overwrites, so an unrelated question naturally replaces stale context for the *next* turn instead of it lingering. |
+| `ConversationContextCache.get/set/clear` | `TtlStore`, keyed by `(channel_id, user_id)`. Stores a single `str` — the previous turn's `resolved_question` — never a list or growing transcript; `set` always overwrites, so an unrelated question naturally replaces stale context for the *next* turn instead of it lingering. |
 | `conversation_context_cache` | Module-level singleton, from `settings.conversation_context_ttl_seconds` (default 300s) / max 500 entries. Only consulted by `pipeline.answer_question` when no clarification is pending (see `app/rag/clarification_cache.py`, which already carries context forward its own way for that case). |
 
 ### `app/rag/context_switch_cache.py`
 | Function | Does |
 |---|---|
-| `ContextSwitchCache.get/set/clear` | Same TTL+LRU shape as the other per-conversation caches, keyed by `(channel_id, user_id)`. Holds the *candidate* question the classifier decided looked unrelated to still-live context — parked here, unanswered, until the user's next message resolves it (yes/no/neither, matched deterministically in `pipeline.py`, no Gemini call to interpret the reply). |
+| `ContextSwitchCache.get/set/clear` | `TtlStore`, keyed by `(channel_id, user_id)`. Holds the *candidate* question the classifier decided looked unrelated to still-live context — parked here, unanswered, until the user's next message resolves it (yes/no/neither, matched deterministically in `pipeline.py`, no Gemini call to interpret the reply). |
 | `PendingContextSwitch` | Frozen dataclass: `candidate_question` — the question that would have been asked next, had it been confirmed. |
 | `context_switch_cache` | Module-level singleton, from `settings.context_switch_confirmation_ttl_seconds` (default 120s) / max 500 entries. Deliberately a shorter TTL than `conversation_context_cache` — this is "waiting on an active yes/no reply right now," not general conversational memory. |
 
 ### `app/rag/rate_limiter.py`
 | Function | Does |
 |---|---|
-| `RateLimiter.allow(key)` | `True` (and records the call) if `key` is under `limit_per_window` calls within the trailing `window_seconds`; `False` otherwise. Disabled entirely (`0` disables it, always returns `True`) when `limit_per_window <= 0`. Sliding window via a `deque` of call timestamps per key, trimmed on each check; LRU-evicts old keys past `max_tracked_keys` (default 1000) so memory doesn't grow unbounded across many distinct users. |
+| `RateLimiter.allow(key, limit=None)` | `True` (and records the call) if `key` is under the limit within the trailing `window_seconds`. The window lives in `app/state` and is trimmed-and-recorded in **one atomic operation** (`allow_in_window`), because the gap between "count" and "record" is exactly where two replicas both see limit-1 and both proceed. `limit` overrides the configured one for this call — that is how `RATE_LIMIT_BY_ROLE` works; the configured limit stays the **master switch**, so at `0` an override cannot turn limiting back on. |
 | `RateLimiter.make_key(channel_id, user_id)` | `(channel_id or "", user_id or "")`. |
-| `rate_limiter` | Module-level singleton, from `settings.user_rate_limit_per_minute`/`user_rate_limit_window_seconds` (default: disabled). Independent of `quota_tracker` below — this bounds one identity's rate; that bounds a shared daily total. |
+| `DailyQuestionLimiter.allow(principal_scope)` | How many questions one identity may ask per **UTC** day, keyed by date so it rolls over on its own. Checked and counted in one atomic `incr`. The window above stops a burst; this stops a slow drain — a question every thirty seconds passes every per-minute check and still exhausts a free-tier quota by lunchtime. Keyed by `role:user_id`, so it follows the person rather than the channel. |
+| `rate_limiter` / `daily_question_limiter` | Module-level singletons, from `settings.user_rate_limit_per_minute`/`user_rate_limit_window_seconds`/`user_daily_question_limit`. Independent of `quota_tracker` below — these bound one identity; that bounds a shared daily total in Gemini calls. |
 
 ### `app/llm/quota.py`
 | Function | Does |
 |---|---|
-| `QuotaTracker.record_call()` | Increments today's call count (resets first if the day rolled over). Called from inside `GeminiClient._call_with_retry`, but *after* the circuit breaker's `before_call()` — a fast-failed call never reaches Gemini, so it shouldn't spend budget either. |
+| `QuotaTracker.record_call()` | Atomically increments a **date-keyed** counter in `app/state` (`calls:2026-09-08`), so the day rolls over by key rather than by a reset anyone has to remember, and UTC so replicas in different zones agree on when "today" starts. Called from inside `GeminiClient._call_with_retry`, but *after* the circuit breaker's `before_call()` — a fast-failed call never reaches Gemini, so it shouldn't spend budget either. |
 | `QuotaTracker.is_over_budget()` | `True` if today's count ≥ budget (`<= 0` means unlimited). Checked by `pipeline.answer_question` before calling the graph at all. |
-| `quota_tracker` | Module-level singleton, from `settings.gemini_daily_call_budget`. Shared across every user — see `rate_limiter` above for the per-user complement. |
+| `quota_tracker` | Module-level singleton, from `settings.gemini_daily_call_budget`. Shared across every user **and, under `STATE_BACKEND=redis`, every replica** — Google's free-tier quota is per *project*, so three replicas each tracking their own budget make three times the calls and then meet the real 429 this budget exists to avoid showing anyone. |
 
 ### `app/llm/circuit_breaker.py`
 | Function | Does |
 |---|---|
 | `CircuitBreaker.before_call()` | No-op if `failure_threshold <= 0` (disabled) or the breaker is closed. Raises `CircuitBreakerOpenError` if open and still within `cooldown_seconds`. After cooldown, lets exactly one "half-open" trial call through by clearing the open state — a failure re-opens it (via `record_failure`), a success clears it fully (via `record_success`). |
-| `CircuitBreaker.record_success()` / `.record_failure()` | Reset / increment the consecutive-failure counter; `record_failure` opens the breaker once the counter hits `failure_threshold`. |
-| `gemini_circuit_breaker` | Module-level singleton, from `settings.gemini_circuit_breaker_threshold`/`gemini_circuit_breaker_cooldown_seconds` (default: 5 failures, 30s cooldown). Deliberately process-wide, not per-`GeminiClient`-instance — production shares exactly one client, and the failure signal is about the shared backend, not any particular object. |
+| `CircuitBreaker.record_success()` / `.record_failure()` / `.failure_count()` | Clear / atomically increment the consecutive-failure counter in `app/state`; `record_failure` opens the breaker by writing an `open` marker **whose TTL is the cooldown** — the breaker closing again is a key expiring, not a clock this class reads. The marker is only written when not already open, or a continuing outage would push the cooldown forward on every failure and no half-open trial would ever get through. |
+| `gemini_circuit_breaker` | Module-level singleton, from `settings.gemini_circuit_breaker_threshold`/`gemini_circuit_breaker_cooldown_seconds` (default: 5 failures, 30s cooldown). `GeminiClient` also keeps one breaker **per model** (`_breaker_for`), each with its own `name` — a shared one meant a model exhausting its daily quota tripped the breaker for the healthy fallback models too. Now that the state is shared storage, the name is what keeps them apart. |
 
 ### `app/llm/gemini_client.py`
 | Function | Does |
@@ -506,9 +757,11 @@ Grouped by module, in call order for a typical successful request. `*` = private
 | `GeminiClient.generate_structured(prompt, schema)` | Sends `prompt`, parses the JSON reply into `schema(**data)`. Used by the classifier. |
 | `GeminiClient.generate_structured_or_error(prompt, schema)` | Like `generate_structured`, but treats a `{"error": "..."}` reply as a `QueryError` instead of validating it against `schema`. Used by every domain agent. |
 | `GeminiClient.generate_answer(question, rows_by_domain)` | Serializes `rows_by_domain` via `_rows_for_prompt` (capped at `answer_max_rows` *per domain*, so one chatty domain can't crowd the others out of the prompt), sends `_ANSWER_PROMPT`, returns the natural-language reply. |
-| `*GeminiClient._generate_content(contents, config)` | Tries `model_name`, then each `GEMINI_FALLBACK_MODELS` entry in order — but only advances on a 429/404 (`_is_model_unavailable`; Google's free-tier quota is per-model, so a model out of quota doesn't affect a different model's quota). Any other failure (timeout, 5xx exhausted) propagates immediately instead of cascading through every fallback. Drops `thinking_config` for fallback models (confirmed: a different model 400s on `thinking_budget=0`, a value the primary model accepts). |
-| `*GeminiClient._call_with_retry(fn)` | `gemini_circuit_breaker.before_call()` (raises immediately if the breaker is open) → `quota_tracker.record_call()` → retries on 429/5xx **and client-side timeouts** with exponential backoff + jitter up to `max_retries`, re-raising immediately on non-retryable errors, after retries are exhausted, or if the next retry's delay would push total elapsed time past `max_retry_seconds`. Records exactly one circuit-breaker success/failure per call (not per internal retry attempt), so routine retried-then-recovered calls don't inflate the consecutive-failure count. |
-| `*_is_retryable(exc)` | `True` for a `google.genai.errors.APIError` with a 429/500/502/503/504 status, **or** an `httpx.TimeoutException` (a client-side timeout — this used to be non-retryable, which caused a real production failure: a single slow response failed the question outright with no retry). 429 is deliberately excluded from automatic escalation logic elsewhere — see `is_rate_limited`. |
+| `GeminiClient.stream_answer(question, rows_by_domain, skipped, *, on_text)` | The same answer as `generate_answer`, delivered as it is written. `on_text` receives text **already through `StreamingRedactor`** — streaming straight from the model would bypass the finished-prose PII scan. Returns the complete raw answer, so every downstream step behaves identically whether or not anyone watched it arrive. A failure *after* text has reached the user raises `StreamInterrupted`, which is neither retryable nor a reason to try a fallback model: both would replay the answer from the beginning over what the user has already read. |
+| `*GeminiClient._for_each_model(attempt)` | The fallback policy, stated once and shared by `_generate_content` and `stream_answer`. Tries `model_name`, then each `GEMINI_FALLBACK_MODELS` entry in order. Advances on a **429/404** (`_is_model_unavailable`; Google's free-tier quota is per-model, so a model out of quota doesn't affect a different model's quota), on that model's **circuit breaker being open**, or on a **deadline exceeded** (`_is_deadline_exceeded` — a 504 or a client-side timeout, *after* this model's own retries are spent: a request accepted and then not answered in time is a busy queue, and a different model is a different queue). A plain 500/502/503 still propagates — a server that failed rather than stalled says nothing about the next model. One retry budget is shared across the whole sweep, so *retrying* isn't multiplied by the number of models; each model still gets its one attempt, making the worst case the budget plus one attempt per model. Drops `thinking_config` for fallback models (confirmed: a different model 400s on `thinking_budget=0`, a value the primary model accepts). |
+| `*GeminiClient._call_with_retry(fn, breaker=None, deadline=None)` | `breaker.before_call()` (raises immediately if the breaker is open) → `quota_tracker.record_call()` → retries on 5xx **and client-side timeouts** with exponential backoff + jitter up to `max_retries`, re-raising immediately on non-retryable errors, after retries are exhausted, or once the next retry's delay would push past the deadline. **The budget covers the attempts, not just the sleeps**, so it has to exceed `GEMINI_REQUEST_TIMEOUT_MS` or slow failures are never retried — `settings.retry_budget_warning()` says so at startup, and the incident note below is what happens when it doesn't. `deadline` is shared across one `_for_each_model` sweep; past it this still makes one attempt, because a model that never runs isn't a fallback. Records exactly one circuit-breaker success/failure per call (not per internal retry attempt), so routine retried-then-recovered calls don't inflate the consecutive-failure count. |
+| `*_is_retryable(exc)` | `True` for a `google.genai.errors.APIError` with a 500/502/503/504 status, **or** an `httpx.TimeoutException` (a client-side timeout — this used to be non-retryable, which caused a real production failure: a single slow response failed the question outright with no retry; classifying it as retryable then did nothing for two releases, because the retry budget was smaller than the timeout — see the incident notes). 429 is deliberately excluded — it's rate-limiting, not a transient fault; see `is_rate_limited` and `_is_model_unavailable`. |
+| `*_is_deadline_exceeded(exc)` | `True` for a 504 or an `httpx.TimeoutException` — the same event seen from either end of the wire: the request was accepted and then not answered in time. Distinct from `_is_retryable` because it additionally justifies advancing to a fallback model, which a 500/502/503 does not. |
 | `is_rate_limited(exc)` | `True` only for a 429 — lets `pipeline.py` show a clean "I'm getting rate-limited" message instead of Google's raw error payload. |
 | `*_extract_json(text)` / `*_rows_for_prompt(rows, max_rows)` | Regex-extracts the first `{...}` block and `json.loads`s it; caps serialized rows per domain, appending an `"...N more row(s) omitted..."` note instead of the full set. |
 
@@ -534,7 +787,11 @@ Grouped by module, in call order for a typical successful request. `*` = private
 ### `app/agents/graph.py` and `app/agents/state.py`
 See ["The agent graph in detail"](#the-agent-graph-in-detail) above for the full node-by-node
 breakdown (`_classify_node`, `_confirm_context_switch_node`, `_resolve_anchors_node`,
-`_fan_out`/`_domain_agent_node`, `_synthesize_node`, and the `spec_cache` dedup). `GraphState` (a
+`_fan_out`/`_domain_agent_node`, `_deny_node`, `_synthesize_node`, and the `spec_cache` dedup).
+`_domain_filter(state, domain)` is where the row policy lands: it merges
+`roles.forced_filter(...)` with any geo anchor, and an anchor is never allowed to overwrite an
+authorization filter. `_resolve_authorized_customer_ids(db, vendor_id)` resolves the one rule that
+needs a query. `GraphState` (a
 `TypedDict`) is the graph's schema; fields without an `Annotated` reducer are "last write wins,"
 fields with `Annotated[..., _merge_dicts]` (`specs_by_domain`, `rows_by_domain`,
 `out_of_scope_by_domain`, `errors_by_domain`, `timings`) accumulate across the parallel
@@ -544,8 +801,13 @@ and `resolved_question` (written once by `_classify_node`) are both plain last-w
 what `_resolve_anchors_node`, `_fan_out`, and `_synthesize_node` all call instead of reading
 `state["question"]` directly. `needs_context_confirmation` (set only by
 `_confirm_context_switch_node`) mirrors `needs_clarification`'s shape and is mutually exclusive
-with it — `_route_after_classify` picks at most one of `clarify` / `confirm_context_switch` /
-`resolve_anchors` per invocation.
+with it — `_route_after_classify` picks at most one of `clarify` / `confirm_context_switch` / `deny` /
+`resolve_anchors` per invocation. `principal` and `authorized_customer_ids` are threaded
+explicitly into every `Send` payload alongside `spec_cache`, for the reason the fan-out always
+has: a payload is a fresh dict, and `_principal(state)` defaults a missing one to `ANONYMOUS` so
+the failure is a refusal rather than an unrestricted read. `stream_sink` is threaded the same way.
+`_fan_out` returns the string `"synthesize"` when every domain has been refused after routing —
+an empty `Send` list would end the graph with no `answer` at all.
 
 ### `app/rag/schema_context.py`
 | Function | Does |
@@ -626,6 +888,71 @@ block's `finally` had recorded that stage's duration. Fixed by timing each stage
 manager (`_timed_stage`) whose `finally` runs as the exception unwinds out of the `with` block —
 strictly before the enclosing `except` clause (and therefore before `_log`) runs. See
 `app/llm/gemini_client.py::_is_retryable` and `app/rag/pipeline.py::_timed_stage`.
+
+**A retry budget smaller than the request timeout, which silently disabled retrying.** The
+sequel to the timeout incident above, and caused by its fix. Extending `_is_retryable` to cover
+`httpx.TimeoutException` was correct and did nothing: `_call_with_retry` measures
+`GEMINI_MAX_RETRY_SECONDS` from the start of the *first attempt*, and that ceiling (8s) was
+smaller than `GEMINI_REQUEST_TIMEOUT_MS` (15s) — so by the time a slow failure raised, the budget
+was already spent and the retry was refused. The production log that surfaced it was a
+`504 DEADLINE_EXCEEDED` arriving 12.1s into query generation: a retryable status, a configured
+fallback model, and neither used. The rule is now arithmetic rather than judgement — a failure is
+retried only if it fails *faster* than the budget:
+
+```
+failure at   2.0s -> 3 attempts        (with the old 8s ceiling)
+failure at   8.0s -> 1 attempt         <- everything past here never retried
+failure at  12.1s -> 1 attempt         <- the production 504
+failure at  15.0s -> 1 attempt         <- the client timeout itself, by definition
+```
+
+Three things were wrong at once and each is now covered separately: the defaults (timeout 15s →
+**8s**, ceiling 8s → **16s**, so two attempts fit), the silence (`settings.retry_budget_warning()`
+refuses to let the pair disagree quietly at startup), and the tests — every retry test made its
+failures *instantaneous* with a mocked `time.sleep` and a 60s ceiling, so none of them could
+observe a budget being consumed by an attempt. `tests/test_gemini_retry.py` now drives a fake
+clock where a failure costs time. A 504 also now advances to the next fallback model
+(`_is_deadline_exceeded`), which would have answered this question outright. The general lesson:
+two guards in different units, each correct alone, can compose into no guard at all.
+
+**"Orders with user details" refused by both halves of the fan-out.** A vendor asked for
+incomplete orders "with order details, user's details" and got no report at all — the classifier
+fanned out to `orders` and `customers`, and each agent correctly refused the half it could not
+see: orders has no user fields, users has no order status. Neither was wrong; nothing had told
+either of them that the join between them already exists in code. Fixed by making that join
+visible rather than by adding a planner: `DomainConfig.enriched_columns` declares the columns
+`app/agents/enrichment.py` attaches after a query, the domain agent's prompt lists them and is
+told not to refuse for them, and the classifier is told such questions stay single-domain. The
+party's attributes ride the existing `$in`, and only when the question names the people; any
+attribute constant across the result is dropped — a vendor's own orders all carry the same
+vendor, and those columns had pushed `created_at` past `REPORT_MAX_COLUMNS`.
+
+**A chart that answered a different question than the one asked.** A vendor asked "how many
+orders are incomplete and what are their current status" and got a PDF whose pie read 47.2%
+preparing / 42.5% pending / 10.3% refunded -- for three orders, one in each status. Root cause:
+`choose_chart` took `numeric_indexes[0]` as its measure, and the first numeric column of an orders
+report is `amount`, so the chart plotted money per status. Every number on it was correct and
+none of them answered the question. Fixed by making the measure part of the decision rather than
+an assumption: `ChartSpec.value_column` is now `int | None`, where None means *count the rows*,
+selected when the question asks how many (`asks_for_a_count` -- a small deliberate vocabulary, not
+a model call, because this is the most quota-constrained path in the system). A counted chart is
+titled for the rows ("Orders by Current Status") rather than for a column it is deliberately not
+reading, and its bar axis uses integer ticks, since half an order is not a quantity. The failure
+mode worth remembering: a wrong measure is *self-consistent*. The slices sum to 100%, the labels
+are right, and nothing on the page looks wrong.
+
+**A request timeout below the API's own floor, which broke every call.** The immediate sequel to
+the retry-budget fix above, and caused by it: lowering `GEMINI_REQUEST_TIMEOUT_MS` to 8000 to make
+room for a retry produced `400 INVALID_ARGUMENT: Manually set deadline 8s is too short. Minimum
+allowed deadline is 10s.` on *every* call, in ~1.2s, with no query ever generated. The setting was
+chosen by arithmetic against our own retry budget without checking whether the upstream accepted
+it, and a fully-mocked test suite cannot notice that — every test passed. Fixed by clamping to
+`GEMINI_MIN_REQUEST_TIMEOUT_MS` (10000) with `settings.gemini_timeout_warning()` naming what was
+asked for and what is being used, and by making one real API call part of verifying a value the
+API has an opinion about. A second bug rode along: `classify_exception` mapped every non-429
+`APIError` to `UPSTREAM_UNAVAILABLE`, so users were told a permanent configuration failure
+"usually recovers on its own within a few minutes" — a 4xx is now `UNKNOWN`, which carries a
+reference code and says to pass it on.
 
 **Query-generation JSON truncated by a "thinking" model.** A second production log showed query
 generation failing with `"Gemini response did not contain JSON: '{\n  \"collection'"` after ~14s —

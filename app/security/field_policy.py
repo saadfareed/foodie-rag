@@ -63,6 +63,31 @@ _SECRET_FIELD_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"iban|swift|routing_?number|account_?number"),
 )
 
+# Contact details -- dropped outright, not redacted.
+#
+# These arrived with OTP sign-in: `users.email` / `users.phone` exist so a person can prove who
+# they are, and that is the only thing they are for. A model that can see them can be asked for
+# them ("list my customers with their phone numbers"), which turns an authentication field into a
+# contact-scraping endpoint with natural-language search over it.
+#
+# Dropped rather than redacted because, unlike a card number, the *column* is not useful either:
+# nobody needs a report with an `email` column full of [REDACTED]. Note this also means a vendor
+# cannot get their own customers' contact details through the bot even though they may legitimately
+# have them elsewhere -- making that possible needs a role-aware field policy, which this
+# deliberately is not (app/db/executor.py applies this at the choke point, where no role is in
+# scope). That is the right trade until someone actually asks for it.
+# Deliberately broader than the secret patterns above, and in the opposite direction. A false
+# positive here drops one column from a report; a false negative hands over a contact list. So
+# `emailed_at` being dropped along with `email` is an accepted cost -- these patterns match a
+# substring, unlike the card ones, which require a qualifier precisely because `card` alone is
+# usually a payment method rather than a number.
+_CONTACT_FIELD_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"e-?mail"),
+    re.compile(r"phone|msisdn|whatsapp"),
+    re.compile(r"^mobile(?:_|$)|_mobile$"),
+    re.compile(r"^contact(?:_|$)"),
+)
+
 
 def _matches_any(patterns: tuple[re.Pattern[str], ...], field: str) -> bool:
     lowered = field.lower()
@@ -70,8 +95,11 @@ def _matches_any(patterns: tuple[re.Pattern[str], ...], field: str) -> bool:
 
 
 def is_internal_field(field: str) -> bool:
-    """True if `field` is storage plumbing that should never reach a user or the model."""
+    """True if `field` should never reach a user or the model at all -- storage plumbing, or a
+    contact detail that exists only so someone can sign in."""
     if _matches_any(_INTERNAL_FIELD_PATTERNS, field):
+        return True
+    if _matches_any(_CONTACT_FIELD_PATTERNS, field):
         return True
     return field.lower() in {f.lower() for f in settings.security_extra_denied_fields}
 

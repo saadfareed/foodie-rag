@@ -4,6 +4,7 @@ from typing import Annotated, TypedDict
 
 from app.agents.classifier import Classification
 from app.rag.query_spec import QueryError, QuerySpec
+from app.security.roles import Principal
 
 
 def _merge_dicts(a: dict, b: dict) -> dict:
@@ -14,12 +15,23 @@ class GraphState(TypedDict, total=False):
     question: str
     user_id: str | None
     channel_id: str | None
-    authenticated_vendor_id: str | None
+    # WHO is asking, and therefore which rows they may be answered from. Replaces the previous
+    # single `authenticated_vendor_id`, whose absence meant "no filter" -- i.e. an unauthenticated
+    # request was an admin request. See app/security/roles.py.
+    principal: "Principal"
+    # Resolved once, ahead of the fan-out, for the one authorization rule that needs a query to
+    # answer: which customers a vendor may see (those who have ordered from them).
+    authorized_customer_ids: list[str]
     # The previous turn's resolved_question for this (channel, user), from
     # app/rag/conversation_context.py -- None for a fresh conversation or when the answer_cache/
     # clarification path already short-circuited. Read only by _classify_node, which decides
     # (via Classification.context_mode) whether the current question actually needs it.
     previous_question: str | None
+    # Where progress and token events go (app/rag/stream.py). Defaults to NULL_SINK, which does
+    # nothing, so the Slack path is unchanged and pays nothing. Like every other value a
+    # fanned-out node needs, it has to be threaded into the Send payload explicitly -- see
+    # _fan_out in graph.py.
+    stream_sink: object
 
     classification: Classification
     # Set once by _classify_node from classification.resolved_question -- either the question
@@ -65,3 +77,6 @@ class GraphState(TypedDict, total=False):
     # `answer` is a yes/no prompt in that case, not a real answer. Mutually exclusive with
     # needs_clarification: _route_after_classify picks at most one branch per invocation.
     needs_context_confirmation: bool
+    # Set by _deny_node when this principal may read none of the domains the question needs.
+    # `answer` is a refusal in that case -- no query was generated and nothing was read.
+    not_authorized: bool

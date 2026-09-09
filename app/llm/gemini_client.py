@@ -22,6 +22,7 @@ from app.config import settings
 from app.llm.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError, gemini_circuit_breaker
 from app.llm.quota import quota_tracker
 from app.rag.query_spec import QueryError
+from app.security.output_scanner import StreamingRedactor
 
 R = TypeVar("R")
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
@@ -79,6 +80,15 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
+class StreamInterrupted(Exception):
+    """A streaming call failed *after* text had already reached the user.
+
+    Deliberately not retryable and deliberately not a reason to try a fallback model: both would
+    restart the answer from the beginning, and the user has already read the first half of the
+    previous attempt. The only honest outcome is to stop and say so.
+    """
+
+
 def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, errors.APIError):
         return exc.code in _RETRYABLE_STATUS_CODES
@@ -87,6 +97,20 @@ def _is_retryable(exc: Exception) -> bool:
     # no retry at all (this is what happened in production: a 15s HTTP timeout on the
     # query-generation call raised httpx.ReadTimeout, which wasn't a google.genai.errors.APIError,
     # so _call_with_retry gave up on the first attempt instead of retrying).
+    return isinstance(exc, httpx.TimeoutException)
+
+
+def _is_deadline_exceeded(exc: Exception) -> bool:
+    """True for a failure that is *this attempt taking too long*, from either end of the wire.
+
+    Google's `504 DEADLINE_EXCEEDED` and our own client-side timeout are the same event seen from
+    two sides, and both mean the request was accepted and then not answered in time -- unlike a
+    500/502/503, which is a server that failed rather than stalled. That distinction is what makes
+    this worth advancing a fallback model for: a different model is a different queue, and the
+    thing that just ran out of time was the queue.
+    """
+    if isinstance(exc, errors.APIError):
+        return exc.code == 504
     return isinstance(exc, httpx.TimeoutException)
 
 
@@ -197,11 +221,27 @@ class GeminiClient:
             breaker = CircuitBreaker(
                 failure_threshold=settings.gemini_circuit_breaker_threshold,
                 cooldown_seconds=settings.gemini_circuit_breaker_cooldown_seconds,
+                # Namespaces this breaker's state (app/llm/circuit_breaker.py) -- without it, a
+                # shared backend would put every model's failures back in one bucket and undo the
+                # per-model isolation this dict exists to provide.
+                name=model,
             )
             self._breakers[model] = breaker
         return breaker
 
-    def _call_with_retry(self, fn: Callable[[], R], breaker: CircuitBreaker | None = None) -> R:
+    def _call_with_retry(
+        self,
+        fn: Callable[[], R],
+        breaker: CircuitBreaker | None = None,
+        deadline: float | None = None,
+    ) -> R:
+        """Call `fn`, retrying transient failures until the retry budget runs out.
+
+        `deadline` is a `time.monotonic()` value shared across every model in one
+        `_for_each_model` sweep, so falling through to a fallback model cannot multiply the budget
+        by the number of models configured. Past the deadline this still makes **one** attempt --
+        the budget bounds retrying, and a model that never gets a single try is not a fallback.
+        """
         # Defaults to the shared module-level breaker only when no per-model breaker is given --
         # every real call site (_generate_content) always passes one explicitly (see
         # _breaker_for). Checked first, before quota_tracker.record_call(): a call the breaker
@@ -211,7 +251,8 @@ class GeminiClient:
         breaker.before_call()
         quota_tracker.record_call()
         attempt = 0
-        start = time.monotonic()
+        if deadline is None:
+            deadline = time.monotonic() + self.max_retry_seconds
         while True:
             try:
                 result = fn()
@@ -221,7 +262,11 @@ class GeminiClient:
                     raise
                 jitter = random.uniform(0, 0.5)  # nosec B311 - retry backoff jitter, not security-sensitive
                 delay = self.retry_base_delay_seconds * (2**attempt) + jitter
-                if time.monotonic() - start + delay > self.max_retry_seconds:
+                # The budget covers the attempts as well as the sleeps, which is why
+                # settings.retry_budget_warning() exists: a ceiling below the per-attempt timeout
+                # means a slow failure has already spent it here, and the retry this exception was
+                # classified as deserving never happens.
+                if time.monotonic() + delay > deadline:
                     breaker.record_failure()
                     raise
                 time.sleep(delay)
@@ -230,19 +275,62 @@ class GeminiClient:
                 breaker.record_success()
                 return result
 
-    def _generate_content(self, contents: str, config: types.GenerateContentConfig | None = None):
-        """Tries self.model_name first, then each configured fallback model in order -- but only
-        advances to the next model on a 429/404 (see _is_model_unavailable) or that model's own
-        circuit breaker being open. Google's free-tier quota is per-model
-        (GenerateRequestsPerDayPerProjectPerModel-FreeTier), so a model that's out of quota for
-        the day doesn't affect a different model's quota; trying gemini-3.6-flash after
-        gemini-3-flash-preview hits its daily cap effectively multiplies the day's total
-        capacity. Any other failure (timeout, 5xx exhausted after retrying) propagates
-        immediately instead of cascading through every fallback model -- that kind of failure
-        isn't model-specific, so retrying it against a different model wouldn't help and would
-        only multiply latency."""
+    def _for_each_model(self, attempt: Callable[[str], R]) -> R:
+        """Run `attempt` against the primary model, then each fallback, and return its result.
+
+        Three conditions advance to the next model, and each is a statement that *this model*
+        can't serve the request right now:
+
+        * **429/404** (see _is_model_unavailable). Google's free-tier quota is per-model
+          (GenerateRequestsPerDayPerProjectPerModel-FreeTier), so a model that's out of quota for
+          the day doesn't affect a different model's quota; trying gemini-3.6-flash after
+          gemini-3-flash-preview hits its daily cap effectively multiplies the day's capacity.
+        * **That model's circuit breaker being open** -- it is per-model for this reason.
+        * **A deadline exceeded** (see _is_deadline_exceeded), but only after this model's own
+          retries are spent. A 504 is a request that was accepted and then not answered in time,
+          which in practice is a busy model rather than a broken network -- a real one arrived
+          12.1s into query generation on a preview model that had answered a classify call two
+          seconds earlier. A different model is a different queue. A plain 500/502/503 still
+          propagates: that is a server that failed rather than stalled, and nothing about it says
+          the next model would do better.
+
+        Every model shares **one** retry budget (`deadline` below), so *retrying* is not multiplied
+        by the number of models configured: whichever model is running when the budget runs out is
+        the last one to get a second try. Each subsequent model still gets its one attempt -- a
+        model that never runs isn't a fallback -- so the honest worst case for a sweep is the
+        budget plus one attempt per model -- the budget bounds when an attempt may *start*, never
+        how long it then runs. That is why GEMINI_FALLBACK_MODELS is a list an operator sizes
+        deliberately rather than an unbounded chain.
+
+        Shared by _generate_content and stream_answer so the fallback policy is stated once. A
+        streaming call that already delivered text raises StreamInterrupted, which is none of the
+        three advance conditions -- so it stops here rather than restarting the answer from the
+        beginning under a different model, however it failed.
+        """
         models = [self.model_name, *self.fallback_models]
+        deadline = time.monotonic() + self.max_retry_seconds
         for i, model in enumerate(models):
+            try:
+                result = self._call_with_retry(
+                    lambda m=model: attempt(m),
+                    breaker=self._breaker_for(model),
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                is_last = i == len(models) - 1
+                if not is_last and (
+                    _is_model_unavailable(exc)
+                    or _is_deadline_exceeded(exc)
+                    or isinstance(exc, CircuitBreakerOpenError)
+                ):
+                    continue
+                raise
+            self.last_model_used = model
+            return result
+        raise AssertionError("unreachable: the loop above always returns or raises")
+
+    def _generate_content(self, contents: str, config: types.GenerateContentConfig | None = None):
+        def attempt(model: str):
             effective_config = config
             if effective_config is not None and model != self.model_name:
                 # thinking_config is tuned specifically for self.model_name (see
@@ -252,23 +340,11 @@ class GeminiClient:
                 # thinks by default, rather than fail outright over an incompatible tuning knob
                 # that has nothing to do with why we're falling back in the first place.
                 effective_config = effective_config.model_copy(update={"thinking_config": None})
-            try:
-                response = self._call_with_retry(
-                    lambda m=model, c=effective_config: self.client.models.generate_content(
-                        model=m, contents=contents, config=c
-                    ),
-                    breaker=self._breaker_for(model),
-                )
-            except Exception as exc:
-                is_last = i == len(models) - 1
-                if not is_last and (
-                    _is_model_unavailable(exc) or isinstance(exc, CircuitBreakerOpenError)
-                ):
-                    continue
-                raise
-            self.last_model_used = model
-            return response
-        raise AssertionError("unreachable: the loop above always returns or raises")
+            return self.client.models.generate_content(
+                model=model, contents=contents, config=effective_config
+            )
+
+        return self._for_each_model(attempt)
 
     def _generate_json(self, prompt: str) -> dict:
         """Every app/agents/ chain (classifier, per-domain query agents) is built on this one
@@ -303,7 +379,21 @@ class GeminiClient:
         be incomplete" caveat regardless of whether the other domains' data already answers the
         question in full (confirmed in production: this produced a misleading caveat on a fully
         correct, complete answer)."""
-        prompt = _ANSWER_PROMPT.format(
+        response = self._generate_content(
+            self._answer_prompt(question, rows_by_domain, skipped_domains)
+        )
+        return response.text.strip()
+
+    def _answer_prompt(
+        self,
+        question: str,
+        rows_by_domain: dict[str, list[dict]],
+        skipped_domains: dict[str, str] | None,
+    ) -> str:
+        """Shared by generate_answer and stream_answer, so the streamed answer and the blocking
+        one are the same answer -- two prompt builders would drift, and the difference would only
+        show up as "the Slack reply and the web reply disagree"."""
+        return _ANSWER_PROMPT.format(
             question=question,
             rows_by_domain=_rows_for_prompt(rows_by_domain, self.answer_max_rows),
             skipped_domains_note=(
@@ -316,5 +406,52 @@ class GeminiClient:
                 else ""
             ),
         )
-        response = self._generate_content(prompt)
-        return response.text.strip()
+
+    def stream_answer(
+        self,
+        question: str,
+        rows_by_domain: dict[str, list[dict]],
+        skipped_domains: dict[str, str] | None = None,
+        *,
+        on_text: Callable[[str], None],
+    ) -> str:
+        """Same answer as generate_answer, delivered as it is written.
+
+        `on_text` receives text that has already been through the PII redactor -- streaming
+        straight from the model would bypass `scan_output_for_pii`, which runs on the *finished*
+        prose and so would arrive long after a card number had been displayed. See
+        `app/security/output_scanner.py::StreamingRedactor` for why chunk-at-a-time redaction is
+        not simply "scan each chunk".
+
+        The return value is the complete raw answer, exactly as `generate_answer` returns it, so
+        every downstream step -- the output scan, the report builder, the answer cache -- behaves
+        identically whether or not anyone was watching it arrive.
+        """
+        prompt = self._answer_prompt(question, rows_by_domain, skipped_domains)
+        redactor = StreamingRedactor()
+        collected: list[str] = []
+
+        def consume(model: str) -> None:
+            delivered = False
+            try:
+                for chunk in self.client.models.generate_content_stream(
+                    model=model, contents=prompt
+                ):
+                    text = getattr(chunk, "text", None)
+                    if not text:
+                        continue
+                    collected.append(text)
+                    safe = redactor.feed(text)
+                    if safe:
+                        delivered = True
+                        on_text(safe)
+            except Exception as exc:
+                if delivered or collected:
+                    raise StreamInterrupted(str(exc)) from exc
+                raise
+
+        self._for_each_model(consume)
+        tail = redactor.finish()
+        if tail:
+            on_text(tail)
+        return "".join(collected).strip()

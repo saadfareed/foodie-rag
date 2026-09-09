@@ -163,9 +163,10 @@ def generate_pdf(
     question: str | None = None,
     answer: str | None = None,
     title: str | None = None,
+    max_rows: int | None = None,
 ) -> bytes:
     """Render the report template to PDF bytes."""
-    tables = build_tables(rows_by_domain)
+    tables = build_tables(rows_by_domain, max_rows=max_rows)
     chart = _pick_chart(tables, question)
 
     html_content = _TEMPLATE.render(

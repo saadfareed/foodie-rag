@@ -8,9 +8,15 @@ path, not for a first orientation.
 
 ## What this is
 
-A Slack bot: users `@mention` it, DM it, or run `/ask <question>`; it turns the question into a
-safe, read-only MongoDB query via Google's Gemini (free tier), executes it, and replies with a
-natural-language answer — plus, when asked, a **CSV, XLSX, or PDF report** attached to the reply.
+A natural-language assistant over MongoDB, reachable two ways: a **Slack bot** (users `@mention`
+it, DM it, or run `/ask <question>`) and an **embeddable web chat widget** any web application can
+drop in with one script tag. Either way it turns the question into a safe, read-only MongoDB query
+via Google's Gemini (free tier), executes it, and replies with a natural-language answer — plus,
+when asked, a **CSV, XLSX, or PDF report** attached to the reply.
+
+`app/slack/` and `app/api/` are two *adapters* onto one pipeline, not two implementations. Nothing
+below `app/rag/pipeline.py::answer_question` knows which one a question arrived through, and both
+can run at once against one database.
 Python 3.12+, `slack-bolt` (Socket Mode, no public URL needed), `google-genai`, `pymongo`,
 `langgraph`/`langchain-core` for the agent orchestration, `pydantic` for every structured shape
 the LLM produces, and `openpyxl`/`matplotlib`/`WeasyPrint` for the report formats.
@@ -25,6 +31,16 @@ Two core design principles:
    is applied at the single point where rows leave MongoDB, so storage plumbing (`_id`, `__v`,
    index fields) and credential values are gone before anything downstream — the answer prompt,
    an exported file, the cache, the audit log — can see them.
+
+3. **The caller never asserts its own identity or role.** Slack states who is speaking; a
+   browser will send whatever it is told to. So the web adapter takes both from a short-lived
+   token minted server-to-server by the host application (`app/api/tokens.py`), never from the
+   request body — and the resulting `Principal` (`app/security/roles.py`) is turned into a forced
+   filter, in code, on every generated query.
+4. **The default is deny.** An unauthenticated caller reads nothing. This used to be the opposite:
+   the single `authenticated_vendor_id` axis applied no filter when absent, so "not signed in"
+   meant "sees everything" — survivable when the only entrance was an allow-listed Slack channel,
+   and not survivable once a browser could reach it.
 
 Read [Guardrails](#guardrails-do-not-weaken-these) below before changing anything in the request
 path.
@@ -49,10 +65,18 @@ app/
     indexes.py         idempotent compound-index creation, called at every startup
     introspect.py      CLI: samples collections -> schema_summary.json (offline, not live path)
     executor.py         runs a *validated* QuerySpec, applies the field policy to every row out
+    identity.py           the ONE code path allowed to read users.email/password_hash --
+                          sign-in lookups only (asserted address, or address + password)
+    accounts.py             the ONE code path that WRITES to users (playground sign-up, backfill);
+                            needs a writable credential, never reachable from a question
+    backfill_credentials.py   CLI: give existing rows an email + password_hash (dry run by
+                              default; offline, not live path)
     seed.py, seed_users.py   demo-data generators (offline, not live path)
   security/
-    field_policy.py   THE field allow/deny policy: drop internal, redact secret (one source of truth)
-    output_scanner.py   last-resort regex redaction over the model's finished prose
+    field_policy.py   THE field allow/deny policy: drop internal/contact, redact secret (one source)
+    roles.py            THE row-level policy: admin/vendor/customer -> a forced filter per domain
+    passwords.py          PBKDF2 hashing/verification for users.password_hash; equal-cost failure
+    output_scanner.py     last-resort redaction over the model's prose, whole or streamed
   services/
     intent_router.py  deterministic (no Gemini) explicit-format detection + policy refusals
   generators/       Report formats, all built on one shared tabular layer
@@ -72,7 +96,13 @@ app/
     clarification_cache.py  per-(channel,user) "we asked a follow-up" state
     conversation_context.py per-(channel,user) last resolved_question, for short elliptical follow-ups
     context_switch_cache.py per-(channel,user) "should I clear that context?" pending confirmation
-    rate_limiter.py        per-(channel,user) sliding-window rate limit
+    rate_limiter.py        per-identity limits: a sliding window (bursts) + a daily count (drains)
+    stream.py               progress/token events (NullSink for Slack, QueueSink for SSE)
+  state/              WHERE EVERY STATEFUL GUARDRAIL KEEPS ITS STATE. One seam, two backends.
+    backend.py          the contract: 7 primitives, chosen so each is ATOMIC in Redis
+    memory.py             in-process TTL + LRU (default; the behaviour these caches always had)
+    redis_backend.py       shared across replicas; two Lua scripts (counter, sliding window)
+    store.py                TtlStore + key encoding, shared by every cache that has a TTL
   llm/
     gemini_client.py  all Gemini calls: retry/backoff/timeout/thinking-budget/fallback-models/quota
     circuit_breaker.py  fails fast on a sustained Gemini outage instead of retrying forever
@@ -82,12 +112,31 @@ app/
                       pipeline.answer_question; uploads any generated file
     access_control.py   channel/user allowlists
     auth.py              mock `/login` vendor sessions (TTL-bounded), scopes queries to one vendor
+  api/                THE WEB ADAPTER: same pipeline, browser-shaped. Mirrors slack/handlers.py.
+    server.py           FastAPI gateway: / (role-aware sign-in page + dev playground),
+                          /v1/session, /v1/identity/lookup, /v1/me, /v1/ask,
+                          /v1/ask/stream (SSE), /v1/files/{id}, /widget.js, CORS,
+                          /v1/dev/{login,logout,session} (playground only, loopback only)
+    tokens.py             host-app keys (server-side) vs browser session tokens (short-lived JWT)
+                          vs the playground's signed sign-in cookie -- three `typ`s, one key;
+                          conversation id is DERIVED from the token, never accepted from the body
+    files.py               bounded TTL store holding a generated report between answer and download
+    static/widget.js        the embeddable widget: shadow DOM, textContent-only, no build, no deps
+    static/playground.html    the gateway's own page: sign in, then chat. Admin-only sections are
+                              stripped server-side, not hidden in CSS
+    main.py                  entrypoint: `python -m app.api.main`
   audit/
     logger.py         structured JSON audit logging (stdout always, optional rotating file)
   main.py             entrypoint: config validation, index bootstrap, builds shared clients, Socket Mode
 tests/                pytest, fully mocked (no live Slack/Mongo/Gemini calls, ever)
+examples/
+  supabase-app/       runnable sample host app: email one-time-code sign-in, roles, the widget
+                      embedded, zero npm dependencies (otp.mjs is liftable as-is)
 docs/
   architecture.md            full component map + sequence diagrams + function reference (the deep dive)
+  web-plugin.md                the web adapter: security model, env vars, endpoints, embedding guide
+  scaling.md                     running more than one instance: what breaks, and STATE_BACKEND=redis
+  authorization.md                 roles, row-level access, and how one-time-code sign-in fits
   onboarding-a-collection.md   how to add a new collection/domain
 schema_summary.json, schema_annotations.json   git-ignored, environment-specific (see below)
 ```
@@ -98,8 +147,10 @@ schema_summary.json, schema_annotations.json   git-ignored, environment-specific
 Gemini until all of them have passed — that ordering is load-bearing, not cosmetic.
 
 ```
-Slack event -> handlers.py -> access_control.is_authorized (+ auth.get_authenticated_vendor)
-  -> pipeline.answer_question:
+Slack event -> slack/handlers.py -> access_control.is_authorized (+ auth.get_authenticated_vendor)
+HTTP POST  -> api/server.py    -> verify_session_token (principal + ROLE + conversation id all
+                                   come from the signed token, never the request body)
+  -> both call pipeline.answer_question:
        "reset"/"new topic"/"start over"/"forget that" (exact match)?
           -> clear clarification/conversation-context/context-switch state, reply, done (no Gemini)
        pending context_switch_cache confirmation for this user?
@@ -171,8 +222,122 @@ Every Gemini call funnels through `GeminiClient._call_with_retry`:
   stale-answer annoyance.
 - **The classifier only ever names a domain** (`app/agents/classifier.py::DomainName`), never a
   raw collection or field — a hallucinated domain fails Pydantic validation structurally.
+- **`app/security/roles.py` is the one and only row-level access policy.** Which rows a
+  principal may be answered from is decided there and merged into the query by
+  `app/agents/graph.py::_domain_filter`, in code, after generation — the same relationship
+  `scope_spec_to_domain` has to the collection. Three rules matter more than the rest:
+  the default is **deny** (`ANONYMOUS` reads nothing, and a domain missing from a role's set is
+  refused by omission); an unresolved computed scope becomes `{"$in": []}` and **never** an absent
+  filter; and an authorization filter is never widened by a geo anchor. All three fail silently if
+  broken — the query runs, the answer is fluent, and it is built from rows the asker was not
+  entitled to — so `tests/test_graph.py` asserts the *filter that reached the database*, not that
+  a function was called.
+- **A per-role limit is an *override*, never a replacement.** `settings.rate_limit_override_for`
+  returns None when a role isn't listed, and `RateLimiter.allow` reads None as "use whatever this
+  limiter was built with". Resolving it to a number in the settings instead would make the setting
+  authoritative over the limiter object, silently overriding anything configured directly. The
+  flat `USER_RATE_LIMIT_PER_MINUTE=0` stays the master switch: a role entry cannot turn limiting
+  back on where it was deliberately off. `REPORT_MAX_ROWS_BY_ROLE` is the same shape, and
+  `build_table` clamps whatever it is given to `REPORT_MAX_ROWS` so an override can only lower the
+  cap, never raise it past the bound the render pool was sized for.
+- **`users.email` / `users.phone` / `users.password_hash` exist only so someone can sign in.** The field policy drops them
+  from every row (`_CONTACT_FIELD_PATTERNS`), so no question can reach them however it is phrased,
+  and `app/db/identity.py` is the single code path allowed to read them — exact match, fixed
+  projection, active accounts only. A model that can see a contact column can be asked to list it,
+  which turns an authentication field into a contact-scraping endpoint with natural-language
+  search over it. `REPORT_INCLUDE_CONTACTS` (off by default) opens one narrow exception on the
+  *report* path only, governed by `roles.may_see_contacts` — which is a strictly narrower question
+  than `may_query`: a customer reads the vendor directory *unfiltered*, so contacts there would be
+  every vendor's phone number in one download. That subset relationship has its own test.
+- **The web adapter reads identity, role and conversation from the signed token only**
+  (`app/api/server.py` -> `app/api/tokens.py::SessionClaims`). A browser can put `vendor_id` or a
+  conversation id in the request body all day; nothing reads them. `WIDGET_ALLOWED_SESSION_ROLES`
+  additionally limits which roles a host key may assert, and `admin` is not in the default: a host
+  key is a long-lived secret on someone else's server, and leaking one should not confer the
+  ability to mint an unrestricted session. This is the browser equivalent
+  of `scope_spec_to_domain` — a guarantee by construction rather than a validation rule someone
+  has to remember — and, like the `Send(...)` payload bug below, it fails *silently* if broken:
+  every request still succeeds and simply answers with the wrong person's data. `tests/test_api.py`
+  asserts the effect (what reaches `answer_question`), not the plumbing.
+- **A `WIDGET_API_KEYS` entry is `tenant:secret` only when the prefix is a plain identifier.**
+  Splitting on the first colon unconditionally silently reinterpreted a generated secret that
+  happened to contain one as a tenant plus a much shorter secret — the host application sent the
+  whole string, the gateway compared it against the tail, and every sign-in failed with a 401
+  naming nothing. Generated keys contain punctuation often enough that this is a matter of when,
+  not if.
+- **The dev playground is a hole in the credential boundary, fenced three ways.**
+  `WIDGET_DEV_PLAYGROUND` lets the landing page mint a session with no host-app key, so it is off
+  by default, refused for any non-loopback *peer* (a forwarded header is not enough -- anyone
+  could claim to be local), and still bound by `WIDGET_ALLOWED_SESSION_ROLES` plus the same
+  live-account check. It shares `_check_session_request` with `/v1/session` so a playground
+  session can never be more permissive than a real one: a playground that is easier to pass than
+  production teaches the wrong lesson.
+- **`WIDGET_API_KEYS` is a server-side credential and `WIDGET_JWT_SECRET` signs browser tokens;
+  they are separate on purpose.** Rotating a host app's key must not invalidate every live chat
+  session, and leaking one must not confer the ability to mint the other. A browser holding a
+  host-app key could mint a session for any user at any scope, so a host application's *server*
+  is the only thing that may ever call `POST /v1/session`.
+- **A sign-up form names its errors; a sign-in form never does.** `app/messages.py`'s
+  `invalid_credentials_message()` is deliberately identical for every way a sign-in can fail, so
+  the form can't be used to test whether an address is registered. `AccountError`
+  (`app/db/accounts.py`) is the opposite on purpose: on a *sign-up* the person is telling us the
+  address rather than guessing it, and "that address is taken" is the one thing they need. Don't
+  unify the two -- they are answering different questions.
+- **The playground authenticates; it does not ask who you are.** `POST /v1/dev/login` takes an
+  email and a password, and `app/db/identity.py::authenticate_password` decides both the identity
+  and the role from the account (`usertype`) -- neither is ever read from the page. The previous
+  form asked for a role and a `user_id`, which was the wrong question asked of the wrong person:
+  nobody knows their own `USR-00031`, and a role you type is a role you chose. The cookie it sets
+  is a signed JWT with its own `typ` (`app/api/tokens.py::mint_dev_login_cookie`) for the same
+  reason: next to a password field, a `role:user_id` string the page writes itself would be a lie
+  anyone could edit to say `admin`. Every failed sign-in -- unknown address, wrong password,
+  suspended account, role the gateway won't mint -- is **one message and one cost**
+  (`verify_password` hashes even when there is no account), because any difference is a way to
+  test whether an address is registered.
+- **`users.password_hash` is stored, never seen.** `app/security/passwords.py` owns the format
+  (PBKDF2-HMAC-SHA256, per-record salt, cost factor carried in the record so it can be raised
+  without invalidating anyone). The field policy already matches it as a secret field, so the
+  value is replaced on the way out of `app/db/executor.py` and no question can reach one; the
+  domains hide the column from reports as well, because a column of `[REDACTED]` is unhelpful
+  rather than unsafe. A new credential column needs nothing new -- it needs to match the existing
+  patterns.
+- **The widget's opening line comes from `GET /v1/me`, not from the widget.** What a person may
+  ask about is `app/security/roles.py`'s answer, and a greeting written in JavaScript is a second
+  copy of it in the one place that cannot see it -- so a customer would be invited to "ask about
+  your orders, customers or vendors" and then refused for two thirds of it. `app/messages.py`
+  owns the wording, like every other non-answer string; `data-greeting` on the script tag is the
+  host's override and skips the request entirely.
+- **The landing page's admin sections are stripped server-side.** `app/api/server.py::landing`
+  removes the endpoint reference and the embedding guide from the HTML for anyone whose signed
+  cookie doesn't say `admin`. Hiding them with CSS would ship them to everyone and call it a
+  preference; this is the same "by construction, not by remembering" shape as
+  `scope_spec_to_domain`, applied to a page.
+- **`app/api/static/widget.js` writes every server-provided string with `textContent`.** Slack
+  renders text; a browser renders markup. Answers are generated from database rows, so an
+  `innerHTML` path here turns one poisoned row into stored XSS on every customer site embedding
+  the widget. There is deliberately no HTML-rendering code in that file at all — the safety comes
+  from having nothing to forget to escape, and `tests/test_api.py` asserts `textContent` is still
+  in the served script.
+- **Streamed tokens go through the redactor, never around it.**
+  `app/security/output_scanner.py::scan_output_for_pii` runs on *finished* prose -- for a stream
+  that is long after a card number has been displayed -- and re-scanning each chunk alone catches
+  nothing, because a number split across two chunks matches neither half. `StreamingRedactor`
+  releases text only up to a character no pattern can match. **That set (`_UNSAFE_IN_A_MATCH`) is
+  derived from the patterns directly above it: a new pattern must use only those characters, or
+  widen the set.** A pattern needing letters would make almost nothing a safe cut, at which point
+  the strategy needs rethinking rather than patching. `tests/test_output_scanner.py` asserts the
+  property that matters -- streaming *any* chunking of a text equals scanning the whole text.
+- **Anything shared across replicas must be atomic in the backend, not assembled in Python.**
+  `app/state/backend.py` deliberately exposes `incr` and `allow_in_window` as primitives rather
+  than a general key-value map. Read-modify-write over `get`/`set` is a race: two replicas both
+  read 19, both write 20, and 21 calls have been spent against a budget of 20 -- while the budget
+  still reports itself as enforced. A new shared guardrail extends that protocol; it does not
+  build its own read-then-write on top of the existing primitives.
 - **`MONGODB_URI` must be a read-only credential.** The app-layer checks above are a second
-  layer, not a substitute.
+  layer, not a substitute. `app/db/accounts.py` is the single exception and is scoped to be one:
+  it is the only module in `app/` that writes, its two callers are the dev playground's sign-up
+  form and an offline CLI, and against a read-only credential it fails loudly with a message
+  saying so rather than silently degrading. Nothing on the question path may import it.
 - **Config lives only in `app/config.py`.** New env vars go through `Settings.__init__` via the
   `_require`/`_int`/`_float`/`_parse_list` helpers (which raise naming the offending variable),
   not scattered `os.environ` reads elsewhere.
@@ -184,11 +349,39 @@ Every Gemini call funnels through `GeminiClient._call_with_retry`:
 
 - **Every stateful guardrail is in-process only**: `answer_cache`, `clarification_cache`,
   `conversation_context_cache`, `context_switch_cache`, `rate_limiter`, `quota_tracker`,
-  `gemini_circuit_breaker`, and the `/login` vendor sessions in `app/slack/auth.py` are all
+  `gemini_circuit_breaker`, the `/login` vendor sessions in `app/slack/auth.py`, and the web
+  adapter's report `file_store` (`app/api/files.py`) are all
   module-level singletons with no shared backing store. This is
   *the* reason running more than one bot instance isn't a drop-in throughput fix today — each
   replica would enforce its own daily budget, cache, rate limit, and follow-up context
-  independently. Revisit with Mongo/Redis-backed state first if that's ever needed.
+  independently. Revisit with Mongo/Redis-backed state first if that's ever needed. The web
+  adapter adds one more reason: a download would have to land on the replica that generated the
+  file, since that's the only one holding the bytes.
+- **The web adapter does not stream.** `answer_question` returns a complete `AnswerResult`, so the
+  widget shows a typing indicator rather than tokens appearing. Streaming means an SSE endpoint
+  *and* a pipeline that yields — a real change through every layer, not a flag.
+- **The gateway authenticates nobody in production.** It takes a verified identity and a role as inputs; the
+  host application proves who someone is. That is why `/v1/identity/lookup` exists (the host app
+  needs to resolve an address without its own Mongo credential) and why the one-time-code flow
+  lives in `examples/supabase-app/otp.mjs` rather than in `app/`. Moving authentication into the
+  gateway would make it an identity provider, which is a different product with different
+  obligations. The one exception is deliberate and fenced: the dev playground's own sign-in form
+  (`/v1/dev/login`), which is off by default, loopback-only, and exists so a developer can see the
+  thing work before writing a host application.
+- **Contact details are invisible in *answers*, and available in *reports* only when switched
+  on.** The model is never shown them; `REPORT_INCLUDE_CONTACTS` adds the columns in code, after
+  the answer, to already-authorized rows. Making the bot *answer* contact questions needs a
+  role-aware field policy — the principal threaded into `app/db/executor.py` — and the field
+  policy is deliberately applied at a choke point where no role is in scope. The trade is stated
+  in `_CONTACT_FIELD_PATTERNS`; make it deliberately rather than by loosening the choke point.
+- **Revocation is bounded by the session TTL, not immediate.** JWTs are stateless, so disabling an
+  account stops new sign-ins (`WIDGET_VERIFY_ASSERTED_IDENTITY` re-checks at every renewal) and
+  leaves an issued token valid for up to `WIDGET_SESSION_TTL_SECONDS` — 15 minutes by default,
+  which *is* the mechanism rather than a workaround. A `revoked_before:{tenant}:{sub}` timestamp
+  in `app/state`, checked in `verify_session_token`, is the fix if that has to be instant.
+- **One conversation per web principal.** `SessionClaims.conversation_id` is `web:{tenant}:{sub}`,
+  mirroring a Slack DM; `reset` starts a new topic. Named threads would need a thread claim minted
+  server-side, and must stay server-side for the reason in the guardrails above.
 - **Conversational follow-up context (`app/rag/conversation_context.py`) is deliberately
   same-session, single-turn only** — it remembers one prior *resolved* question per
   (channel, user), not a growing transcript, and expires after
@@ -216,12 +409,23 @@ Every Gemini call funnels through `GeminiClient._call_with_retry`:
   dedicated "classify the intent" call previously cost a full quota unit per question to return
   one word, *and* called the transport without `query_generation_config` so it ran with thinking
   enabled. Don't reintroduce a standalone call for a decision the classify call can carry.
-- **Ids are resolved to names in code, not by a model-authored `$lookup`**
+- **Ids are resolved to the person in code, not by a model-authored `$lookup`**
   (`app/agents/enrichment.py`). A `$lookup` would need its own `usertype` scoping to avoid
   joining a customer row onto a vendor column — exactly what `scope_spec_to_domain` exists to
   keep out of the prompt's hands. The join is identical every time, so there is nothing for a
   model to decide. The id column is dropped once its name is in hand (but only then), so a
   report never shows `USR-00031` beside `Ayesha Khan`.
+  The same join answers **"orders with customer details"**, which used to be refused by both
+  domain agents at once -- orders because user fields aren't in its schema, customers because
+  order status isn't in theirs. The party's own columns (city, loyalty tier, category, rating)
+  ride along on the same `$in`, but only when the question asks about the *people*
+  (`wants_related_details` -- "customer details" yes, "order details" no), because attaching five
+  columns to every order export is a cost paid by every question to serve a few.
+  `DomainConfig.enriched_columns` is the single declaration the agent's prompt, the report column
+  order and enrichment all read, so none of them can believe in a different set. An attribute
+  constant on every row is dropped: a vendor's own orders all carry the same vendor, and those
+  columns spend table width restating the filter -- on a real PDF they pushed `created_at` past
+  `REPORT_MAX_COLUMNS` and off the page.
 - **Report presentation is declared per domain, not inferred**
   (`DomainConfig.report_columns` / `report_hidden_columns`). Mongo key order is an
   implementation detail; `report_columns` is the reading order. `report_hidden_columns` is a
@@ -233,6 +437,14 @@ Every Gemini call funnels through `GeminiClient._call_with_retry`:
 - **The report title comes from the classifier** (`Classification.report_title`), on the call
   that was happening anyway, so "last 10 incomplete order details in csv" produces a document
   titled *Last 10 Incomplete Order Details* rather than the generic `REPORT_TITLE`.
+- **A chart's *measure* is a count or a sum depending on the question, and getting it wrong is
+  invisible.** `choose_chart` used the first numeric column unconditionally; on an orders table
+  that is `amount`, so "how many orders are incomplete" drew a pie of *money* per status -- three
+  orders, one in each status, rendered 47.2% / 42.5% / 10.3% when every correct answer was 33.3%.
+  `ChartSpec.value_column is None` now means "count rows", chosen when the question asks how many
+  (`asks_for_a_count`). Nothing about a wrong measure looks wrong on the page, which is what makes
+  it worth a rule rather than a glance: the percentages are internally consistent, the labels are
+  right, and only the arithmetic against a question nobody re-reads is off.
 - **Chart type is chosen by rule, not by the model** (`app/generators/charts.py::choose_chart`):
   a temporal dimension is a line, few positive categories are a pie, everything else is a bar.
   The dimension is a column the question named (including via `_DIMENSION_SYNONYMS` — asking for
@@ -250,6 +462,11 @@ Every Gemini call funnels through `GeminiClient._call_with_retry`:
   `app/agents/graph.py` only handles "vendors near a customer[, with pending orders]" explicitly.
   Adding a second cross-domain pattern means extending that function, not writing a general
   dependency graph — a generic planner was deliberately deferred as speculative machinery.
+  The *other* cross-domain shape — "orders together with the customer's or vendor's own details"
+  — is deliberately **not** an anchor pattern and never fans out: it is one join, always the same,
+  so it belongs to `app/agents/enrichment.py`, and the classifier is told to keep such questions
+  single-domain. A question needing a second *query* is a planner problem; a question needing a
+  second *column* is not.
 - **Vector search, a chosen hosting target/CD pipeline, and external error tracking are
   out of scope for now** (see `CONTRIBUTING.md`) — deliberately deferred, not forgotten.
 - **`schema_summary.json`/`schema_annotations.json` are git-ignored and environment-specific.**
@@ -283,6 +500,13 @@ ever makes a real Slack/Mongo/Gemini call. Patterns to follow (don't introduce n
   `Settings` construction itself and does use `monkeypatch.setenv`).
 - `caplog.at_level(logging.INFO, logger="audit")` for anything that audit-logs.
 - One test per validator rule, both the pass and fail case (`tests/test_query_validator.py`).
+- `tests/test_api.py` covers the web adapter, and is organised around the one thing a browser
+  adds that Slack didn't: a client that will send whatever it is told to. The tests that matter
+  most there assert what *reaches* `answer_question` (scope, principal, conversation id) rather
+  than what the endpoint returns — a regression in any of those fails silently, answering happily
+  with the wrong person's rows. `answer_question` is patched to record its arguments; a
+  `@pytest.mark.answer_result(...)` marker sets what it returns, so the fake stays a fake rather
+  than growing a switch on the question text.
 - `tests/test_negative.py` is the adversarial suite, organised by *where the bad input comes
   from* (question / model output / database rows / infrastructure / boundaries), because that's
   what determines which guardrail should catch it. Its `assert_clean()` helper checks every reply
@@ -343,20 +567,86 @@ Lint (must pass before any PR, also pre-commit/CI gated): `ruff check .`, `ruff 
   `introspect.py` is picked up without a restart (there's a test for it). The memoization worth
   having is `_rendered_cache`, which skips re-rendering the prompt text, not the `stat`.
 
+- **An empty fan-out must still reach `synthesize`.** A domain refused *after* routing (a vendor
+  whose customer scope came back over the cap) leaves `_fan_out` with nothing to send, and an
+  empty `Send` list ends the graph with no `answer` key at all. It returns the string
+  `"synthesize"` in that case, which renders whatever is in `out_of_scope_by_domain`.
+- **`merge_forced_filter` combines clauses under `$and`, it does not merge dicts.** Two
+  restrictions on the same field must both hold — a vendor's own `vendor_id` and a geo anchor's
+  `$in` are not interchangeable — so a test asserting on a forced filter has to flatten the `$and`
+  rather than reading the top-level key (see `_flat` in `tests/test_graph.py`).
+- **In `app/state/memory.py`, `delete()` must clear all three maps.** Values, counters and
+  windows are separate dicts but one namespace to the caller. A `delete` that reached only the
+  value map is exactly why `CircuitBreaker.record_success()` silently failed to reset its own
+  failure count -- the breaker opened and never closed, and nothing raised.
+- **A non-positive TTL means "never expires", not "expire immediately".** That is the convention
+  the rest of the config uses for a zero setting, and `VENDOR_SESSION_TTL_SECONDS=0` depends on it
+  (there's a test). `app/api/files.py` is the deliberate exception: it clamps a non-positive TTL to
+  a short one, because "keep every generated report forever" is the wrong reading of a typo in the
+  one store that holds customers' query results.
+- **`GEMINI_MAX_RETRY_SECONDS` must exceed `GEMINI_REQUEST_TIMEOUT_MS`, or nothing slow is ever
+  retried.** The budget is measured from the start of the *first attempt* and covers the attempts
+  as well as the backoff, so a call that fails slowly has already spent it before the first retry
+  is considered — and the failures worth retrying (a 504, the client timeout itself) are slow by
+  construction. Shipped as 8s vs 15s, which meant `_is_retryable`'s explicit handling of
+  `httpx.TimeoutException` never once fired in production; a real `504 DEADLINE_EXCEEDED` at
+  12.1s was refused a retry and a configured fallback model went unused. `settings.
+  retry_budget_warning()` now says so at startup. Note the corollary when reading either number:
+  the budget bounds when an attempt may *start*, never how long it then runs, so a sweep's true
+  worst case is the budget plus one attempt per model.
+- **`GEMINI_REQUEST_TIMEOUT_MS` has a floor of 10000 imposed by the API, not by us.** Below it
+  Gemini rejects *every* call instantly with `400 INVALID_ARGUMENT: Manually set deadline 8s is
+  too short. Minimum allowed deadline is 10s.` -- so a smaller number does not tighten latency,
+  it stops the bot answering anything. An 8s default shipped and did exactly that. `app/config.py`
+  now clamps it up and `settings.gemini_timeout_warning()` says so at startup. The wider lesson:
+  a fully-mocked test suite cannot tell you an upstream refuses your configuration -- one real
+  call can, and is worth making before shipping a value the API has an opinion about.
+- **A 4xx from Gemini is not an outage and must not be described as one.** `classify_exception`
+  maps a non-429 4xx to `UNKNOWN` (reference code, "pass this to whoever runs the bot") rather
+  than `UPSTREAM_UNAVAILABLE` ("it usually recovers on its own within a few minutes"). A 400 is a
+  request this application got wrong; it will never recover, and telling users to wait sends the
+  one person who could fix it away from the problem.
+- **A retry test whose failures are instantaneous cannot see a budget being spent.** Every test in
+  `tests/test_gemini_retry.py` mocked `time.sleep` and raised immediately, under a 60s ceiling —
+  so they proved the retry *predicate* and were blind to the interaction that actually broke.
+  The ones that matter now drive a fake clock where a failure costs the request timeout.
+- **A per-model circuit breaker needs a per-model `name`.** `GeminiClient._breaker_for` keeps one
+  breaker per model because a shared one meant a model exhausting its daily quota tripped the
+  breaker for the healthy fallback models too. Now that breaker state is shared storage, the name
+  is what keeps them apart -- without it a shared backend silently re-merges them and the fallback
+  chain stops working again.
+- **`QueueSink.finish()` makes room by dropping progress; `token()`/`stage()` drop themselves.**
+  Blocking on a queue nobody is draining strands the worker thread answering the question -- a
+  leak that only appears with flaky clients. Progress is a courtesy; the answer is the contract.
+- **Gateway endpoints are `def`, not `async def`, and that is not an oversight.**
+  `answer_question` blocks (Gemini calls, Mongo round-trips, WeasyPrint). Starlette runs sync
+  endpoints in a worker thread; as `async def` the same code would hold the event loop for the
+  whole question and serialise every concurrent user behind it.
+- **Session tokens and file-download tokens are signed with the same key, so they carry a `typ`
+  claim.** Without it a download URL — which lands in browser history, the address bar and
+  referrers — would be accepted as proof of identity at `/v1/ask`. One claim closes a
+  confused-deputy bug that is otherwise invisible.
+- **A CSS class rule beats the user agent's `[hidden] { display: none }`.** `examples/supabase-app`
+  toggles sections with the `hidden` attribute, and `.stack { display: grid }` silently overrode
+  it — the signed-out page rendered the sign-in form *and* the signed-in chrome at once. The fix
+  is an explicit `[hidden] { display: none !important; }`; the lesson is that hiding by attribute
+  only works if the stylesheet says so.
 - **`isinstance` can't distinguish a test framework's log handler from a real `StreamHandler`**
   if the former subclasses the latter (pytest's `LogCaptureHandler` does) — `app/audit/logger.py`
   checks `type(h) is logging.StreamHandler` (exact type) for its idempotency guard, not
   `isinstance`, and not "handlers list is non-empty."
 - **LangGraph `Send(...)` payloads are a fresh dict, not the full graph state.** A fanned-out node
   (`domain_agent`) only sees what `_fan_out` explicitly puts in its payload — see how
-  `resolved_customer_location`/`resolved_vendor_ids`/`spec_cache`/`authenticated_vendor_id` are
-  threaded through deliberately in `app/agents/graph.py::_fan_out`, not implicitly inherited.
-  **This has already caused one silent security bug**: `authenticated_vendor_id` was set on the
-  top-level state but never added to the payload, so `_orders_id_filter`/`_vendors_id_filter`
-  read it from their own node's state, found nothing, and forced no vendor scoping — every
-  `/login` user saw every vendor's rows. Nothing raised; the answers were just wrong. Anything a
-  fanned-out node reads from state needs a test that asserts the *effect* (see
-  `tests/test_graph.py`'s RBAC tests), because a missing key here fails silently by design.
+  `resolved_customer_location`/`resolved_vendor_ids`/`spec_cache`/`principal`/
+  `authorized_customer_ids`/`stream_sink` are threaded through deliberately in
+  `app/agents/graph.py::_fan_out`, not implicitly inherited.
+  **This has already caused one silent security bug**: the authenticated scope was set on the
+  top-level state but never added to the payload, so the id filters read it from their own node's
+  state, found nothing, and forced no scoping — every `/login` user saw every vendor's rows.
+  Nothing raised; the answers were just wrong. `_principal(state)` now defaults a missing
+  principal to `ANONYMOUS`, which reads nothing, so the same omission fails closed rather than
+  open. Anything a fanned-out node reads from state still needs a test that asserts the *effect*
+  (see `tests/test_graph.py`'s RBAC tests), because a missing key here fails silently by design.
 - **A `QuerySpec` fetched from `spec_cache` must be deep-copied before mutation** — the same
   cached object is reused across call sites (anchor resolution and the real fan-out) that apply
   different `limit`/geo/id-filter overrides; mutating the shared instance would leak one site's

@@ -10,6 +10,12 @@ from app.rag.conversation_context import ConversationContextCache
 from app.rag.pipeline import answer_question
 from app.rag.query_spec import QueryError, QuerySpec
 from app.rag.rate_limiter import rate_limiter
+from app.security.roles import admin
+
+#: These tests exercise formats, caching and bad input -- not authorization -- so they run as
+#: an operator. Stated explicitly rather than inherited: answer_question defaults to ANONYMOUS,
+#: which can read nothing, so a forgotten principal fails loudly instead of seeing everything.
+ADMIN = admin()
 
 
 class _FakeCursor(list):
@@ -99,7 +105,10 @@ def _patch_shared_caches(monkeypatch, ttl_seconds=1800, max_entries=500):
 def test_query_error_short_circuits_to_error_message(monkeypatch):
     _patch_shared_caches(monkeypatch)
     gemini = _StubGemini(query_result=QueryError(error="I don't have data for that"))
-    assert answer_question("what's the weather?", gemini).text == "I don't have data for that"
+    assert (
+        answer_question("what's the weather?", gemini, principal=ADMIN).text
+        == "I don't have data for that"
+    )
 
 
 def test_hallucinated_collection_name_is_overridden_not_honored(monkeypatch):
@@ -119,7 +128,7 @@ def test_hallucinated_collection_name_is_overridden_not_honored(monkeypatch):
     monkeypatch.setattr("app.agents.graph.get_db", lambda: fake_db)
 
     gemini = _StubGemini(query_result=QuerySpec(collection="secrets", operation="find"))
-    answer_question("show me orders", gemini)
+    answer_question("show me orders", gemini, principal=ADMIN)
 
     assert queried_collections == ["orders"]
 
@@ -134,7 +143,7 @@ def test_successful_query_calls_generate_answer_with_rows(monkeypatch):
         query_result=QuerySpec(collection="orders", operation="find"), answer="there are 2 orders"
     )
 
-    result = answer_question("how many orders?", gemini)
+    result = answer_question("how many orders?", gemini, principal=ADMIN)
 
     assert result.text == "there are 2 orders"
     assert gemini.answer_calls == [{"orders": [{"amount": 10}, {"amount": 20}]}]
@@ -146,7 +155,7 @@ def test_empty_results_short_circuit_without_calling_generate_answer(monkeypatch
 
     gemini = _StubGemini(query_result=QuerySpec(collection="orders", operation="find"))
 
-    result = answer_question("orders from Mars?", gemini)
+    result = answer_question("orders from Mars?", gemini, principal=ADMIN)
 
     assert "nothing matched that" in result.text
     assert gemini.answer_calls == []
@@ -161,7 +170,7 @@ def test_successful_query_logs_per_stage_timings(monkeypatch, caplog):
     )
 
     with caplog.at_level(logging.INFO, logger="audit"):
-        answer_question("how many orders?", gemini)
+        answer_question("how many orders?", gemini, principal=ADMIN)
 
     event = caplog.records[-1].event
     assert {"classify_ms", "orders_agent_ms", "synthesize_ms", "graph_ms"} <= set(event["timings"])
@@ -176,7 +185,7 @@ def test_query_generation_failure_still_returns_a_graceful_message(monkeypatch, 
             raise TimeoutError("The read operation timed out")
 
     with caplog.at_level(logging.INFO, logger="audit"):
-        result = answer_question("how many cash orders?", _SlowFailingGemini())
+        result = answer_question("how many cash orders?", _SlowFailingGemini(), principal=ADMIN)
 
     assert "Something went wrong" in result.text
     event = caplog.records[-1].event
@@ -201,7 +210,7 @@ def test_rate_limit_error_gives_a_clean_message_not_the_raw_api_payload(monkeypa
                 },
             )
 
-    result = answer_question("how many orders?", _RateLimitedGemini())
+    result = answer_question("how many orders?", _RateLimitedGemini(), principal=ADMIN)
 
     assert "rate-limited" in result.text
     assert "RESOURCE_EXHAUSTED" not in result.text
@@ -222,6 +231,7 @@ def test_answer_generation_failure_is_handled_gracefully(monkeypatch, caplog):
         result = answer_question(
             "how many orders?",
             _FailsOnAnswerGemini(query_result=QuerySpec(collection="orders", operation="find")),
+            principal=ADMIN,
         )
 
     assert "Something went wrong" in result.text
@@ -235,8 +245,8 @@ def test_repeated_question_in_same_channel_is_served_from_cache(monkeypatch):
         query_result=QuerySpec(collection="orders", operation="find"), answer="cached answer"
     )
 
-    first = answer_question("How many orders?", gemini, channel_id="C1")
-    second = answer_question("  how many orders?  ", gemini, channel_id="C1")
+    first = answer_question("How many orders?", gemini, channel_id="C1", principal=ADMIN)
+    second = answer_question("  how many orders?  ", gemini, channel_id="C1", principal=ADMIN)
 
     assert first.text == second.text == "cached answer"
     assert gemini.query_spec_calls == 1
@@ -251,8 +261,8 @@ def test_cache_is_scoped_per_channel(monkeypatch):
         query_result=QuerySpec(collection="orders", operation="find"), answer="answer"
     )
 
-    answer_question("how many orders?", gemini, channel_id="C1")
-    answer_question("how many orders?", gemini, channel_id="C2")
+    answer_question("how many orders?", gemini, channel_id="C1", principal=ADMIN)
+    answer_question("how many orders?", gemini, channel_id="C2", principal=ADMIN)
 
     assert gemini.query_spec_calls == 2
 
@@ -266,9 +276,9 @@ def test_cache_hit_logs_cache_hit_true(monkeypatch, caplog):
     )
 
     with caplog.at_level(logging.INFO, logger="audit"):
-        answer_question("how many orders?", gemini, channel_id="C1")
+        answer_question("how many orders?", gemini, channel_id="C1", principal=ADMIN)
         first_event = caplog.records[-1].event
-        answer_question("how many orders?", gemini, channel_id="C1")
+        answer_question("how many orders?", gemini, channel_id="C1", principal=ADMIN)
         second_event = caplog.records[-1].event
 
     assert first_event["cache_hit"] is False
@@ -280,8 +290,8 @@ def test_quota_exceeded_responses_are_not_cached(monkeypatch):
     monkeypatch.setattr("app.rag.pipeline.quota_tracker.is_over_budget", lambda: True)
     gemini = _StubGemini(query_result=QuerySpec(collection="orders", operation="find"))
 
-    answer_question("how many orders?", gemini, channel_id="C1")
-    answer_question("how many orders?", gemini, channel_id="C1")
+    answer_question("how many orders?", gemini, channel_id="C1", principal=ADMIN)
+    answer_question("how many orders?", gemini, channel_id="C1", principal=ADMIN)
 
     assert gemini.query_spec_calls == 0
 
@@ -290,8 +300,8 @@ def test_query_error_responses_are_cached(monkeypatch):
     _patch_shared_caches(monkeypatch, ttl_seconds=60, max_entries=10)
     gemini = _StubGemini(query_result=QueryError(error="I don't have data for that"))
 
-    first = answer_question("what's the weather?", gemini, channel_id="C1")
-    second = answer_question("what's the weather?", gemini, channel_id="C1")
+    first = answer_question("what's the weather?", gemini, channel_id="C1", principal=ADMIN)
+    second = answer_question("what's the weather?", gemini, channel_id="C1", principal=ADMIN)
 
     assert first.text == second.text == "I don't have data for that"
     assert gemini.query_spec_calls == 1
@@ -302,8 +312,8 @@ def test_no_rows_found_responses_are_cached(monkeypatch):
     monkeypatch.setattr("app.agents.graph.get_db", lambda: _fake_db([]))
     gemini = _StubGemini(query_result=QuerySpec(collection="orders", operation="find"))
 
-    answer_question("orders from Mars?", gemini, channel_id="C1")
-    answer_question("orders from Mars?", gemini, channel_id="C1")
+    answer_question("orders from Mars?", gemini, channel_id="C1", principal=ADMIN)
+    answer_question("orders from Mars?", gemini, channel_id="C1", principal=ADMIN)
 
     assert gemini.query_spec_calls == 1
 
@@ -321,8 +331,8 @@ def test_gemini_exceptions_are_not_cached(monkeypatch):
 
     gemini = _AlwaysFailingGemini()
 
-    answer_question("how many cash orders?", gemini, channel_id="C1")
-    answer_question("how many cash orders?", gemini, channel_id="C1")
+    answer_question("how many cash orders?", gemini, channel_id="C1", principal=ADMIN)
+    answer_question("how many cash orders?", gemini, channel_id="C1", principal=ADMIN)
 
     assert gemini.calls == 2
 
@@ -333,7 +343,9 @@ def test_low_confidence_classification_asks_a_clarifying_question(monkeypatch):
         domains=[], confidence=0.1, clarification_question="which one do you mean?"
     )
 
-    result = answer_question("show me active ones nearby", gemini, channel_id="C1", user_id="U1")
+    result = answer_question(
+        "show me active ones nearby", gemini, channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
     assert result.text == "which one do you mean?"
 
@@ -358,10 +370,12 @@ def test_clarification_followup_is_merged_with_original_question(monkeypatch):
 
     gemini = _ClarifyThenAnswerGemini(query_result=QuerySpec(collection="orders", operation="find"))
 
-    first = answer_question("show me active ones", gemini, channel_id="C1", user_id="U1")
+    first = answer_question(
+        "show me active ones", gemini, channel_id="C1", user_id="U1", principal=ADMIN
+    )
     assert first.text == "active what -- customers or vendors?"
 
-    second = answer_question("orders", gemini, channel_id="C1", user_id="U1")
+    second = answer_question("orders", gemini, channel_id="C1", user_id="U1", principal=ADMIN)
     assert "the answer" in second.text
     # The follow-up's classification call should have seen both the original question and the
     # follow-up merged together, not just "orders" in isolation.
@@ -389,7 +403,9 @@ def test_reset_command_clears_clarification_conversation_and_switch_state(monkey
         def generate_structured(self, prompt, schema):
             raise AssertionError("classify should not run for a reset command")
 
-    result = answer_question("reset", _ExplodingGemini(), channel_id="C1", user_id="U1")
+    result = answer_question(
+        "reset", _ExplodingGemini(), channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
     assert "cleared our conversation context" in result.text
     assert pipeline_module.clarification_cache.get(key) is None
@@ -408,7 +424,9 @@ def test_reset_command_recognizes_common_phrasings(monkeypatch, phrase):
         def generate_structured(self, prompt, schema):
             raise AssertionError("classify should not run for a reset command")
 
-    result = answer_question(phrase, _ExplodingGemini(), channel_id="C1", user_id="U1")
+    result = answer_question(
+        phrase, _ExplodingGemini(), channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
     assert "cleared our conversation context" in result.text
 
@@ -424,7 +442,9 @@ def test_reset_command_bypasses_rate_limiter_and_quota(monkeypatch):
         def generate_structured(self, prompt, schema):
             raise AssertionError("classify should not run for a reset command")
 
-    result = answer_question("reset", _ExplodingGemini(), channel_id="C1", user_id="U1")
+    result = answer_question(
+        "reset", _ExplodingGemini(), channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
     assert "cleared our conversation context" in result.text
 
@@ -438,7 +458,7 @@ def test_reset_command_is_never_served_from_or_written_to_answer_cache(monkeypat
         def generate_structured(self, prompt, schema):
             raise AssertionError("classify should not run for a reset command")
 
-    answer_question("reset", _ExplodingGemini(), channel_id="C1", user_id="U1")
+    answer_question("reset", _ExplodingGemini(), channel_id="C1", user_id="U1", principal=ADMIN)
 
     cache_key = pipeline_module.answer_cache.make_key("C1", "reset")
     assert pipeline_module.answer_cache.get(cache_key) is None
@@ -453,7 +473,11 @@ def test_message_merely_containing_reset_word_is_not_treated_as_a_reset_command(
         answer="12 orders were reset",
     )
     result = answer_question(
-        "how many orders did we reset last week?", gemini, channel_id="C1", user_id="U1"
+        "how many orders did we reset last week?",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+        principal=ADMIN,
     )
 
     assert result.text == "12 orders were reset"
@@ -499,11 +523,17 @@ def test_followup_question_reuses_previous_turn_context(monkeypatch):
     gemini = _ContextAwareGemini()
 
     first = answer_question(
-        "how many orders did vendor V1 have last week?", gemini, channel_id="C1", user_id="U1"
+        "how many orders did vendor V1 have last week?",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+        principal=ADMIN,
     )
     assert first.text == "answered: how many orders did vendor V1 have last week?"
 
-    second = answer_question("what about the grand total?", gemini, channel_id="C1", user_id="U1")
+    second = answer_question(
+        "what about the grand total?", gemini, channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
     assert second.text == "answered: what is the grand total of orders vendor V1 had last week?"
     # The second turn's classify prompt must have seen the first turn's resolved question.
@@ -542,10 +572,14 @@ def test_unrelated_followup_question_asks_for_confirmation_before_answering(monk
 
     gemini = _ContextAwareGemini()
     answer_question(
-        "how many orders did vendor V1 have last week?", gemini, channel_id="C1", user_id="U1"
+        "how many orders did vendor V1 have last week?",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+        principal=ADMIN,
     )
     result = answer_question(
-        "how many orders were placed today?", gemini, channel_id="C1", user_id="U1"
+        "how many orders were placed today?", gemini, channel_id="C1", user_id="U1", principal=ADMIN
     )
 
     assert "how many orders did vendor V1 have last week?" in result.text
@@ -574,11 +608,17 @@ def test_confirming_a_context_switch_answers_the_candidate_question_fresh(monkey
 
     gemini = _ContextAwareGemini()
     answer_question(
-        "how many orders did vendor V1 have last week?", gemini, channel_id="C1", user_id="U1"
+        "how many orders did vendor V1 have last week?",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+        principal=ADMIN,
     )
-    answer_question("how many orders were placed today?", gemini, channel_id="C1", user_id="U1")
+    answer_question(
+        "how many orders were placed today?", gemini, channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
-    result = answer_question("yes", gemini, channel_id="C1", user_id="U1")
+    result = answer_question("yes", gemini, channel_id="C1", user_id="U1", principal=ADMIN)
 
     assert result.text == "answered: how many orders were placed today?"
 
@@ -605,11 +645,17 @@ def test_declining_a_context_switch_keeps_the_old_context_and_asks_nothing_of_ge
 
     gemini = _ContextAwareGemini()
     answer_question(
-        "how many orders did vendor V1 have last week?", gemini, channel_id="C1", user_id="U1"
+        "how many orders did vendor V1 have last week?",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+        principal=ADMIN,
     )
-    answer_question("how many orders were placed today?", gemini, channel_id="C1", user_id="U1")
+    answer_question(
+        "how many orders were placed today?", gemini, channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
-    result = answer_question("no", gemini, channel_id="C1", user_id="U1")
+    result = answer_question("no", gemini, channel_id="C1", user_id="U1", principal=ADMIN)
 
     assert "sticking with our current conversation" in result.text
 
@@ -650,12 +696,18 @@ def test_ambiguous_reply_to_a_context_switch_prompt_is_treated_as_a_fresh_messag
 
     gemini = _ContextAwareGemini()
     answer_question(
-        "how many orders did vendor V1 have last week?", gemini, channel_id="C1", user_id="U1"
+        "how many orders did vendor V1 have last week?",
+        gemini,
+        channel_id="C1",
+        user_id="U1",
+        principal=ADMIN,
     )
-    answer_question("how many orders were placed today?", gemini, channel_id="C1", user_id="U1")
+    answer_question(
+        "how many orders were placed today?", gemini, channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
     result = answer_question(
-        "how many pending orders are there?", gemini, channel_id="C1", user_id="U1"
+        "how many pending orders are there?", gemini, channel_id="C1", user_id="U1", principal=ADMIN
     )
 
     assert result.text == "answered: how many pending orders are there?"
@@ -689,8 +741,8 @@ def test_pending_clarification_does_not_also_consult_conversation_context(monkey
 
     gemini = _ClarifyThenAnswerGemini(query_result=QuerySpec(collection="orders", operation="find"))
 
-    answer_question("show me active ones", gemini, channel_id="C1", user_id="U1")
-    answer_question("orders", gemini, channel_id="C1", user_id="U1")
+    answer_question("show me active ones", gemini, channel_id="C1", user_id="U1", principal=ADMIN)
+    answer_question("orders", gemini, channel_id="C1", user_id="U1", principal=ADMIN)
 
     assert "totally unrelated prior context" not in seen_prompts[-1]
 
@@ -704,7 +756,7 @@ def test_circuit_breaker_open_gives_a_clean_message_not_the_raw_exception(monkey
         def generate_structured(self, prompt, schema):
             raise CircuitBreakerOpenError("Gemini circuit breaker open after 5 failures")
 
-    result = answer_question("how many orders?", _BrokenCircuitGemini())
+    result = answer_question("how many orders?", _BrokenCircuitGemini(), principal=ADMIN)
 
     assert "can't reach the service" in result.text
 
@@ -717,10 +769,14 @@ def test_rate_limited_user_gets_a_clean_message_without_reaching_gemini(monkeypa
     monkeypatch.setattr(rate_limiter, "_limit", 1)
 
     gemini = _StubGemini()
-    first = answer_question("first question", gemini, channel_id="C1", user_id="U1")
+    first = answer_question(
+        "first question", gemini, channel_id="C1", user_id="U1", principal=ADMIN
+    )
     assert first.text == "the answer"
 
-    second = answer_question("second question", gemini, channel_id="C1", user_id="U1")
+    second = answer_question(
+        "second question", gemini, channel_id="C1", user_id="U1", principal=ADMIN
+    )
 
     assert "asking faster" in second.text
     assert gemini.query_spec_calls == 1  # the second call never reached Gemini
@@ -732,8 +788,10 @@ def test_rate_limit_is_scoped_per_user_not_shared_across_the_channel(monkeypatch
     monkeypatch.setattr(rate_limiter, "_limit", 1)
 
     gemini = _StubGemini()
-    answer_question("q from u1", gemini, channel_id="C1", user_id="U1")
-    other_user = answer_question("q from u2", gemini, channel_id="C1", user_id="U2")
+    answer_question("q from u1", gemini, channel_id="C1", user_id="U1", principal=ADMIN)
+    other_user = answer_question(
+        "q from u2", gemini, channel_id="C1", user_id="U2", principal=ADMIN
+    )
 
     assert other_user.text == "the answer"
 
@@ -744,7 +802,7 @@ def test_clarification_gives_up_after_max_rounds(monkeypatch):
 
     gemini = _StubGemini(domains=[], confidence=0.1, clarification_question="which one?")
 
-    answer_question("vague question", gemini, channel_id="C1", user_id="U1")
-    final = answer_question("still vague", gemini, channel_id="C1", user_id="U1")
+    answer_question("vague question", gemini, channel_id="C1", user_id="U1", principal=ADMIN)
+    final = answer_question("still vague", gemini, channel_id="C1", user_id="U1", principal=ADMIN)
 
     assert "still don't have enough information" in final.text

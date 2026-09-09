@@ -129,12 +129,21 @@ def _ordered_columns(rows: list[dict], preferred: list[str] | None = None) -> li
 
 
 def build_table(
-    name: str, rows: list[dict], preferred_columns: list[str] | None = None
+    name: str,
+    rows: list[dict],
+    preferred_columns: list[str] | None = None,
+    max_rows: int | None = None,
 ) -> ReportTable | None:
     """Build one bounded table, or None when there's nothing to show.
 
     `preferred_columns` defaults to the domain's declared order when `name` is a known domain,
     so callers don't have to look it up.
+
+    `max_rows` overrides the configured cap for this call -- that is how a per-role report limit
+    works (`settings.report_max_rows_for`). REPORT_MAX_ROWS remains the absolute ceiling: an
+    override can only lower it, never raise it, so a role can't be configured past the bound the
+    render pool was sized for. The truncation note is computed from the effective cap, so a
+    smaller table still says it was cut.
     """
     if not rows:
         return None
@@ -159,24 +168,27 @@ def build_table(
     columns = all_columns[:max_columns]
     dropped = all_columns[max_columns:]
 
-    max_rows = max(1, settings.report_max_rows)
-    visible_rows = rows[:max_rows]
+    ceiling = max(1, settings.report_max_rows)
+    effective_max_rows = ceiling if max_rows is None else max(1, min(max_rows, ceiling))
+    visible_rows = rows[:effective_max_rows]
 
     return ReportTable(
         name=name,
         headers=[humanize_header(c) for c in columns],
         rows=[[flatten_value(row.get(c)) for c in columns] for row in visible_rows],
         total_row_count=len(rows),
-        truncated_rows=len(rows) > max_rows,
+        truncated_rows=len(rows) > effective_max_rows,
         dropped_columns=dropped,
     )
 
 
-def build_tables(rows_by_domain: dict[str, list[dict]]) -> list[ReportTable]:
+def build_tables(
+    rows_by_domain: dict[str, list[dict]], max_rows: int | None = None
+) -> list[ReportTable]:
     """One table per domain that actually returned rows, in domain order."""
     tables = []
     for domain, rows in rows_by_domain.items():
-        table = build_table(domain, rows)
+        table = build_table(domain, rows, max_rows=max_rows)
         if table is not None:
             tables.append(table)
     return tables

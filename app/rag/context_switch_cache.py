@@ -1,4 +1,4 @@
-"""In-process TTL + LRU cache holding a not-yet-confirmed context switch.
+"""TTL cache holding a not-yet-confirmed context switch.
 
 When `app/agents/classifier.py` decides a message doesn't fit the still-live conversation
 (`Classification.context_mode == "new_topic"` while `app/rag/conversation_context.py` has a
@@ -7,19 +7,18 @@ the new message -- it asks the user to confirm first. The *candidate* question w
 the user replies; no Gemini call is spent generating a real answer for a question that might get
 abandoned by a "no".
 
-Same TTL+LRU shape as `app/rag/clarification_cache.py` and the same documented limitation:
-in-process, single-replica only.
+Storage is `app/state`'s TtlStore: in-process by default, and shared across replicas when
+STATE_BACKEND=redis -- without that, a follow-up answered by a different replica finds no pending
+state and is treated as an unrelated question.
 
 Keyed by (channel_id, user_id), like every other per-conversation cache in this package -- this
 is one user's specific back-and-forth, not something shareable across a channel.
 """
 
-import threading
-import time
-from collections import OrderedDict
 from dataclasses import dataclass
 
 from app.config import settings
+from app.state.store import TtlStore
 
 
 @dataclass(frozen=True)
@@ -28,12 +27,12 @@ class PendingContextSwitch:
 
 
 class ContextSwitchCache:
-    def __init__(self, ttl_seconds: float, max_entries: int) -> None:
-        self._ttl_seconds = ttl_seconds
-        self._max_entries = max_entries
-        self._lock = threading.Lock()
-        self._entries: OrderedDict[tuple[str, str], tuple[float, PendingContextSwitch]] = (
-            OrderedDict()
+    def __init__(self, ttl_seconds: float, max_entries: int, backend=None) -> None:
+        self._store = TtlStore(
+            namespace="context_switch",
+            ttl_seconds=ttl_seconds,
+            max_entries=max_entries,
+            backend=backend,
         )
 
     @staticmethod
@@ -41,27 +40,16 @@ class ContextSwitchCache:
         return (channel_id or "", user_id or "")
 
     def get(self, key: tuple[str, str]) -> PendingContextSwitch | None:
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                return None
-            inserted_at, value = entry
-            if time.monotonic() - inserted_at > self._ttl_seconds:
-                del self._entries[key]
-                return None
-            self._entries.move_to_end(key)
-            return value
+        payload = self._store.get_json(key)
+        if payload is None:
+            return None
+        return PendingContextSwitch(candidate_question=payload.get("candidate_question", ""))
 
     def set(self, key: tuple[str, str], value: PendingContextSwitch) -> None:
-        with self._lock:
-            self._entries[key] = (time.monotonic(), value)
-            self._entries.move_to_end(key)
-            while len(self._entries) > self._max_entries:
-                self._entries.popitem(last=False)
+        self._store.set_json(key, {"candidate_question": value.candidate_question})
 
     def clear(self, key: tuple[str, str]) -> None:
-        with self._lock:
-            self._entries.pop(key, None)
+        self._store.delete(key)
 
 
 context_switch_cache = ContextSwitchCache(

@@ -52,10 +52,22 @@ from app.messages import (
     failure_message,
     new_reference,
     no_data_message,
+    not_authorized_message,
     out_of_scope_message,
+    sign_in_required_message,
+    too_many_related_records_message,
 )
 from app.rag.query_spec import GeoNear, QueryError, QuerySpec
+from app.rag.stream import NULL_SINK
 from app.rag.validator import QueryValidationError, validate_query_spec
+from app.security.roles import (
+    ANONYMOUS,
+    Principal,
+    Role,
+    forced_filter,
+    may_query,
+    needs_authorized_customers,
+)
 
 logger = logging.getLogger("audit")
 
@@ -150,6 +162,7 @@ def _generate_validate_execute(
 def _classify_node(gemini: GeminiClient):
     def node(state: GraphState) -> dict:
         start = time.perf_counter()
+        _sink(state).stage("understanding")
         classification = classify_question(
             gemini, state["question"], previous_question=state.get("previous_question")
         )
@@ -168,6 +181,27 @@ def _classify_node(gemini: GeminiClient):
         }
 
     return node
+
+
+def _sink(state: GraphState):
+    """The stream sink for this invocation, or the no-op one.
+
+    Every node goes through this rather than `state["stream_sink"]` directly: the key is absent
+    on every Slack request and on any node whose Send payload forgot it, and a KeyError on the
+    answer path would be a spectacular way to fail at emitting a progress message.
+    """
+    return state.get("stream_sink") or NULL_SINK
+
+
+def _principal(state: GraphState) -> Principal:
+    """The identity this invocation is answered under.
+
+    Defaults to ANONYMOUS -- which can read nothing -- rather than to an unrestricted principal.
+    A node that reads this from a `Send` payload that forgot to include it therefore refuses,
+    instead of quietly answering from every row. The previous shape defaulted the other way and
+    that is exactly how the `/login` scoping was silently disabled once before.
+    """
+    return state.get("principal") or ANONYMOUS
 
 
 def _effective_question(state: GraphState) -> str:
@@ -190,7 +224,28 @@ def _route_after_classify(state: GraphState) -> str:
     # just an ordinary question and goes straight to resolve_anchors as before.
     if c.context_mode == "new_topic" and state.get("previous_question"):
         return "confirm_context_switch"
+    # Authorization is checked here, before anything is generated or queried: a question this
+    # principal may not have answered at all should cost nothing. A *partial* refusal (one of two
+    # domains) carries on and is reported per-domain by _resolve_anchors_node.
+    if _principal(state).role is Role.ANONYMOUS or not _authorized_domains(state):
+        return "deny"
     return "resolve_anchors"
+
+
+def _deny_node(state: GraphState) -> dict:
+    """Nothing this principal may read was asked for.
+
+    Two different messages because the fix is different: an anonymous caller has to sign in,
+    while a signed-in one is asking for someone else's data and no amount of retrying will help.
+    Neither says whether the data exists -- "there are none" and "not yours" must be
+    indistinguishable, or a refusal becomes a lookup tool.
+    """
+    principal = _principal(state)
+    if principal.role is Role.ANONYMOUS:
+        answer = sign_in_required_message()
+    else:
+        answer = not_authorized_message(state["classification"].domains)
+    return {"answer": answer, "not_authorized": True}
 
 
 def _clarify_node(state: GraphState) -> dict:
@@ -212,17 +267,81 @@ def _confirm_context_switch_node(state: GraphState) -> dict:
     }
 
 
+def _resolve_authorized_customer_ids(db, vendor_id: str) -> list[str] | None:
+    """The customers who have ordered from `vendor_id`, or None if there are too many.
+
+    Written in code, not generated: this is an authorization boundary, and the one thing that must
+    never depend on a model producing the right filter. It is the same reasoning as
+    `app/agents/enrichment.py` -- the query is identical every time, so there is nothing for a
+    model to decide.
+
+    Bounded by `RBAC_MAX_AUTHORIZED_IDS`, and returning None past the cap rather than a truncated
+    list. A truncated list would silently answer "your customers in Karachi" from an arbitrary
+    subset while looking complete, which is worse than refusing -- the caller turns None into a
+    message telling the user to narrow the question.
+    """
+    cap = settings.rbac_max_authorized_ids
+    rows = db["orders"].aggregate(
+        [
+            {"$match": {"vendor_id": vendor_id}},
+            {"$group": {"_id": "$customer_id"}},
+            # One past the cap, so "exactly at the limit" and "over it" are distinguishable.
+            {"$limit": cap + 1},
+        ],
+        maxTimeMS=settings.mongodb_query_timeout_ms,
+    )
+    ids = [row["_id"] for row in rows if row.get("_id")]
+    if len(ids) > cap:
+        return None
+    return ids
+
+
 def _resolve_anchors_node(gemini: GeminiClient):
     def node(state: GraphState) -> dict:
         classification: Classification = state["classification"]
         domains = set(classification.domains)
-        if not (classification.needs_geo and "vendors" in domains):
-            return {}
+        principal = _principal(state)
+        update: dict = {}
 
+        # Partial refusal: the authorized half of the question still gets answered, and the
+        # refused half is reported through the existing per-domain "declined" channel rather than
+        # a new one -- app/messages.py::out_of_scope_message already renders that readably, and
+        # _synthesize_node already tells the model what was skipped so it can judge whether the
+        # gap matters.
+        # The same slice _authorized_domains applies, so a domain dropped by the fan-out cap
+        # isn't reported to the user as an authorization refusal.
+        considered = classification.domains[: settings.agent_max_fan_out]
+        denied = [d for d in considered if not may_query(principal, d)]
+        if denied:
+            update["out_of_scope_by_domain"] = {d: not_authorized_message([d]) for d in denied}
+
+        if any(needs_authorized_customers(principal, d) for d in domains):
+            start = time.perf_counter()
+            authorized = _resolve_authorized_customer_ids(get_db(), principal.user_id or "")
+            if authorized is None:
+                update["out_of_scope_by_domain"] = {
+                    **update.get("out_of_scope_by_domain", {}),
+                    "customers": too_many_related_records_message("customers"),
+                }
+                # An empty list, not None: forced_filter turns None into an impossible filter, and
+                # the domain is being refused above anyway. Leaving it unset would be the one
+                # shape that could reach a query with no restriction.
+                update["authorized_customer_ids"] = []
+            else:
+                update["authorized_customer_ids"] = authorized
+            update.setdefault("timings", {})["resolve_authorized_customers_ms"] = round(
+                (time.perf_counter() - start) * 1000, 2
+            )
+
+        if not (classification.needs_geo and "vendors" in domains):
+            return update
+
+        _sink(state).stage("locating")
         question = _effective_question(state)
         spec_cache = state.get("spec_cache")
-        timings: dict[str, float] = {}
-        update: dict = {}
+        # Seeded from what the authorization step above already recorded, not a fresh dict: the
+        # final `update["timings"] = timings` would otherwise drop it.
+        timings: dict[str, float] = dict(update.get("timings", {}))
 
         start = time.perf_counter()
         customer_location: dict | None = None
@@ -261,9 +380,35 @@ def _resolve_anchors_node(gemini: GeminiClient):
     return node
 
 
-def _fan_out(state: GraphState) -> list[Send]:
+def _authorized_domains(state: GraphState) -> list[str]:
+    """The classifier's domains, minus any this principal may not read at all.
+
+    Filtered here, before any Send is issued, so a refused domain costs no Gemini generation call
+    and no Mongo round-trip. _resolve_anchors_node records what was refused in
+    `out_of_scope_by_domain`, so a two-domain question says which half it couldn't cover rather
+    than silently answering half of it.
+    """
+    principal = _principal(state)
     classification = state["classification"]
-    domains = classification.domains[: settings.agent_max_fan_out]
+    return [
+        d for d in classification.domains[: settings.agent_max_fan_out] if may_query(principal, d)
+    ]
+
+
+def _fan_out(state: GraphState) -> list[Send] | str:
+    # Already-refused domains are dropped here as well as in _authorized_domains: a vendor whose
+    # customer scope came back too large to apply has had `customers` refused by
+    # _resolve_anchors_node, and fanning out to it anyway would spend a Gemini generation call and
+    # a Mongo round-trip producing rows the answer must then ignore.
+    refused = set(state.get("out_of_scope_by_domain") or {})
+    domains = [d for d in _authorized_domains(state) if d not in refused]
+    if not domains:
+        # Everything was refused *after* routing -- the only way here is a scope that had to be
+        # computed and came back unusable (a vendor with more customers than the cap). Returning
+        # an empty list would end the graph with no `answer` at all, so go straight to synthesize,
+        # which renders whatever is in out_of_scope_by_domain. Reachable only in that case:
+        # _route_after_classify already sends a wholly-unauthorized question to `deny`.
+        return "synthesize"
     sends = []
     for domain_name in domains:
         payload: dict = {
@@ -271,15 +416,24 @@ def _fan_out(state: GraphState) -> list[Send]:
             "domain": domain_name,
             # Threaded explicitly because a Send payload is a fresh dict, NOT the graph state:
             # a fanned-out node sees only what is put here. Omitting this silently disabled the
-            # whole `/login` guardrail -- _orders_id_filter/_vendors_id_filter read it from
-            # their node's state, found nothing, and forced no vendor scoping at all, so an
-            # authenticated vendor saw every vendor's rows. Nothing failed; the answers were
-            # just wrong.
-            "authenticated_vendor_id": state.get("authenticated_vendor_id"),
+            # whole `/login` guardrail -- the id filters (now `_domain_filter`) read the scope
+            # from their own node's state, found nothing, and forced none at all, so an
+            # authenticated vendor saw every vendor's rows. Nothing failed; the answers were just
+            # wrong. `_principal(state)` now defaults a missing one to ANONYMOUS, which reads
+            # nothing -- so the same mistake fails loudly instead.
+            "principal": _principal(state),
+            # Resolved in _resolve_anchors_node. Threaded explicitly for the same reason as
+            # everything else here: a Send payload is a fresh dict, and a missing key would make a
+            # vendor's customers query fail *open* if forced_filter treated None as "no filter" --
+            # which is precisely why it doesn't (see app/security/roles.py).
+            "authorized_customer_ids": state.get("authorized_customer_ids"),
             # Shared with _resolve_anchors_node so a domain already queried while resolving a
             # cross-domain anchor (customers/vendors, in the geo composite pattern) doesn't pay
             # for an identical Gemini generation call a second time here.
             "spec_cache": state.get("spec_cache"),
+            # Same reason as the principal above: a Send payload is a fresh dict, so a
+            # sink left out here means a silently un-streamed fan-out rather than an error.
+            "stream_sink": _sink(state),
         }
         if domain_name == "vendors" and "resolved_customer_location" in state:
             payload["resolved_customer_location"] = state["resolved_customer_location"]
@@ -292,26 +446,36 @@ def _fan_out(state: GraphState) -> list[Send]:
     return sends
 
 
-def _orders_id_filter(state: GraphState) -> dict | None:
+def _domain_filter(state: GraphState, domain_name: str) -> dict | None:
+    """The row restriction for this principal and domain, merged into the generated query in code.
+
+    The policy itself lives in `app/security/roles.py` -- this only supplies the two things the
+    policy cannot know: which customer ids a vendor is entitled to (resolved in
+    `_resolve_anchors_node`), and the anchor ids a cross-domain geo question resolved.
+
+    Both kinds of restriction are merged, not chosen between: a vendor asking "which of my
+    customers are near me?" must be limited to *their* customers **and** the geo anchor, and
+    keeping only one of the two would answer a question they didn't ask.
+    """
     forced: dict = {}
 
-    # RBAC: Restrict vendor to their own orders
-    auth_vendor = state.get("authenticated_vendor_id")
-    if auth_vendor:
-        forced["vendor_id"] = auth_vendor
-    elif state.get("resolved_vendor_ids"):
-        forced["vendor_id"] = {"$in": state["resolved_vendor_ids"]}
+    authorization = forced_filter(
+        _principal(state),
+        domain_name,
+        authorized_customer_ids=state.get("authorized_customer_ids"),
+    )
+    if authorization:
+        forced.update(authorization)
 
-    if state.get("resolved_customer_ids"):
-        forced["customer_id"] = {"$in": state["resolved_customer_ids"]}
-    return forced or None
+    if domain_name == "orders":
+        # Anchors from a cross-domain geo question. Applied only where authorization hasn't
+        # already pinned the same field -- a vendor's own vendor_id is not negotiable, and an
+        # anchor set must never widen it.
+        if "vendor_id" not in forced and state.get("resolved_vendor_ids"):
+            forced["vendor_id"] = {"$in": state["resolved_vendor_ids"]}
+        if "customer_id" not in forced and state.get("resolved_customer_ids"):
+            forced["customer_id"] = {"$in": state["resolved_customer_ids"]}
 
-
-def _vendors_id_filter(state: GraphState) -> dict | None:
-    forced: dict = {}
-    auth_vendor = state.get("authenticated_vendor_id")
-    if auth_vendor:
-        forced["user_id"] = auth_vendor
     return forced or None
 
 
@@ -320,16 +484,15 @@ def _domain_agent_node(gemini: GeminiClient):
         domain_name = state["domain"]
         question = state["question"]
         start = time.perf_counter()
+        # Named rather than generic: fanned-out agents run concurrently, so "querying orders" and
+        # "querying customers" arriving together is the honest picture of what is happening.
+        _sink(state).stage("querying", domain_name)
 
         geo_override_location = (
             state.get("resolved_customer_location") if domain_name == "vendors" else None
         )
 
-        id_filter = None
-        if domain_name == "orders":
-            id_filter = _orders_id_filter(state)
-        elif domain_name == "vendors":
-            id_filter = _vendors_id_filter(state)
+        id_filter = _domain_filter(state, domain_name)
 
         spec, rows, error, out_of_scope, failure = _generate_validate_execute(
             gemini,
@@ -348,7 +511,13 @@ def _domain_agent_node(gemini: GeminiClient):
             # outcome than a report that shows ids.
             try:
                 rows = enrich_rows_with_names(
-                    get_db(), rows, timeout_ms=settings.mongodb_query_timeout_ms
+                    get_db(),
+                    rows,
+                    timeout_ms=settings.mongodb_query_timeout_ms,
+                    # The question decides whether the *party's* own columns come too -- see
+                    # enrichment.wants_related_details. `question` here is already the resolved
+                    # one (_fan_out passes it), so a follow-up asking for "their details" works.
+                    question=question,
                 )
             except Exception:  # noqa: BLE001 -- enrichment is presentation, not correctness
                 logger.warning("name_enrichment_failed", extra={"event": {"domain": domain_name}})
@@ -398,9 +567,23 @@ def _synthesize_node(gemini: GeminiClient):
                 answer = no_data_message(list(rows_by_domain) or state["classification"].domains)
         else:
             skipped = {**out_of_scope_by_domain, **errors_by_domain}
-            answer = gemini.generate_answer(
-                _effective_question(state), rows_by_domain, skipped or None
-            )
+            sink = _sink(state)
+            sink.stage("writing")
+            # Streamed only when someone is listening. The Slack path holds NULL_SINK and takes
+            # the plain call, so it neither pays for streaming nor changes behaviour -- and
+            # `stream_answer` returns the same complete string either way, so everything
+            # downstream (the PII scan, the report builder, the cache) is identical.
+            if sink is NULL_SINK:
+                answer = gemini.generate_answer(
+                    _effective_question(state), rows_by_domain, skipped or None
+                )
+            else:
+                answer = gemini.stream_answer(
+                    _effective_question(state),
+                    rows_by_domain,
+                    skipped or None,
+                    on_text=sink.token,
+                )
 
         elapsed = round((time.perf_counter() - start) * 1000, 2)
         return {"answer": answer, "timings": {"synthesize_ms": elapsed}}
@@ -412,6 +595,7 @@ def build_graph(gemini: GeminiClient):
     graph = StateGraph(GraphState)
     graph.add_node("classify", _classify_node(gemini))
     graph.add_node("clarify", _clarify_node)
+    graph.add_node("deny", _deny_node)
     graph.add_node("confirm_context_switch", _confirm_context_switch_node)
     graph.add_node("resolve_anchors", _resolve_anchors_node(gemini))
     graph.add_node("domain_agent", _domain_agent_node(gemini))
@@ -421,11 +605,12 @@ def build_graph(gemini: GeminiClient):
     graph.add_conditional_edges(
         "classify",
         _route_after_classify,
-        ["clarify", "confirm_context_switch", "resolve_anchors"],
+        ["clarify", "confirm_context_switch", "deny", "resolve_anchors"],
     )
     graph.add_edge("clarify", END)
+    graph.add_edge("deny", END)
     graph.add_edge("confirm_context_switch", END)
-    graph.add_conditional_edges("resolve_anchors", _fan_out, ["domain_agent"])
+    graph.add_conditional_edges("resolve_anchors", _fan_out, ["domain_agent", "synthesize"])
     graph.add_edge("domain_agent", "synthesize")
     graph.add_edge("synthesize", END)
 

@@ -81,10 +81,20 @@ def test_an_expected_condition_carries_no_reference_code():
     assert "E-ABC123" not in failure_message(Failure.USER_RATE_LIMITED, "E-ABC123")
 
 
-def test_references_are_short_and_unique():
-    references = {new_reference() for _ in range(500)}
+def test_references_are_short_and_collide_rarely():
+    """Six hex characters: long enough not to collide within a log someone is actually reading,
+    short enough to retype from a screenshot.
 
-    assert len(references) == 500
+    Asserting *exact* uniqueness over 500 draws was flaky and had to be: 500 draws from a
+    16.7M space collide about 0.75% of the time by the birthday bound, which is a test that fails
+    roughly once every 130 runs for no reason at all. The property that actually matters is that
+    collisions are rare enough to be irrelevant when grepping a day of logs, so that is what this
+    asserts -- with a threshold far enough from the expected value (~1 collision at worst) to
+    stay green, and close enough to catch a real regression like truncating to three characters.
+    """
+    references = [new_reference() for _ in range(500)]
+
+    assert len(set(references)) >= 495
     assert all(r.startswith("E-") and len(r) == 8 for r in references)
 
 
@@ -106,6 +116,35 @@ def test_exceptions_map_to_the_right_failure(exc, expected):
 
 
 # --- no data is not an error ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("code", [400, 403, 404])
+def test_a_client_error_from_the_model_api_is_not_called_transient(code):
+    """A 4xx is a request *we* got wrong -- a malformed call, a retired model, a deadline the API
+    refuses. "It usually recovers on its own within a few minutes" is advice for a wait that never
+    ends: a real `400 INVALID_ARGUMENT: Manually set deadline 8s is too short` was reported to
+    users that way, and nobody waiting could have fixed it. It needs a reference and an operator.
+    """
+    failure = classify_exception(genai_errors.ClientError(code, {"error": {"message": "boom"}}))
+
+    assert failure is Failure.UNKNOWN
+    assert needs_reference(failure)
+
+
+def test_a_server_error_from_the_model_api_still_is_transient():
+    """A 5xx genuinely is worth waiting out, and telling someone to fetch an admin for one would
+    send them chasing an outage that fixes itself."""
+    failure = classify_exception(genai_errors.ServerError(503, {"error": {"message": "busy"}}))
+
+    assert failure is Failure.UPSTREAM_UNAVAILABLE
+
+
+def test_rate_limiting_keeps_its_own_message():
+    """429 is neither: it is expected, self-resolving, and gets no reference code."""
+    failure = classify_exception(genai_errors.ClientError(429, {"error": {"message": "quota"}}))
+
+    assert failure is Failure.UPSTREAM_RATE_LIMITED
+    assert not needs_reference(failure)
 
 
 def test_no_data_names_what_was_searched():

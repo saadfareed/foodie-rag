@@ -2,6 +2,7 @@
 testpaths = ["tests"]
 markers = [
     "uses_mongo_client: opts out of the conftest tripwire that refuses real MongoClient construction",
+    "answer_result: the AnswerResult the stubbed pipeline should return (tests/test_api.py)",
 ]
 
 [tool.ruff]

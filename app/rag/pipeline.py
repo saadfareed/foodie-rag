@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from app.agents.graph import build_graph
 from app.audit.logger import log_query_event
 from app.config import settings
+from app.db.identity import fetch_contacts
+from app.db.mongo import get_db
 from app.generators.csv_generator import generate_csv
 from app.generators.pdf_generator import generate_pdf
 from app.generators.render_pool import RenderTimeout, run_render
@@ -49,8 +51,10 @@ from app.rag.answer_cache import CachedResult, answer_cache
 from app.rag.clarification_cache import PendingClarification, clarification_cache
 from app.rag.context_switch_cache import PendingContextSwitch, context_switch_cache
 from app.rag.conversation_context import conversation_context_cache
-from app.rag.rate_limiter import rate_limiter
+from app.rag.rate_limiter import daily_question_limiter, rate_limiter
+from app.rag.stream import NULL_SINK, StreamSink
 from app.security.output_scanner import scan_output_for_pii
+from app.security.roles import ANONYMOUS, Principal, Role, may_see_contacts
 from app.services.intent_router import detect_explicit_format, refusal_reason
 
 logger = logging.getLogger("audit")
@@ -140,12 +144,48 @@ def _timed_stage(timings: dict[str, float], name: str) -> Iterator[None]:
         timings[name] = round((time.perf_counter() - start) * 1000, 2)
 
 
+def _with_contact_columns(
+    rows_by_domain: dict[str, list[dict]], principal: Principal
+) -> dict[str, list[dict]]:
+    """Add contact columns to the rows going into a report, where this principal may see them.
+
+    Runs **after** the answer, on the report path only, and never touches the rows the model was
+    shown -- `app/security/field_policy.py` strips these fields on the way out of MongoDB, so the
+    bot cannot be prompted into producing a contact list however the question is phrased. This
+    adds a column, in code, to rows the principal was already authorized to see.
+
+    Off unless REPORT_INCLUDE_CONTACTS is set: exposing contact details should be a deliberate
+    operator decision, not something that arrives with an upgrade.
+    """
+    if not settings.report_include_contacts or principal.role is Role.ANONYMOUS:
+        return rows_by_domain
+
+    enriched = dict(rows_by_domain)
+    for domain, rows in rows_by_domain.items():
+        if not rows or not may_see_contacts(principal, domain):
+            continue
+        # Only `users`-shaped rows carry a user_id to look up. An orders table references people
+        # by id, and those ids are resolved to *names* by app/agents/enrichment.py and then
+        # dropped -- deliberately, so a report doesn't show USR-00031 beside Ayesha Khan. Adding
+        # contacts there would mean re-introducing the id, which is a bigger change than this.
+        ids = [row.get("user_id") for row in rows if isinstance(row, dict)]
+        contacts = fetch_contacts(get_db(), [i for i in ids if i])
+        if not contacts:
+            continue
+        enriched[domain] = [
+            {**row, **contacts.get(row.get("user_id"), {})} if isinstance(row, dict) else row
+            for row in rows
+        ]
+    return enriched
+
+
 def _build_file(
     output_format: str,
     rows_by_domain: dict[str, list[dict]],
     question: str,
     answer: str,
     title: str,
+    max_rows: int | None = None,
 ) -> tuple[bytes, str] | None:
     """Render the requested deliverable, or None if it can't be produced.
 
@@ -160,9 +200,11 @@ def _build_file(
         return None
 
     builders = {
-        "csv": lambda: generate_csv(rows_by_domain, title=title),
-        "xlsx": lambda: generate_xlsx(rows_by_domain, title=title),
-        "pdf": lambda: generate_pdf(rows_by_domain, question=question, answer=answer, title=title),
+        "csv": lambda: generate_csv(rows_by_domain, title=title, max_rows=max_rows),
+        "xlsx": lambda: generate_xlsx(rows_by_domain, title=title, max_rows=max_rows),
+        "pdf": lambda: generate_pdf(
+            rows_by_domain, question=question, answer=answer, title=title, max_rows=max_rows
+        ),
     }
     builder = builders.get(output_format)
     if builder is None:
@@ -183,16 +225,34 @@ def answer_question(
     *,
     user_id: str | None = None,
     channel_id: str | None = None,
-    authenticated_vendor_id: str | None = None,
+    principal: Principal | None = None,
+    progress: StreamSink | None = None,
 ) -> AnswerResult:
+    """`principal` is who is asking, and therefore which rows the answer may be built from
+    (app/security/roles.py). It defaults to ANONYMOUS -- which can read nothing -- rather than to
+    an unrestricted identity: a caller that forgets to pass one gets a refusal, not everything.
+
+    `progress` receives stage and token events as the answer is built (app/rag/stream.py).
+
+    Optional, and a no-op sink by default, so the Slack adapter's behaviour is byte-identical:
+    it has nowhere to put a progress event, since a Slack message appears only when finished.
+    The events are a courtesy channel -- the returned AnswerResult is the same object either way,
+    and a caller that ignores them loses nothing.
+    """
     start = time.perf_counter()
     timings: dict[str, float] = {}
+    sink = progress or NULL_SINK
+    principal = principal or ANONYMOUS
 
     def _log(**kwargs) -> None:
         log_query_event(
             question=question,
             user_id=user_id,
             channel_id=channel_id,
+            # Role and principal, not just the Slack/browser user id: when authorization decides
+            # which rows an answer contains, the identity it was authorised under is the thing an
+            # auditor needs, and it isn't recoverable from the question afterwards.
+            **principal.audit_fields,
             duration_ms=(time.perf_counter() - start) * 1000,
             timings=timings,
             **kwargs,
@@ -262,13 +322,14 @@ def answer_question(
     # after the graph runs.
     explicit_format = detect_explicit_format(question)
 
-    # Scoping the key by the authenticated vendor is a correctness requirement, not a tuning
-    # knob: a vendor-scoped answer contains only that vendor's rows, so replaying it to a
-    # different asker in the same channel would leak across tenants.
+    # Scoping the key by the principal is a correctness requirement, not a tuning knob: a
+    # role-scoped answer contains only that identity's rows, so replaying it to a different asker
+    # in the same channel would leak across tenants. Role *and* id -- two principals sharing a
+    # user_id under different roles are answered from different rows.
     cache_key = answer_cache.make_key(
         channel_id,
         question,
-        vendor_scope=authenticated_vendor_id,
+        principal_scope=principal.cache_scope,
         output_format=explicit_format or "text",
     )
     cached = answer_cache.get(cache_key)
@@ -285,10 +346,22 @@ def answer_question(
     # is free and shouldn't count against this user's own rate, but everything past this point
     # spends a real resource one user could otherwise monopolize.
     rate_limit_key = rate_limiter.make_key(channel_id, user_id)
-    if not rate_limiter.allow(rate_limit_key):
+    if not rate_limiter.allow(
+        rate_limit_key, limit=settings.rate_limit_override_for(principal.role.value)
+    ):
         return _plain(
             failure_message(Failure.USER_RATE_LIMITED),
             error=Failure.USER_RATE_LIMITED.value,
+        )
+
+    # The window above stops a burst; this stops a slow drain -- an identity asking a question
+    # every thirty seconds all day passes every per-minute check and still exhausts a free-tier
+    # quota by lunchtime. Keyed by principal rather than by channel, so it follows the person
+    # rather than the place they happen to be asking from.
+    if not daily_question_limiter.allow(principal.cache_scope):
+        return _plain(
+            failure_message(Failure.USER_DAILY_LIMIT),
+            error=Failure.USER_DAILY_LIMIT.value,
         )
 
     # Ahead of every Gemini call, so an over-budget request costs nothing to refuse.
@@ -327,7 +400,8 @@ def answer_question(
                     "previous_question": previous_question,
                     "user_id": user_id,
                     "channel_id": channel_id,
-                    "authenticated_vendor_id": authenticated_vendor_id,
+                    "principal": principal,
+                    "stream_sink": sink,
                 }
             )
     except Exception as exc:
@@ -362,6 +436,12 @@ def answer_question(
                 PendingClarification(original_question=effective_question, rounds=rounds),
             )
         return _plain(answer, error="clarification_needed")
+
+    if result.get("not_authorized"):
+        # No query was generated and nothing was read. Returned before the cache is written, like
+        # a clarification: caching a refusal under a channel-scoped key would replay it to the
+        # next person who asks the same words, who may well be allowed to see the answer.
+        return _plain(answer, error="not_authorized")
 
     if result.get("needs_context_confirmation"):
         # The classifier decided this message doesn't fit the still-live context but didn't
@@ -409,9 +489,18 @@ def answer_question(
 
     file_result = None
     if output_format != "text":
+        # Rendering a PDF is the most expensive CPU on the request path, and it happens *after*
+        # the answer text is finished -- so without this the stream goes quiet for seconds
+        # immediately after appearing to have finished.
+        sink.stage("report", output_format)
         with _timed_stage(timings, "render_ms"):
             file_result = _build_file(
-                output_format, rows_by_domain, effective_question, answer, report_title
+                output_format,
+                _with_contact_columns(rows_by_domain, principal),
+                effective_question,
+                answer,
+                report_title,
+                max_rows=settings.report_max_rows_override_for(principal.role.value),
             )
 
     if output_format != "text" and file_result is None and row_count > 0:

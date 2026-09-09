@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from langchain_core.prompts import PromptTemplate
 
-from app.agents.domains import DomainConfig, scope_spec_to_domain
+from app.agents.domains import DomainConfig, enriched_columns_for, scope_spec_to_domain
 from app.llm.gemini_client import GeminiClient
 from app.rag.query_spec import QueryError, QuerySpec
 from app.rag.schema_context import build_domain_schema_context
@@ -51,7 +51,16 @@ _PROMPT = PromptTemplate.from_template(
     'be understood as "vendor_id" or whatever you actually grouped by, and will read as if the '
     "data is missing or unrelated.\n"
     "{geo_rule}"
+    "{enriched_rule}"
     "\nQuestion: {question}\n"
+)
+
+_ENRICHED_RULE = (
+    "- These fields are NOT in the collection and are attached to every row automatically after "
+    "your query runs, from the id columns: {enriched_columns}. They will be present in the final "
+    "answer and report. So: do NOT try to filter, project or group by them, and do NOT refuse a "
+    'question because it asks for them -- a question like "orders with customer details" is '
+    "answerable, and your job for it is simply the orders half.\n"
 )
 
 _GEO_FIELD_DOC = (
@@ -83,6 +92,13 @@ def generate_domain_query_spec(
         question=question,
         geo_field_doc=_GEO_FIELD_DOC if domain.geo_capable else "",
         geo_rule=_GEO_RULE if domain.geo_capable else "",
+        # Declared on the domain (app/agents/domains.py) rather than written here, so the prompt,
+        # the report's column order and enrichment itself cannot disagree about what exists.
+        enriched_rule=(
+            _ENRICHED_RULE.format(enriched_columns=", ".join(enriched))
+            if (enriched := enriched_columns_for(domain.name))
+            else ""
+        ),
     )
     result = gemini.generate_structured_or_error(prompt, QuerySpec)
     if isinstance(result, QueryError):

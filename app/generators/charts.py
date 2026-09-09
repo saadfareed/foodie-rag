@@ -23,6 +23,7 @@ from datetime import date, datetime
 from typing import Any, Literal
 
 from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 
 from app.config import settings
 from app.generators.tabular import ReportTable
@@ -47,11 +48,17 @@ _GRID_COLOR = "#DDDDDD"
 
 @dataclass(frozen=True)
 class ChartSpec:
-    """What to draw, resolved from the table's shape."""
+    """What to draw, resolved from the table's shape and what was asked."""
 
     kind: ChartKind
     label_column: int
-    value_column: int
+    #: The column to measure, or **None to count rows** per label.
+    #:
+    #: None is not a missing value, it is a different measure. "How many orders are incomplete"
+    #: is answered by counting orders per status; summing a money column instead produces a chart
+    #: that is confidently, silently wrong -- three orders one-per-status rendered as 47.2% /
+    #: 42.5% / 10.3% because that is how the money split, when every correct answer was 33.3%.
+    value_column: int | None
     title: str
 
 
@@ -129,6 +136,23 @@ _GENERIC_HEADER_WORDS = frozenset(
 )
 
 
+#: Phrases that make the *measure* a row count rather than a sum. Deliberately about counting
+#: things, not about size: "how much" and "total amount" are sum questions and must not match.
+_COUNT_INTENT = re.compile(
+    r"\bhow many\b|\bcount\b|\bcounts\b|\bnumber of\b|\bno\.? of\b", re.IGNORECASE
+)
+
+
+def asks_for_a_count(question: str | None) -> bool:
+    """Whether the question is asking *how many*, rather than how much.
+
+    The distinction decides the chart's measure and nothing else. It is deliberately a small
+    vocabulary rather than a model call: this runs on the report path, which is already the most
+    quota-constrained thing in the system, and "how many" is not an ambiguous phrase.
+    """
+    return bool(question) and bool(_COUNT_INTENT.search(question))
+
+
 def _mentioned_in(question: str, header: str) -> bool:
     """Whether the question refers to this column, by word or by an implying synonym.
 
@@ -191,25 +215,35 @@ def _label_column_index(
 
 
 def extract_series(table: ReportTable, spec: "ChartSpec") -> list[tuple[Any, float]]:
-    """`(label, value)` pairs for the chart, summed per distinct label.
+    """`(label, value)` pairs for the chart, aggregated per distinct label.
+
+    Summed when `spec.value_column` names a column, **counted** when it is None -- see ChartSpec.
+    A counted row contributes 1 regardless of what else is on it, which is the whole point: "how
+    many orders are in each status" must not be swayed by how large those orders happen to be.
 
     Aggregation is why this is shared between `choose_chart` and `render_chart_png` rather than
     living in the renderer. Raw (un-grouped) rows repeat their dimension -- twenty orders across
     three statuses -- and plotting them unaggregated would draw twenty slices for three
-    categories. Summing first means the pie-vs-bar threshold is judged on what will actually be
-    drawn, not on the row count.
+    categories. Aggregating first means the pie-vs-bar threshold is judged on what will actually
+    be drawn, not on the row count.
     """
     totals: dict[str, float] = {}
     labels: dict[str, Any] = {}
     for row in table.rows:
-        if spec.label_column >= len(row) or spec.value_column >= len(row):
+        if spec.label_column >= len(row):
             continue
-        value = row[spec.value_column]
-        if not _is_number(value):
-            continue
+        if spec.value_column is None:
+            value: float = 1.0
+        else:
+            if spec.value_column >= len(row):
+                continue
+            raw = row[spec.value_column]
+            if not _is_number(raw):
+                continue
+            value = float(raw)
         label = row[spec.label_column]
         key = str(label)
-        totals[key] = totals.get(key, 0) + float(value)
+        totals[key] = totals.get(key, 0) + value
         labels.setdefault(key, label)
     return [(labels[key], total) for key, total in totals.items()]
 
@@ -222,22 +256,37 @@ def choose_chart(table: ReportTable, question: str | None = None) -> ChartSpec |
     to measure -- in both cases the table itself is the better representation, and an empty or
     one-bar chart is just noise on the page.
 
-    `question` is optional context used only to prefer a dimension the user actually named --
-    see _label_column_index. Everything else is decided from the data's shape alone.
+    `question` is optional context, used for two decisions and nothing else: which dimension the
+    user actually named (see _label_column_index), and whether the measure is a **count of rows**
+    or a **sum of a column** (see asks_for_a_count). Everything else is decided from the data's
+    shape alone.
+
+    The measure matters more than it looks. "First numeric column" was the original rule, and on
+    an orders table that is `amount` -- so "how many orders are incomplete" drew a pie of money
+    per status: three orders, one in each status, rendered 47.2% / 42.5% / 10.3% when every
+    correct answer was 33.3%. A chart that answers a different question than the one asked is
+    worse than no chart, because nothing about it looks wrong.
     """
     if len(table.rows) < 2 or not table.headers:
         return None
 
     numeric_indexes = _numeric_column_indexes(table)
-    if not numeric_indexes:
+    counting = asks_for_a_count(question)
+    if not numeric_indexes and not counting:
         return None
 
-    value_column = numeric_indexes[0]
+    # None means "count rows" -- see ChartSpec.value_column.
+    value_column = None if counting else numeric_indexes[0]
+    # Numeric columns stay out of the running as the *dimension* either way: counting by `amount`
+    # would be one bar per distinct price, which is the same nothing that charting by `order_id`
+    # produces.
     label_column = _label_column_index(table, set(numeric_indexes), question)
     if label_column is None:
         return None
 
-    measure = table.headers[value_column]
+    # A counted chart is measuring the rows themselves, so it is named for what they are --
+    # "Orders by Status" -- rather than for a column it deliberately isn't reading.
+    measure = table.title if value_column is None else table.headers[value_column]
     dimension = table.headers[label_column]
     raw_labels = _column_values(table, label_column)
 
@@ -322,6 +371,10 @@ def render_chart_png(table: ReportTable, spec: ChartSpec) -> bytes:
         ax.barh(labels, values, color=_PALETTE[0], height=0.65)
         ax.grid(True, axis="x", color=_GRID_COLOR, linewidth=0.8)
         ax.set_axisbelow(True)
+        if spec.value_column is None:
+            # Counting rows: the axis is whole things. Matplotlib's default ticks on a max of 3
+            # are 0.0/0.5/1.0/..., and "1.5 orders" is not a quantity that exists.
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         _style_axes(ax)
 
     ax.set_title(spec.title, fontsize=12, pad=12, color=_TEXT_COLOR)

@@ -200,6 +200,84 @@ def test_chart_aggregates_repeated_dimension_values():
     assert sum(value for _, value in series) == sum(r["amount"] for r in _ORDER_ROWS)
 
 
+# --- what the chart measures ---------------------------------------------------------------------
+
+
+def test_a_how_many_question_counts_rows_rather_than_summing_money():
+    """The production bug this exists for. Three orders, one in each status, charted from an
+    orders table whose first numeric column is `amount` -- so "how many orders are incomplete"
+    drew 47.2% / 42.5% / 10.3%, which is how the *money* split. Every correct answer was 33.3%.
+    A chart answering a different question than the one asked is worse than no chart, because
+    nothing about it looks wrong.
+    """
+    rows = [
+        {"order_id": "ORD-1", "amount": 373.77, "status": "preparing"},
+        {"order_id": "ORD-2", "amount": 336.60, "status": "pending"},
+        {"order_id": "ORD-3", "amount": 81.60, "status": "refunded"},
+    ]
+    table = build_table("orders", rows)
+
+    spec = choose_chart(table, "how many orders are incomplete and what are their current status")
+
+    assert spec.value_column is None, "a count question measures rows, not a column"
+    series = extract_series(table, spec)
+    assert sorted(value for _, value in series) == [1, 1, 1]
+    assert {label for label, _ in series} == {"preparing", "pending", "refunded"}
+
+
+def test_a_counted_chart_is_named_for_the_rows_not_a_column():
+    """It deliberately isn't reading `amount`, so calling itself "Amount by Status" would be a
+    label for a chart it didn't draw."""
+    table = build_table(
+        "orders", [{"amount": 10.0, "status": "a"}, {"amount": 90.0, "status": "b"}]
+    )
+
+    # "Orders" is the table, "Current Status" is what `status` is called in a report
+    # (app/generators/tabular.py::_HEADER_OVERRIDES).
+    assert choose_chart(table, "how many orders by status").title == "Orders by Current Status"
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["total amount by status", "how much did each status account for", "orders by status in pdf"],
+)
+def test_a_question_that_is_not_about_counting_still_sums(question):
+    """ "How much" is a sum question, and so is a plain request for a breakdown. Counting those
+    would be the same bug pointed the other way."""
+    rows = [
+        {"amount": 373.77, "status": "preparing"},
+        {"amount": 336.60, "status": "pending"},
+    ]
+    table = build_table("orders", rows)
+
+    spec = choose_chart(table, question)
+
+    assert spec.value_column is not None
+    assert table.headers[spec.value_column] == "Order Payment", "`amount`, as a report names it"
+
+
+def test_a_count_chart_works_when_there_is_no_numeric_column_at_all():
+    """Previously this drew nothing: no numeric column meant no measure. Counting rows is a
+    measure, and "how many customers per city" is a perfectly good chart."""
+    table = build_table("customers", [{"city": "Karachi"}, {"city": "Lahore"}, {"city": "Karachi"}])
+
+    spec = choose_chart(table, "how many customers in each city")
+
+    assert spec is not None
+    assert sorted(value for _, value in extract_series(table, spec)) == [1, 2]
+
+
+def test_counting_still_refuses_to_chart_against_an_identifier():
+    """A count by `order_id` is one bar per order saying 1 -- the same nothing the cardinality
+    rule exists to prevent, and counting must not become a way around it."""
+    rows = [{"order_id": f"ORD-{i}", "status": ["a", "b"][i % 2]} for i in range(6)]
+    table = build_table("orders", rows)
+
+    spec = choose_chart(table, "how many orders")
+
+    assert table.headers[spec.label_column] == "Current Status"
+
+
 def test_few_positive_categories_become_a_pie():
     table = build_table("orders", [{"status": "a", "n": 3}, {"status": "b", "n": 4}])
     assert choose_chart(table).kind == "pie"

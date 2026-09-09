@@ -1,5 +1,6 @@
 import json
 
+import httpx
 import pytest
 from google.genai import errors
 from pydantic import BaseModel
@@ -14,6 +15,10 @@ def _rate_limit_error() -> errors.ClientError:
 
 def _model_not_found_error() -> errors.ClientError:
     return errors.ClientError(404, {"error": {"message": "no longer available to new users"}})
+
+
+def _server_error(code: int) -> errors.ServerError:
+    return errors.ServerError(code, {"error": {"message": "Deadline expired", "status": "X"}})
 
 
 def test_extract_json_raises_clearly_on_truncated_response():
@@ -74,6 +79,7 @@ def test_generate_answer_uses_configured_row_cap(monkeypatch):
     client.model_name = "test-model"
     client.fallback_models = []
     client._breakers = {}
+    client.max_retry_seconds = 16.0
     client.answer_max_rows = 2
 
     captured = {}
@@ -81,7 +87,7 @@ def test_generate_answer_uses_configured_row_cap(monkeypatch):
     class _FakeResponse:
         text = "  the answer  "
 
-    def fake_call_with_retry(fn, breaker=None):
+    def fake_call_with_retry(fn, breaker=None, deadline=None):
         return fn()
 
     class _FakeModels:
@@ -109,6 +115,7 @@ def _client_for_answer_prompt_capture():
     client.model_name = "test-model"
     client.fallback_models = []
     client._breakers = {}
+    client.max_retry_seconds = 16.0
     client.answer_max_rows = 30
 
     captured = {}
@@ -125,7 +132,7 @@ def _client_for_answer_prompt_capture():
         models = _FakeModels()
 
     client.client = _FakeClient()
-    client._call_with_retry = lambda fn, breaker=None: fn()
+    client._call_with_retry = lambda fn, breaker=None, deadline=None: fn()
     return client, captured
 
 
@@ -167,6 +174,7 @@ def test_generate_structured_uses_low_temperature_json_config():
     client.model_name = "test-model"
     client.fallback_models = []
     client._breakers = {}
+    client.max_retry_seconds = 16.0
     client.query_generation_config = "the-configured-config-object"
 
     captured = {}
@@ -174,7 +182,7 @@ def test_generate_structured_uses_low_temperature_json_config():
     class _FakeResponse:
         text = '{"collection": "orders", "operation": "count"}'
 
-    def fake_call_with_retry(fn, breaker=None):
+    def fake_call_with_retry(fn, breaker=None, deadline=None):
         return fn()
 
     class _FakeModels:
@@ -199,6 +207,7 @@ def test_generate_structured_or_error_returns_query_error_on_error_shape():
     client.model_name = "test-model"
     client.fallback_models = []
     client._breakers = {}
+    client.max_retry_seconds = 16.0
     client.query_generation_config = None
 
     class _FakeResponse:
@@ -212,7 +221,7 @@ def test_generate_structured_or_error_returns_query_error_on_error_shape():
         models = _FakeModels()
 
     client.client = _FakeClient()
-    client._call_with_retry = lambda fn, breaker=None: fn()
+    client._call_with_retry = lambda fn, breaker=None, deadline=None: fn()
 
     result = client.generate_structured_or_error("how many orders?", QuerySpec)
 
@@ -227,6 +236,7 @@ def test_generate_structured_is_generic_over_any_pydantic_schema():
     client.model_name = "test-model"
     client.fallback_models = []
     client._breakers = {}
+    client.max_retry_seconds = 16.0
     client.query_generation_config = None
 
     class _FakeResponse:
@@ -240,7 +250,7 @@ def test_generate_structured_is_generic_over_any_pydantic_schema():
         models = _FakeModels()
 
     client.client = _FakeClient()
-    client._call_with_retry = lambda fn, breaker=None: fn()
+    client._call_with_retry = lambda fn, breaker=None, deadline=None: fn()
 
     assert client.generate_structured("irrelevant prompt", _Widget) == _Widget(count=7)
 
@@ -353,24 +363,78 @@ def test_tries_each_fallback_model_in_order():
     assert attempts == ["primary", "second", "third"]
 
 
-def test_does_not_fall_back_on_a_non_rate_limit_error():
-    """A timeout or 5xx isn't a per-model problem -- cascading through every fallback model
-    would just multiply latency for a failure a different model can't fix."""
+def test_does_not_fall_back_on_a_server_error():
+    """A 500 is a server that *failed*, not one that ran out of time. Nothing about it says the
+    next model would do better, and cascading through every fallback would multiply latency for a
+    failure a different model can't fix."""
     attempts = []
 
     def generate_content(model, config=None):
         attempts.append(model)
-        raise TimeoutError("boom")
+        raise _server_error(500)
 
     client = _client_with_models("primary", ["fallback"], generate_content)
 
     class _Widget(BaseModel):
         count: int
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(errors.ServerError):
         client.generate_structured("prompt", _Widget)
 
     assert attempts == ["primary"]
+
+
+def test_falls_back_to_the_next_model_when_the_deadline_is_exceeded():
+    """The production failure this came from: a 504 arrived 12.1s into query generation on a
+    preview model that had answered a classify call two seconds earlier, and the question failed
+    with a fallback model sitting configured and unused. A 504 is a request accepted and then not
+    answered in time -- a busy queue -- and a different model is a different queue.
+    """
+    attempts = []
+
+    def generate_content(model, config=None):
+        attempts.append(model)
+        if model == "primary":
+            raise _server_error(504)
+
+        class _FakeResponse:
+            text = '{"count": 1}'
+
+        return _FakeResponse()
+
+    client = _client_with_models("primary", ["fallback"], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    assert client.generate_structured("prompt", _Widget) == _Widget(count=1)
+    assert attempts == ["primary", "fallback"]
+    assert client.last_model_used == "fallback"
+
+
+def test_falls_back_to_the_next_model_on_a_client_side_timeout():
+    """The same event from our side of the wire. Without this the two halves of one failure are
+    handled differently depending on which end noticed first."""
+    attempts = []
+
+    def generate_content(model, config=None):
+        attempts.append(model)
+        if model == "primary":
+            raise httpx.ReadTimeout("The read operation timed out")
+
+        class _FakeResponse:
+            text = '{"count": 1}'
+
+        return _FakeResponse()
+
+    client = _client_with_models("primary", ["fallback"], generate_content)
+
+    class _Widget(BaseModel):
+        count: int
+
+    client.generate_structured("prompt", _Widget)
+
+    assert attempts == ["primary", "fallback"]
 
 
 def test_raises_the_final_models_error_when_all_are_rate_limited():

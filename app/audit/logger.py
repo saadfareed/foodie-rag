@@ -68,6 +68,13 @@ def log_query_event(
     duration_ms: float,
     user_id: str | None = None,
     channel_id: str | None = None,
+    #: The role the answer was authorised under, and the account it was scoped to
+    #: (app/security/roles.py). Recorded separately from user_id because they answer different
+    #: questions: user_id is who sent the message, role is what let them see the result. When
+    #: authorization decides which rows an answer contains, the second is the one an auditor asks
+    #: for, and it is not recoverable from the question or the answer afterwards.
+    role: str | None = None,
+    principal_id: str | None = None,
     specs: list[QuerySpec] | None = None,
     error: str | None = None,
     #: The raw exception text. Logged, never shown -- it has carried pymongo tracebacks and
@@ -87,6 +94,8 @@ def log_query_event(
         "question": question,
         "user_id": user_id,
         "channel_id": channel_id,
+        "role": role,
+        "principal_id": principal_id,
         "query_specs": [spec.model_dump() for spec in specs] if specs else None,
         "error": error,
         "error_detail": error_detail,

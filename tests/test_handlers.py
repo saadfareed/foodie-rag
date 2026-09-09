@@ -3,6 +3,7 @@ import logging
 import pytest
 
 from app.rag.pipeline import AnswerResult
+from app.security.roles import Principal, Role
 from app.slack.handlers import register_handlers
 
 
@@ -88,7 +89,9 @@ def test_mention_passes_the_injected_gemini_client_through(monkeypatch):
             "gemini": gemini,
             "user_id": "U1",
             "channel_id": "C1",
-            "authenticated_vendor_id": None,
+            # No `/login`, so the principal is SLACK_DEFAULT_ROLE (admin by default -- see
+            # app/slack/auth.py::get_principal for why that default preserves existing behaviour).
+            "principal": Principal(role=Role.ADMIN),
         }
     ]
     assert say_calls == [{"text": "the answer", "thread_ts": "111.222"}]
@@ -124,7 +127,9 @@ def test_dm_passes_the_injected_gemini_client_through(monkeypatch):
             "gemini": gemini,
             "user_id": "U2",
             "channel_id": "D1",
-            "authenticated_vendor_id": None,
+            # No `/login`, so the principal is SLACK_DEFAULT_ROLE (admin by default -- see
+            # app/slack/auth.py::get_principal for why that default preserves existing behaviour).
+            "principal": Principal(role=Role.ADMIN),
         }
     ]
     assert say_calls == [{"text": "the answer", "thread_ts": None}]
@@ -165,7 +170,9 @@ def test_ask_command_passes_the_injected_gemini_client_through(monkeypatch):
             "gemini": gemini,
             "user_id": "U1",
             "channel_id": "C1",
-            "authenticated_vendor_id": None,
+            # No `/login`, so the principal is SLACK_DEFAULT_ROLE (admin by default -- see
+            # app/slack/auth.py::get_principal for why that default preserves existing behaviour).
+            "principal": Principal(role=Role.ADMIN),
         }
     ]
     assert responses == ["the answer"]
@@ -292,7 +299,7 @@ def test_login_scopes_subsequent_questions_to_that_vendor(monkeypatch):
     )
 
     assert "USR-00031" in responses[0]
-    assert calls[0]["authenticated_vendor_id"] == "USR-00031"
+    assert calls[0]["principal"].user_id == "USR-00031"
 
 
 def test_logout_clears_the_vendor_scope(monkeypatch):
@@ -316,7 +323,7 @@ def test_logout_clears_the_vendor_scope(monkeypatch):
     )
 
     assert "Signed out" in responses[0]
-    assert calls[0]["authenticated_vendor_id"] is None
+    assert calls[0]["principal"].user_id is None
 
 
 def test_dm_from_an_unauthorized_user_gets_no_reply(monkeypatch):

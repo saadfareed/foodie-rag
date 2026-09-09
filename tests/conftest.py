@@ -1,12 +1,11 @@
 import pytest
 
+from app.config import settings
 from app.llm.circuit_breaker import gemini_circuit_breaker
 from app.llm.quota import quota_tracker
-from app.rag.answer_cache import AnswerCache
-from app.rag.context_switch_cache import ContextSwitchCache
-from app.rag.conversation_context import ConversationContextCache
-from app.rag.rate_limiter import rate_limiter
-from app.slack import auth
+from app.rag.rate_limiter import daily_question_limiter, rate_limiter
+from app.state import set_backend
+from app.state.memory import InMemoryBackend
 
 
 @pytest.fixture(autouse=True)
@@ -41,77 +40,48 @@ def _no_real_database(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
-def _isolated_answer_cache(monkeypatch):
-    """app.rag.pipeline.answer_cache is a module-level singleton; without this, tests that reuse
-    the same question text (with the default channel_id=None) would leak cached answers into each
-    other depending on test order."""
-    monkeypatch.setattr(
-        "app.rag.pipeline.answer_cache", AnswerCache(ttl_seconds=1800, max_entries=500)
-    )
+def _fresh_state_backend():
+    """Give every test its own state.
 
+    This replaces what used to be five separate fixtures, each rebuilding or hand-resetting one
+    module-level cache. Every stateful guardrail now keeps its bytes in `app/state`'s backend
+    (see that package's docstring), so installing a clean `InMemoryBackend` per test isolates all
+    of them at once -- the answer cache, the three conversation caches, the rate-limit window, the
+    daily quota counter, the circuit breaker, the report file store, and the `/login` sessions.
 
-@pytest.fixture(autouse=True)
-def _isolated_conversation_context_cache(monkeypatch):
-    """app.rag.pipeline.conversation_context_cache is a module-level singleton; without this,
-    tests exercising the default (channel_id=None, user_id=None) key could leak a resolved_question
-    into an unrelated test's classify prompt, depending on test order."""
-    monkeypatch.setattr(
-        "app.rag.pipeline.conversation_context_cache",
-        ConversationContextCache(ttl_seconds=300, max_entries=500),
-    )
-
-
-@pytest.fixture(autouse=True)
-def _isolated_context_switch_cache(monkeypatch):
-    """app.rag.pipeline.context_switch_cache is a module-level singleton; without this, a pending
-    "should I clear that context?" confirmation from one test could leak into another test using
-    the same default (channel_id=None, user_id=None) key, depending on test order."""
-    monkeypatch.setattr(
-        "app.rag.pipeline.context_switch_cache",
-        ContextSwitchCache(ttl_seconds=120, max_entries=500),
-    )
-
-
-@pytest.fixture(autouse=True)
-def _reset_quota_tracker(monkeypatch):
-    """quota_tracker (app/llm/quota.py) is a single module-level object, imported by reference
-    into both app/llm/gemini_client.py and app/rag/pipeline.py -- patching its *attributes*
-    (rather than rebinding the name in one module) resets it everywhere it's held. Without this,
-    real calls made across the suite (each _call_with_retry invocation counts one) accumulate
-    against whatever GEMINI_DAILY_CALL_BUDGET is configured in the environment, and once that's
-    a finite number, tests start tripping "I've hit my daily question budget" depending on
-    unrelated tests' call counts and run order -- exactly what a real per-test isolated budget
-    should never depend on."""
-    monkeypatch.setattr(quota_tracker, "_daily_budget", 0)
-    monkeypatch.setattr(quota_tracker, "_calls_today", 0)
-
-
-@pytest.fixture(autouse=True)
-def _reset_rate_limiter(monkeypatch):
-    """rate_limiter (app/rag/rate_limiter.py) is disabled by default (limit_per_window=0), so
-    this is a no-op for most tests -- it only matters for tests that explicitly enable it via
-    monkeypatch, keeping that state from leaking into unrelated tests via run order."""
-    monkeypatch.setattr(rate_limiter, "_limit", 0)
-    monkeypatch.setattr(rate_limiter, "_calls", type(rate_limiter._calls)())
-
-
-@pytest.fixture(autouse=True)
-def _reset_vendor_sessions():
-    """app/slack/auth.py holds `/login` sessions in a module-level dict with no TTL short enough
-    to expire within a test run -- a session created by one test would otherwise scope another
-    test's questions to that vendor and silently change which rows it sees."""
-    auth.clear_all()
+    It also closes a gap the per-singleton fixtures had: a test that constructed its own
+    `AnswerCache(...)` got isolation, but anything reaching a singleton this fixture list hadn't
+    been updated for did not. The rule is now structural -- if it stores state, it stores it here,
+    and here is reset.
+    """
+    set_backend(InMemoryBackend())
     yield
-    auth.clear_all()
+    set_backend(None)
 
 
 @pytest.fixture(autouse=True)
-def _reset_gemini_circuit_breaker(monkeypatch):
-    """gemini_circuit_breaker (app/llm/circuit_breaker.py) is disabled by default here (like
-    quota_tracker/rate_limiter above) -- several existing tests intentionally drive GeminiClient
-    to fail repeatedly (retry-exhaustion, non-retryable errors), and without this those failures
-    would accumulate against the shared singleton across the whole test run and eventually trip
-    the breaker for unrelated, later tests."""
+def _disabled_limits(monkeypatch):
+    """Turn off the *configured* limits and their per-role overrides, which are policy, not state.
+
+    `_fresh_state_backend` above empties the counters; these three attributes are the thresholds
+    those counters are compared against, and they come from whatever .env the machine happens to
+    have. Several tests deliberately drive GeminiClient to fail repeatedly (retry exhaustion,
+    non-retryable errors), and with a real threshold configured those failures would trip the
+    breaker for unrelated later tests; likewise a finite GEMINI_DAILY_CALL_BUDGET would make tests
+    start failing according to how many calls earlier tests happened to make.
+
+    The per-role override maps matter for the same reason and are easy to miss: a developer whose
+    .env sets RATE_LIMIT_BY_ROLE=admin:60 would see the rate-limit tests pass while CI, which has
+    no .env, sees them fail -- green where it is cheap to investigate, red where it isn't. That is
+    the exact failure mode `_no_real_database` above exists to prevent, so the overrides are
+    cleared here rather than left to whatever the machine happens to have configured.
+
+    Tests that exercise a limit set its threshold, and its override, themselves.
+    """
+    monkeypatch.setattr(quota_tracker, "_daily_budget", 0)
+    monkeypatch.setattr(rate_limiter, "_limit", 0)
     monkeypatch.setattr(gemini_circuit_breaker, "_failure_threshold", 0)
-    monkeypatch.setattr(gemini_circuit_breaker, "_consecutive_failures", 0)
-    monkeypatch.setattr(gemini_circuit_breaker, "_opened_at", None)
+    monkeypatch.setattr(daily_question_limiter, "_daily_limit", 0)
+    monkeypatch.setattr(settings, "rate_limit_by_role", {})
+    monkeypatch.setattr(settings, "report_max_rows_by_role", {})
+    monkeypatch.setattr(settings, "report_include_contacts", False)

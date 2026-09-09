@@ -18,7 +18,9 @@ def test_entry_expires_after_ttl(monkeypatch):
     cache = ConversationContextCache(ttl_seconds=10, max_entries=10)
     cache.set(("C1", "U1"), "how many orders?")
     future = time.monotonic() + 11
-    monkeypatch.setattr("app.rag.conversation_context.time.monotonic", lambda: future)
+    # The TTL clock lives in the state backend now, not in the cache module -- that is the
+    # one place expiry is decided for every guardrail (see app/state/memory.py).
+    monkeypatch.setattr("app.state.memory.time.monotonic", lambda: future)
     assert cache.get(("C1", "U1")) is None
 
 

@@ -25,9 +25,30 @@ def main() -> None:
     )
     logger = logging.getLogger("audit")
     try:
+        state_error = settings.state_config_error()
+        if state_error:
+            # Fatal, not a warning: falling back to in-process state when Redis was asked for is
+            # the worst outcome available -- the process starts, every request succeeds, and the
+            # limits silently stop being shared across replicas.
+            raise RuntimeError(state_error)
+        replica_warning = settings.single_replica_warning()
+        if replica_warning:
+            logger.warning("startup_state_warning", extra={"event": {"message": replica_warning}})
+
         pool_warning = settings.pool_size_warning()
         if pool_warning:
             logger.warning("startup_config_warning", extra={"event": {"message": pool_warning}})
+
+        # Two settings in different units that silently cancel each other out when they disagree:
+        # a retry budget at or below the per-attempt timeout means slow failures are never
+        # retried, which looks exactly like a flaky upstream. See settings.retry_budget_warning().
+        retry_warning = settings.retry_budget_warning()
+        if retry_warning:
+            logger.warning("startup_config_warning", extra={"event": {"message": retry_warning}})
+
+        timeout_warning = settings.gemini_timeout_warning()
+        if timeout_warning:
+            logger.warning("startup_config_warning", extra={"event": {"message": timeout_warning}})
 
         # Idempotent -- safe on every startup, not just first-run seeding (see app/db/indexes.py).
         ensure_indexes(get_db())

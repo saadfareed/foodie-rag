@@ -6,6 +6,18 @@ python-dotenv>=1.0
 pydantic>=2.7
 langgraph>=0.2
 langchain-core>=0.3
+# Shared state (app/state/) -- ONLY needed for STATE_BACKEND=redis, which is what makes running
+# more than one instance correct rather than merely possible. Imported lazily (see
+# app/state/__init__.py::_build_backend), so the default in-process backend needs nothing here.
+#   pip install 'redis>=5.0'
+# redis>=5.0
+
+# Web chat plugin (app/api/): the HTTP gateway the embeddable widget talks to. Not needed to
+# run the Slack bot -- app/config.py keeps every WIDGET_* setting optional at import time.
+fastapi>=0.110
+uvicorn>=0.27
+PyJWT>=2.8
+
 # Report generation (app/generators/): charts, spreadsheets, PDFs.
 matplotlib>=3.7
 openpyxl>=3.1

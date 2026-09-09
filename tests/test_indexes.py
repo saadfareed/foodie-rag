@@ -48,6 +48,10 @@ def test_ensure_indexes_covers_users_hot_fields_and_geo():
         [("usertype", 1), ("city", 1)],
         [("usertype", 1), ("status", 1)],
         [("location", "2dsphere")],
+        # Sign-in looks a user up by exact email (app/db/identity.py). Unique-when-present, so
+        # two accounts can't share an address -- "which identity did this person prove?" is the
+        # one question authentication exists to answer.
+        "email",
     ]
 
 
@@ -57,4 +61,4 @@ def test_ensure_indexes_is_safe_to_call_repeatedly():
     ensure_indexes(db)
 
     assert len(db["orders"].created) == 8
-    assert len(db["users"].created) == 8
+    assert len(db["users"].created) == 10

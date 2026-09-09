@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Northwind Portal — sample host app</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>📦</text></svg>"
+    />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><span aria-hidden="true">📦</span> Northwind Portal</div>
+      <div class="who" id="who" hidden>
+        <span id="who-name"></span>
+        <button type="button" id="sign-out" class="ghost">Sign out</button>
+      </div>
+    </header>
+
+    <main>
+      <!-- Signed out -->
+      <section class="card" id="signin-card">
+        <h1>Sign in</h1>
+        <p class="lede">
+          We email you a one-time code. Your account decides what the assistant will answer —
+          a customer sees their own orders, a vendor sees theirs and the customers who bought
+          from them.
+        </p>
+
+        <form id="email-form" class="stack">
+          <label>
+            Email address
+            <input type="email" id="email" autocomplete="username" required
+                   placeholder="usr-00031@example.test" />
+          </label>
+          <button type="submit" class="primary">Email me a code</button>
+        </form>
+
+        <form id="code-form" class="stack" hidden>
+          <p class="lede" id="code-sent-to"></p>
+          <label>
+            6-digit code
+            <input type="text" id="code" inputmode="numeric" autocomplete="one-time-code"
+                   maxlength="6" pattern="[0-9]{6}" required />
+          </label>
+          <div class="row">
+            <button type="submit" class="primary">Sign in</button>
+            <button type="button" class="ghost" id="back-to-email">Use a different address</button>
+          </div>
+          <p class="warn" id="dev-code" hidden></p>
+        </form>
+
+        <details id="supabase-block" hidden>
+          <summary>Or sign in with a Supabase password</summary>
+          <form id="signin-form" class="stack">
+            <label>
+              Email <input type="email" id="sb-email" autocomplete="username" required />
+            </label>
+            <label>
+              Password
+              <input type="password" id="password" autocomplete="current-password" required />
+            </label>
+            <button type="submit" class="primary">Sign in with Supabase</button>
+          </form>
+        </details>
+
+        <div id="demo-block" class="stack" hidden>
+          <p class="warn">
+            Demo mode is on, so these buttons assert an identity instead of proving one. Useful
+            for watching the role scoping work without any email at all; never for anything real.
+          </p>
+          <div class="row">
+            <button type="button" class="primary" data-demo-role="vendor" data-demo-user="USR-00031">
+              As vendor USR-00031
+            </button>
+            <button type="button" class="primary" data-demo-role="customer" data-demo-user="USR-00002">
+              As customer USR-00002
+            </button>
+            <button type="button" class="ghost" data-demo-role="admin" data-demo-user="ops-1">
+              As admin
+            </button>
+          </div>
+        </div>
+
+        <p class="error" id="signin-error" hidden></p>
+      </section>
+
+      <!-- Signed in -->
+      <section id="dashboard" hidden>
+        <div class="card">
+          <h1>Your data</h1>
+          <dl class="facts">
+            <div><dt>Signed in as</dt><dd id="fact-email">—</dd></div>
+            <div><dt>Role</dt><dd id="fact-role">—</dd></div>
+            <div><dt>Account</dt><dd id="fact-scope">—</dd></div>
+            <div><dt>Assistant</dt><dd id="fact-gateway">—</dd></div>
+          </dl>
+          <p class="lede" id="scope-note"></p>
+        </div>
+
+        <div class="card">
+          <h2>Try asking</h2>
+          <p class="lede">
+            These open the chat with the question filled in. The answer comes from MongoDB via the
+            gateway — Supabase's only job is deciding who you are.
+          </p>
+          <ul class="suggestions" id="suggestions">
+            <li><button type="button">How many orders are pending?</button></li>
+            <li><button type="button">Show me the last 10 incomplete orders as a CSV</button></li>
+            <li><button type="button">Which customers ordered the most last month?</button></li>
+            <li><button type="button">Give me a PDF report of orders by status</button></li>
+          </ul>
+        </div>
+
+        <div class="card subtle">
+          <h2>What just happened</h2>
+          <ol class="flow">
+            <li>You proved you control an inbox with a one-time code.</li>
+            <li>
+              This server asked the gateway who that address belongs to. The gateway read
+              <code>users.email</code> — a field its own field policy hides from the model — and
+              answered with a user id and a role.
+            </li>
+            <li>It set an httpOnly session cookie holding that id and role. Nothing else.</li>
+            <li>
+              The widget asked this server for a chat token; the server called the gateway with
+              its secret key and asserted your id and role. The browser never sees either.
+            </li>
+            <li>
+              Every question is answered under that role — the filter is forced onto the database
+              query in code, so no phrasing gets around it.
+            </li>
+          </ol>
+        </div>
+      </section>
+    </main>
+
+    <script src="/config.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

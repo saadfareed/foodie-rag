@@ -9,7 +9,7 @@ from app.llm.gemini_client import GeminiClient
 from app.messages import upload_failure_note
 from app.rag.pipeline import AnswerResult, answer_question
 from app.slack.access_control import is_authorized
-from app.slack.auth import get_authenticated_vendor, login_vendor, logout_vendor
+from app.slack.auth import get_principal, login_vendor, logout_vendor
 
 logger = logging.getLogger("audit")
 
@@ -96,7 +96,7 @@ def register_handlers(app: App, gemini: GeminiClient) -> None:
             gemini,
             user_id=user_id,
             channel_id=channel_id,
-            authenticated_vendor_id=get_authenticated_vendor(user_id),
+            principal=get_principal(user_id),
         )
         _send_response(
             result,
@@ -118,7 +118,7 @@ def register_handlers(app: App, gemini: GeminiClient) -> None:
             gemini,
             user_id=user_id,
             channel_id=channel_id,
-            authenticated_vendor_id=get_authenticated_vendor(user_id),
+            principal=get_principal(user_id),
         )
         _send_response(result, say=say, client=client, channel_id=channel_id)
 
@@ -138,7 +138,7 @@ def register_handlers(app: App, gemini: GeminiClient) -> None:
             gemini,
             user_id=user_id,
             channel_id=channel_id,
-            authenticated_vendor_id=get_authenticated_vendor(user_id),
+            principal=get_principal(user_id),
         )
         _send_response(result, respond=respond, client=client, channel_id=channel_id)
 

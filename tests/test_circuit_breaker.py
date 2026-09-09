@@ -35,10 +35,12 @@ def test_success_resets_the_failure_count():
 
 
 def test_breaker_half_opens_after_cooldown(monkeypatch):
-    import app.llm.circuit_breaker as module
+    # The cooldown is a key TTL in the state backend now, not a timestamp this module holds --
+    # "the breaker closes again" is that key expiring (see app/llm/circuit_breaker.py).
+    import app.state.memory as state_memory
 
     now = [1000.0]
-    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(state_memory.time, "monotonic", lambda: now[0])
 
     breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10)
     breaker.record_failure()
@@ -50,10 +52,12 @@ def test_breaker_half_opens_after_cooldown(monkeypatch):
 
 
 def test_a_failure_during_half_open_reopens_the_breaker(monkeypatch):
-    import app.llm.circuit_breaker as module
+    # The cooldown is a key TTL in the state backend now, not a timestamp this module holds --
+    # "the breaker closes again" is that key expiring (see app/llm/circuit_breaker.py).
+    import app.state.memory as state_memory
 
     now = [1000.0]
-    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(state_memory.time, "monotonic", lambda: now[0])
 
     breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10)
     breaker.record_failure()

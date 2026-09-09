@@ -46,9 +46,13 @@ def _write_table(writer: "csv._writer", table: ReportTable) -> None:
         writer.writerow([_escape_cell(cell) for cell in row])
 
 
-def generate_csv(rows_by_domain: dict[str, list[dict]], title: str | None = None) -> bytes:
+def generate_csv(
+    rows_by_domain: dict[str, list[dict]],
+    title: str | None = None,
+    max_rows: int | None = None,
+) -> bytes:
     """Render every non-empty domain as a titled CSV block. UTF-8 with a BOM."""
-    tables = build_tables(rows_by_domain)
+    tables = build_tables(rows_by_domain, max_rows=max_rows)
 
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer, lineterminator="\r\n")

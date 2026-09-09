@@ -1,0 +1,576 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Data chat</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>💬</text></svg>" />
+<style>
+  :root {
+    --bg: #f8fafc; --surface: #fff; --text: #0f172a; --muted: #64748b;
+    --border: #e2e8f0; --accent: #4f46e5; --warn-bg: #fffbeb; --warn-text: #92400e;
+    --code-bg: #f1f5f9; --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #020617; --surface: #0f172a; --text: #e2e8f0; --muted: #94a3b8;
+      --border: #1e293b; --warn-bg: #422006; --warn-text: #fde68a;
+      --code-bg: #1e293b; --ok: #4ade80;
+    }
+  }
+  * { box-sizing: border-box; }
+  /* An explicit rule, because a class rule like `.stack { display: grid }` silently beats the
+     user agent's `[hidden] { display: none }` -- which is how a page ends up showing its
+     signed-out form and its signed-in chrome at the same time. */
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); line-height: 1.55;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 780px; margin: 0 auto; padding: 40px 20px 120px; display: grid; gap: 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  p { margin: 0 0 14px; color: var(--muted); font-size: 14px; }
+  p:last-child { margin-bottom: 0; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; }
+  code, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 5px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 9px; overflow-x: auto; margin: 0 0 12px; }
+  pre code { background: none; padding: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 7px 10px 7px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+  td:first-child { white-space: nowrap; }
+  .warn { background: var(--warn-bg); color: var(--warn-text); padding: 12px 14px; border-radius: 9px; font-size: 13px; margin: 0 0 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  label { display: grid; gap: 5px; font-size: 12px; font-weight: 600; }
+  input {
+    font: inherit; font-size: 14px; padding: 8px 10px; border: 1px solid var(--border);
+    border-radius: 9px; background: var(--bg); color: var(--text); min-width: 220px;
+  }
+  button {
+    font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; padding: 9px 16px;
+    border-radius: 9px; border: 1px solid transparent; background: var(--accent); color: #fff;
+  }
+  button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
+  .status { font-size: 13px; margin: 14px 0 0; min-height: 20px; }
+  .status[data-tone="ok"] { color: var(--ok); }
+  .status[data-tone="error"] { color: #b91c1c; }
+  .muted-note { font-size: 12.5px; color: var(--muted); margin: 14px 0 0; }
+  .whoami { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+  .role { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--accent); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; }
+
+  /* ---- the auth screen ------------------------------------------------------------------
+     Dark on both themes, deliberately: it is the one full-bleed screen here, and a sign-in that
+     restyles itself halfway through the page's palette reads as two different products. The rest
+     of the page still follows the viewer's theme. */
+  .auth {
+    display: grid; grid-template-columns: 1.05fr 1fr; overflow: hidden;
+    background: #0b1020; color: #e6e9f5;
+    border: 1px solid #1e2740; border-radius: 20px;
+    box-shadow: 0 30px 80px rgba(2, 6, 23, 0.45);
+  }
+
+  .auth-aside {
+    padding: 34px 32px; display: flex; flex-direction: column; gap: 14px;
+    background:
+      radial-gradient(120% 90% at 0% 0%, rgba(99, 102, 241, 0.35) 0%, rgba(99, 102, 241, 0) 60%),
+      radial-gradient(100% 80% at 100% 100%, rgba(56, 189, 248, 0.22) 0%, rgba(56, 189, 248, 0) 55%),
+      #0d1225;
+    border-right: 1px solid #1e2740;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14px; letter-spacing: -0.01em; }
+  .brand-mark { font-size: 18px; }
+  .aside-title { font-size: 27px; line-height: 1.22; margin: 10px 0 0; font-weight: 700; letter-spacing: -0.02em; }
+  .aside-copy { color: #9aa4c4; font-size: 13.5px; margin: 0; }
+  .aside-points { list-style: none; padding: 0; margin: 6px 0 0; display: grid; gap: 9px; }
+  .aside-points li { position: relative; padding-left: 24px; font-size: 13px; color: #c3cae2; }
+  .aside-points li::before {
+    content: "✓"; position: absolute; left: 0; top: -1px;
+    width: 17px; height: 17px; border-radius: 50%; font-size: 10px;
+    display: grid; place-items: center; background: rgba(99, 102, 241, 0.22); color: #a5b4fc;
+  }
+  .aside-foot { margin: auto 0 0; font-size: 11.5px; color: #f0b45f; line-height: 1.5; }
+  .aside-foot:empty { display: none; }
+
+  .auth-main { padding: 30px 32px 28px; }
+  .auth-main h1 { font-size: 21px; margin: 0 0 4px; }
+  .auth-main .sub { color: #8b95b5; font-size: 13px; margin: 0 0 18px; }
+  .auth-main code { background: #161d33; color: #c7d0ea; }
+
+  .tabs { display: flex; gap: 4px; padding: 4px; margin: 0 0 20px; background: #121834; border-radius: 11px; }
+  .tab {
+    flex: 1; padding: 8px 10px; border: 0; border-radius: 8px; cursor: pointer;
+    background: transparent; color: #8b95b5; font-size: 13px; font-weight: 600;
+  }
+  .tab[aria-selected="true"] { background: #202a4d; color: #fff; }
+
+  .auth-main form { display: grid; gap: 13px; }
+  .auth-main label { color: #aab3d0; gap: 6px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+  .auth-main input, .auth-main select {
+    width: 100%; min-width: 0; background: #121834; border: 1px solid #232c4d; color: #e6e9f5;
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .auth-main input::placeholder { color: #5d678a; }
+  .auth-main input:focus, .auth-main select:focus {
+    outline: 2px solid #6366f1; outline-offset: -1px; border-color: transparent;
+  }
+  .with-reveal { position: relative; display: block; }
+  .with-reveal input { padding-right: 62px; }
+  .reveal {
+    position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+    background: transparent; border: 0; color: #8b95b5; font-size: 11.5px; font-weight: 600;
+    padding: 6px 8px; border-radius: 7px; cursor: pointer;
+  }
+  .reveal:hover { color: #c7d0ea; background: #1b2340; }
+
+  .auth-main button.primary {
+    width: 100%; padding: 11px 16px; margin-top: 3px; font-size: 14px;
+    background: linear-gradient(180deg, #6366f1, #4f46e5); border: 0; color: #fff;
+  }
+  .auth-main button.primary:disabled { opacity: 0.6; cursor: not-allowed; }
+  .auth-main button.secondary { background: #161d33; color: #c7d0ea; border-color: #232c4d; padding: 8px 13px; font-size: 12.5px; }
+  .locate { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .locate-note { font-size: 11.5px; color: #6f7899; flex: 1; min-width: 160px; }
+  .link { background: none; border: 0; padding: 0; color: #a5b4fc; font-weight: 600; cursor: pointer; font-size: 13px; }
+  .link:hover { text-decoration: underline; }
+  .swap { margin: 2px 0 0; text-align: center; font-size: 13px; color: #8b95b5; }
+  .auth-main .status { margin: 0; min-height: 18px; font-size: 12.5px; }
+  .auth-main .status[data-tone="error"] { color: #fda4a4; }
+  .auth-main .status[data-tone="ok"] { color: #86efac; }
+
+  /* Last, deliberately: these override rules above them at the same specificity, so source order
+     is what decides. Written next to `.auth` (where they read better) they silently lost to the
+     `.auth-aside` block further down, and the panel stayed on a phone. */
+  @media (max-width: 720px) {
+    .auth { grid-template-columns: 1fr; }
+    /* The panel's *decoration* goes; the brand and the playground warning stay. Hiding the whole
+       aside would take a security notice with it, and keeping all of it pushes the form below
+       the fold on a phone -- which for a sign-in screen is the same as hiding the form. */
+    .auth-aside { padding: 20px 22px; gap: 10px; border-right: 0; border-bottom: 1px solid #1e2740; }
+    .aside-title, .aside-copy, .aside-points { display: none; }
+    .auth-main { padding: 22px 22px 24px; }
+  }
+  @media (max-width: 520px) { .pair { grid-template-columns: 1fr; } }
+</style>
+
+<main>
+  <!-- Signed in: who you are, and where the chat is. -->
+  <div class="card" id="session-card" hidden>
+    <div class="whoami">
+      <div>
+        <h1 id="hello">Welcome</h1>
+        <p id="scope-note"></p>
+      </div>
+      <div class="row">
+        <span class="role" id="role-chip"></span>
+        <button type="button" class="secondary" id="sign-out">Sign out</button>
+      </div>
+    </div>
+    <p class="muted-note">
+      The chat is open in the bottom-right corner. It answers as this account and nothing else --
+      the same token, the same forced filters a production session gets.
+    </p>
+  </div>
+
+  <!-- Signed out: one card, two tabs. The auth screen is deliberately the whole page rather than
+       a card among others -- until you are signed in there is nothing else here to look at. -->
+  <div class="auth" id="auth-card" hidden>
+    <div class="auth-aside">
+      <div class="brand"><span class="brand-mark">💬</span> Data chat</div>
+      <h2 class="aside-title">Ask your data<br />in plain language.</h2>
+      <p class="aside-copy">
+        Questions in, answers out — with a CSV, Excel or PDF when you want one. What you can see
+        is decided by your account, not by anything you type here.
+      </p>
+      <ul class="aside-points">
+        <li>Answers scoped to your own rows</li>
+        <li>Reports built from the same query</li>
+        <li>Follow-up questions remember the last one</li>
+      </ul>
+      <p class="aside-foot" id="playground-warning"></p>
+    </div>
+
+    <div class="auth-main">
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab" id="tab-signin" role="tab" aria-selected="true"
+                aria-controls="signin-form">Sign in</button>
+        <button type="button" class="tab" id="tab-signup" role="tab" aria-selected="false"
+                aria-controls="signup-form">Create account</button>
+      </div>
+
+      <form id="signin-form" role="tabpanel" aria-labelledby="tab-signin">
+        <h1>Welcome back</h1>
+        <p class="sub">Sign in with the email and password on your account.</p>
+        <label for="email">Email
+          <input id="email" name="email" type="email" autocomplete="email"
+                 placeholder="you@example.test" required />
+        </label>
+        <label for="password">Password
+          <span class="with-reveal">
+            <input id="password" name="password" type="password"
+                   autocomplete="current-password" placeholder="••••••••" required />
+            <button type="button" class="reveal" data-for="password"
+                    aria-label="Show password">Show</button>
+          </span>
+        </label>
+        <button type="submit" class="primary" id="sign-in">Sign in</button>
+        <p class="status" id="signin-status" role="status"></p>
+        <p class="swap">No account yet?
+          <button type="button" class="link" data-go="signup">Create one</button>
+        </p>
+      </form>
+
+      <form id="signup-form" role="tabpanel" aria-labelledby="tab-signup" hidden>
+        <h1>Create your account</h1>
+        <p class="sub">This writes a new row to the <code>users</code> collection and signs you
+          straight in.</p>
+
+        <label for="signup-name">Name
+          <input id="signup-name" name="name" type="text" autocomplete="name"
+                 placeholder="Ayesha Khan" required />
+        </label>
+
+        <div class="pair">
+          <label for="signup-role">Account type
+            <select id="signup-role" name="role" required></select>
+          </label>
+          <label for="signup-city">City
+            <input id="signup-city" name="city" type="text" autocomplete="address-level2"
+                   placeholder="Karachi" />
+          </label>
+        </div>
+
+        <!-- Vendor-only. A vendor with no business name renders as a blank column in every
+             report that lists vendors, so it is asked for here rather than defaulted silently. -->
+        <div class="pair" id="vendor-fields" hidden>
+          <label for="signup-business">Business name
+            <input id="signup-business" name="business_name" type="text"
+                   placeholder="Metro Grocers" />
+          </label>
+          <label for="signup-category">Category
+            <select id="signup-category" name="category">
+              <option value="restaurant">restaurant</option>
+              <option value="grocery">grocery</option>
+              <option value="pharmacy">pharmacy</option>
+              <option value="electronics">electronics</option>
+              <option value="clothing">clothing</option>
+            </select>
+          </label>
+        </div>
+
+        <label for="signup-email">Email
+          <input id="signup-email" name="email" type="email" autocomplete="email"
+                 placeholder="you@example.test" required />
+        </label>
+
+        <div class="pair">
+          <label for="signup-password">Password
+            <span class="with-reveal">
+              <input id="signup-password" name="password" type="password"
+                     autocomplete="new-password" placeholder="at least 6 characters"
+                     minlength="6" required />
+              <button type="button" class="reveal" data-for="signup-password"
+                      aria-label="Show password">Show</button>
+            </span>
+          </label>
+          <label for="signup-confirm">Confirm password
+            <input id="signup-confirm" name="confirm" type="password"
+                   autocomplete="new-password" placeholder="••••••••" required />
+          </label>
+        </div>
+
+        <div class="locate">
+          <button type="button" class="secondary" id="locate">Use my current location</button>
+          <span class="locate-note" id="locate-note">Optional — it's what makes "vendors near me"
+            work.</span>
+        </div>
+
+        <button type="submit" class="primary" id="sign-up">Create account &amp; sign in</button>
+        <p class="status" id="signup-status" role="status"></p>
+        <p class="swap">Already have an account?
+          <button type="button" class="link" data-go="signin">Sign in</button>
+        </p>
+      </form>
+    </div>
+  </div>
+
+  <!-- Playground off: nothing to sign in to. -->
+  <div class="card" id="playground-off" hidden>
+    <h1>Data chat</h1>
+    <p>
+      This service answers questions for signed-in users of the application that embeds it. It has
+      no sign-in of its own except a local development playground, which mints sessions with no
+      host-app key -- so it is off by default, refuses any caller that is not on this machine, and
+      should never be enabled anywhere real.
+    </p>
+    <pre><code>WIDGET_DEV_PLAYGROUND=true python -m app.api.main</code></pre>
+  </div>
+
+  <!--ADMIN-->
+  <div class="card">
+    <h1>💬 Data chat gateway</h1>
+    <p>
+      Beyond this page the service has no user interface — it answers questions and serves the
+      embeddable widget. The chat your users see lives on <em>your</em> page, or on the
+      sample application.
+    </p>
+    <table>
+      <tr><th>Endpoint</th><th>Who calls it</th></tr>
+      <tr><td><code>GET /healthz</code></td><td>anything</td></tr>
+      <tr><td><code>GET /widget.js</code></td><td>the browser, via a script tag</td></tr>
+      <tr><td><code>POST /v1/session</code></td><td>your <strong>server</strong> — needs a host-app key</td></tr>
+      <tr><td><code>POST /v1/identity/lookup</code></td><td>your <strong>server</strong> — email → role</td></tr>
+      <tr><td><code>GET /v1/me</code></td><td>the browser — who this session is</td></tr>
+      <tr><td><code>POST /v1/ask</code></td><td>the browser, with a session token</td></tr>
+      <tr><td><code>POST /v1/ask/stream</code></td><td>the browser — Server-Sent Events</td></tr>
+      <tr><td><code>GET /v1/files/{id}</code></td><td>the browser — a generated report</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Embedding it</h2>
+    <p>One script tag, plus one endpoint on your backend that mints a session for whoever is
+      logged in there. The browser never holds the host-app key, which is why it cannot choose
+      its own data scope.</p>
+    <pre><code id="embed-snippet"></code></pre>
+    <p class="muted-note">
+      Full guide: <code>docs/web-plugin.md</code>. A working host application, with email
+      one-time-code sign-in: <code>examples/supabase-app</code> (<code>npm start --prefix
+      examples/supabase-app</code>, then open port 3000).
+    </p>
+  </div>
+  <!--/ADMIN-->
+</main>
+
+<script>
+  (function () {
+    // Injected by app/api/server.py::landing. Everything here is a *presentation* of what the
+    // server already decided -- the admin-only sections above were removed server-side, and the
+    // chat's scope comes from a token this page never sees.
+    var CONFIG = window.GATEWAY_CONFIG || { playground: false, roles: [], user: null };
+    var origin = window.location.origin;
+
+    var snippet = document.getElementById("embed-snippet");
+    if (snippet) {
+      snippet.textContent =
+        '<script src="' + origin + '/widget.js"\n' +
+        '        data-gateway="' + origin + '"\n' +
+        '        data-token-endpoint="/api/chat-token"><\/script>';
+    }
+
+    function show(id) {
+      document.getElementById(id).hidden = false;
+    }
+
+    /* -- signed in: greet, and load the widget under this identity -- */
+
+    if (CONFIG.user) {
+      var user = CONFIG.user;
+      // textContent everywhere, never innerHTML: a display name is data from the database, and
+      // this page renders it. Same rule the widget follows, for the same reason.
+      document.getElementById("hello").textContent =
+        "Hi " + (user.name || user.user_id || "there");
+      document.getElementById("role-chip").textContent = user.role;
+      document.getElementById("scope-note").textContent =
+        user.role === "admin"
+          ? "You are signed in as an operator, so answers are not narrowed to one account."
+          : "Answers are limited to what a " + user.role + " account may see.";
+      show("session-card");
+
+      document.getElementById("sign-out").addEventListener("click", function () {
+        fetch("/v1/dev/logout", { method: "POST", credentials: "include" }).then(function () {
+          // A reload, not a re-render: the widget holds its token in a closure, and the page's
+          // admin sections were decided server-side. Both are only honest after a round trip.
+          window.location.reload();
+        });
+      });
+
+      var script = document.createElement("script");
+      script.src = "/widget.js";
+      script.async = true;
+      script.dataset.gateway = origin;
+      script.dataset.tokenEndpoint = "/v1/dev/session";
+      script.dataset.title = "Ask your data";
+      script.dataset.open = "true";
+      document.body.appendChild(script);
+      return;
+    }
+
+    /* -- signed out -- */
+
+    if (!CONFIG.playground) {
+      show("playground-off");
+      return;
+    }
+
+    show("auth-card");
+    document.getElementById("playground-warning").textContent = CONFIG.warning || "";
+
+    var roles = CONFIG.roles || [];
+    var roleSelect = document.getElementById("signup-role");
+    roles.forEach(function (role) {
+      // Only roles the gateway would actually mint a session for. Offering one it refuses
+      // produces an account that cannot be used, which is worse than not offering it.
+      var option = document.createElement("option");
+      option.value = role;
+      option.textContent = role;
+      roleSelect.appendChild(option);
+    });
+
+    var vendorFields = document.getElementById("vendor-fields");
+    function syncVendorFields() {
+      vendorFields.hidden = roleSelect.value !== "vendor";
+    }
+    roleSelect.addEventListener("change", syncVendorFields);
+    syncVendorFields();
+
+    /* -- tabs -- */
+
+    var panels = {
+      signin: { tab: document.getElementById("tab-signin"), form: document.getElementById("signin-form") },
+      signup: { tab: document.getElementById("tab-signup"), form: document.getElementById("signup-form") },
+    };
+
+    function showPanel(name) {
+      Object.keys(panels).forEach(function (key) {
+        var active = key === name;
+        panels[key].tab.setAttribute("aria-selected", String(active));
+        panels[key].form.hidden = !active;
+      });
+      var first = panels[name].form.querySelector("input");
+      if (first) first.focus();
+    }
+
+    panels.signin.tab.addEventListener("click", function () { showPanel("signin"); });
+    panels.signup.tab.addEventListener("click", function () { showPanel("signup"); });
+    Array.prototype.forEach.call(document.querySelectorAll("[data-go]"), function (button) {
+      button.addEventListener("click", function () { showPanel(button.dataset.go); });
+    });
+
+    Array.prototype.forEach.call(document.querySelectorAll(".reveal"), function (button) {
+      button.addEventListener("click", function () {
+        var field = document.getElementById(button.dataset.for);
+        var hidden = field.type === "password";
+        field.type = hidden ? "text" : "password";
+        button.textContent = hidden ? "Hide" : "Show";
+        button.setAttribute("aria-label", (hidden ? "Hide" : "Show") + " password");
+      });
+    });
+
+    /* -- current location -- */
+
+    var position = { latitude: null, longitude: null };
+    var locateButton = document.getElementById("locate");
+    var locateNote = document.getElementById("locate-note");
+
+    locateButton.addEventListener("click", function () {
+      if (!navigator.geolocation) {
+        locateNote.textContent = "This browser can't share a location. The city above is enough.";
+        return;
+      }
+      locateButton.disabled = true;
+      locateNote.textContent = "Asking your browser...";
+      navigator.geolocation.getCurrentPosition(
+        function (result) {
+          position.latitude = result.coords.latitude;
+          position.longitude = result.coords.longitude;
+          locateButton.disabled = false;
+          // Rounded for display only -- the full precision is what gets sent. Six decimals is
+          // roughly a tenth of a metre, which is far past what a "vendors near me" query needs.
+          locateNote.textContent =
+            "Location set (" + position.latitude.toFixed(3) + ", " + position.longitude.toFixed(3) + ").";
+        },
+        function () {
+          locateButton.disabled = false;
+          // A refused prompt is a choice, not an error. The account is still perfectly usable.
+          locateNote.textContent = "No location shared. Everything else still works.";
+        },
+        { timeout: 10000 }
+      );
+    });
+
+    /* -- submitting -- */
+
+    function statusFor(form) {
+      return document.getElementById(form + "-status");
+    }
+
+    function post(url, body, form, button) {
+      var status = statusFor(form);
+      button.disabled = true;
+      status.textContent = "Just a moment...";
+      status.setAttribute("data-tone", "");
+
+      return fetch(url, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+        .then(function (response) {
+          return response.json().then(function (payload) {
+            // Whatever the server said is what the user sees. This page never invents a reason
+            // of its own -- for a sign-in the server deliberately gives one answer for every
+            // kind of failure, and second-guessing that here would undo it.
+            if (!response.ok) throw new Error(payload.text || "That didn't work. Try again.");
+            return payload;
+          });
+        })
+        .then(function () {
+          status.setAttribute("data-tone", "ok");
+          status.textContent = "Signed in. One moment...";
+          // A reload, not a re-render: which sections this page may show is decided server-side,
+          // and the widget reads its identity from a fresh token.
+          window.location.reload();
+        })
+        .catch(function (error) {
+          button.disabled = false;
+          status.setAttribute("data-tone", "error");
+          status.textContent = error.message;
+        });
+    }
+
+    panels.signin.form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      post(
+        "/v1/dev/login",
+        {
+          email: document.getElementById("email").value,
+          password: document.getElementById("password").value,
+        },
+        "signin",
+        document.getElementById("sign-in")
+      );
+    });
+
+    panels.signup.form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var password = document.getElementById("signup-password").value;
+      if (password !== document.getElementById("signup-confirm").value) {
+        // Checked here because only here can it be: the server is sent one password, and a
+        // mistyped confirmation is a typo to catch, not a request to refuse.
+        var status = statusFor("signup");
+        status.setAttribute("data-tone", "error");
+        status.textContent = "Those two passwords don't match.";
+        return;
+      }
+      post(
+        "/v1/dev/signup",
+        {
+          name: document.getElementById("signup-name").value,
+          email: document.getElementById("signup-email").value,
+          password: password,
+          role: roleSelect.value,
+          city: document.getElementById("signup-city").value,
+          latitude: position.latitude,
+          longitude: position.longitude,
+          business_name: document.getElementById("signup-business").value,
+          category: document.getElementById("signup-category").value,
+        },
+        "signup",
+        document.getElementById("sign-up")
+      );
+    });
+  })();
+</script>

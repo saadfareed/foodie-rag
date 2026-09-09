@@ -53,6 +53,16 @@ class DomainConfig(BaseModel):
     # be unhelpful. Conflating the two would mean either leaking secrets or losing the ability
     # to answer questions about payment internals.
     report_hidden_columns: list[str] | None = None
+    # Columns that are NOT in the collection and are attached to each row after the query, in
+    # code, by app/agents/enrichment.py -- the id-to-person join.
+    #
+    # Declared here because three places need to agree about them and none of them owns the
+    # others: the domain agent's prompt (so it neither queries them nor refuses a question for
+    # naming them), the report column order below, and enrichment itself. A question asking for
+    # "orders with customer details" used to be refused by *both* agents at once -- orders
+    # because user fields aren't in its schema, customers because order status isn't in theirs --
+    # which is the shape of a join nobody had told either half about.
+    enriched_columns: list[str] | None = None
 
 
 DOMAINS: dict[str, DomainConfig] = {
@@ -63,11 +73,16 @@ DOMAINS: dict[str, DomainConfig] = {
         # customer_id/vendor_id by app/agents/enrichment.py before the report is built.
         report_columns=[
             "customer_name",
+            "customer_city",
+            "customer_loyalty_tier",
             "order_id",
             "amount",
             "order_type",
             "status",
             "vendor_name",
+            "vendor_city",
+            "vendor_category",
+            "vendor_rating",
             "payment_method",
             "created_at",
         ],
@@ -75,6 +90,18 @@ DOMAINS: dict[str, DomainConfig] = {
         # already names in words; payby is its per-method amount breakdown. All three are
         # answerable but none belong in a column a person reads.
         report_hidden_columns=["onlinepaymentmethod", "isWallet", "payby"],
+        # Attached by app/agents/enrichment.py from customer_id/vendor_id. The names are always
+        # resolved; the rest arrive only when the question asks about the people, so an ordinary
+        # orders export doesn't grow five columns nobody asked for.
+        enriched_columns=[
+            "customer_name",
+            "customer_city",
+            "customer_loyalty_tier",
+            "vendor_name",
+            "vendor_city",
+            "vendor_category",
+            "vendor_rating",
+        ],
     ),
     "customers": DomainConfig(
         name="customers",
@@ -84,6 +111,10 @@ DOMAINS: dict[str, DomainConfig] = {
         geo_field="location",
         schema_fields=[*SHARED_USER_FIELDS, "loyalty_tier"],
         report_columns=["name", "user_id", "status", "city", "loyalty_tier", "last_active_at"],
+        # The field policy already replaces the value (app/security/field_policy.py matches
+        # `password`), so this is the *unhelpful* half of the pair: a column of [REDACTED] in a
+        # customer list is noise, not protection.
+        report_hidden_columns=["password_hash"],
     ),
     "vendors": DomainConfig(
         name="vendors",
@@ -100,6 +131,7 @@ DOMAINS: dict[str, DomainConfig] = {
             "status",
             "city",
         ],
+        report_hidden_columns=["password_hash"],
     ),
 }
 
@@ -117,6 +149,12 @@ def geo_allowed_fields() -> dict[str, set[str]]:
 
 def allowed_collections() -> list[str]:
     return sorted({domain.collection for domain in DOMAINS.values()})
+
+
+def enriched_columns_for(domain_name: str) -> list[str]:
+    """Columns attached after the query for this domain, for the prompt and the report to share."""
+    domain = DOMAINS.get(domain_name)
+    return list(domain.enriched_columns or []) if domain else []
 
 
 def report_columns_for(domain_name: str) -> list[str] | None:

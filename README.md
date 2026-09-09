@@ -1,6 +1,9 @@
-# Slack → MongoDB RAG Assistant
+# MongoDB RAG Assistant — Slack bot & embeddable web chat
 
-Ask questions in Slack, get answers computed from your MongoDB data via Google's Gemini (free tier).
+Ask questions in plain English, get answers computed from your MongoDB data via Google's Gemini
+(free tier). Two front ends on one pipeline: a **Slack bot** (Socket Mode) and an **embeddable
+web chat widget** you can drop into any web application with one script tag
+([docs/web-plugin.md](docs/web-plugin.md)).
 
 ## How it works
 
@@ -51,7 +54,17 @@ app/
     indexes.py               # idempotent index creation for the fields agents filter on
     introspect.py             # samples collections -> schema_summary.json
     executor.py                # runs a validated QuerySpec against MongoDB
+    identity.py                 # the one code path allowed to read users.email (sign-in only)
     seed.py, seed_users.py       # demo/sample data generators
+  security/
+    field_policy.py         # which FIELDS may leave the system, for anyone
+    roles.py                 # which ROWS may leave it, for this person (admin/vendor/customer)
+    output_scanner.py         # last-resort redaction, whole answers and streamed ones
+  state/                    # where every stateful guardrail keeps its state
+    backend.py               # the 7-primitive contract (atomic counters, atomic sliding window)
+    memory.py                 # in-process TTL + LRU (default; the original behaviour)
+    redis_backend.py           # shared across replicas (optional: pip install redis)
+    store.py                    # TTL store + key encoding, shared by every cache
   rag/
     query_spec.py           # QuerySpec / QueryError pydantic models
     validator.py             # safety checks on LLM-generated queries
@@ -63,6 +76,7 @@ app/
     conversation_context.py         # per-(channel,user) last resolved_question, for short follow-ups
     context_switch_cache.py         # per-(channel,user) "should I clear that context?" pending confirmation
     rate_limiter.py                 # per-(channel,user) sliding-window rate limit
+    stream.py                        # progress/token events for the streaming web adapter
   llm/
     gemini_client.py        # Gemini calls: retry/backoff/timeout/thinking-budget/quota
     circuit_breaker.py        # fails fast on a sustained Gemini outage instead of retrying forever
@@ -70,9 +84,17 @@ app/
   slack/
     handlers.py              # app_mention / DM / `/ask` handlers
     access_control.py          # channel/user allowlists
+  api/                       # web chat plugin: a second adapter onto the same pipeline
+    server.py                 # FastAPI gateway: /v1/session, /v1/ask{,/stream}, /v1/files, /widget.js
+    tokens.py                   # host-app keys + short-lived browser session tokens
+    files.py                     # bounded TTL store for a generated report between answer and download
+    static/widget.js              # the embeddable widget itself (no build step, no dependencies)
+    main.py                        # gateway entrypoint
   audit/
     logger.py                 # structured JSON audit logging (stdout + optional file)
   main.py                    # Slack Socket Mode entrypoint
+examples/
+  supabase-app/             # sample web application: Supabase auth + the widget embedded
 tests/                      # pytest suite, fully mocked (no live Slack/Mongo/Gemini calls)
 ```
 
@@ -226,6 +248,116 @@ one enforces, and the tradeoffs behind them.
    ```
 
    Socket Mode means no public URL or tunnel is needed for local development.
+
+## Web chat plugin
+
+The same assistant, embedded in any web application as a chat widget. `app/api/` is a second
+*adapter* onto the same pipeline the Slack handlers use — same agent graph, same validator, same
+field policy, same message catalogue — so both can run at once against one database.
+
+```bash
+python -m app.api.main          # the gateway (needs WIDGET_API_KEYS + WIDGET_JWT_SECRET)
+```
+
+To try it before wiring up a host application, turn on the development playground and sign in at
+`http://127.0.0.1:8000/` with the email and password of an account in your `users` collection:
+
+```bash
+python -m app.db.seed_users                       # demo accounts, and one admin
+WIDGET_DEV_PLAYGROUND=true python -m app.api.main
+```
+
+The sign-in screen has a sign-up tab, so you can also create an account from the browser (name,
+account type, city, optional current location). If your `users` collection already exists but has
+no `email`/`password_hash`, give every row credentials without touching anything else:
+
+```bash
+python -m app.db.backfill_credentials --apply     # <user_id>@example.test / test123
+```
+
+The seeder prints the addresses and the shared password (`test123`). The role comes from the account, never
+from anything typed into the page — and the page shows what that role may see: the endpoint
+reference and embedding guide are served only to an `admin`, which needs
+`WIDGET_ALLOWED_SESSION_ROLES=customer,vendor,admin`.
+
+```html
+<script src="https://your-gateway/widget.js"
+        data-gateway="https://your-gateway"
+        data-token-endpoint="/api/chat-token"></script>
+```
+
+`data-token-endpoint` is an endpoint on **your** backend that mints a chat session for whoever is
+logged in there — about thirty lines, and the only place the gateway key may appear. The browser
+never holds that key and so cannot choose its own data scope: the scope travels in a short-lived
+signed token and is forced onto every generated query in code.
+
+The answer **streams**: the widget shows which stage the question is on (reading, looking up your
+data, writing) and then the answer as it is written. Streamed text goes through the same PII
+redaction as the finished answer — incrementally, so a card number split across two chunks is
+still caught.
+
+- [docs/web-plugin.md](docs/web-plugin.md) — the security model, full env var reference, endpoint
+  contract (including the SSE events), widget options, and the production checklist.
+- [examples/supabase-app](examples/supabase-app) — a runnable sample web app using Supabase for
+  identity, with the widget embedded. It has a demo mode so you can try the whole flow before
+  creating a Supabase project.
+
+To run the gateway from the container image, override the entrypoint and publish the port:
+
+```bash
+docker run --rm --env-file .env -p 8000:8000 \
+  -e WIDGET_API_HOST=0.0.0.0 \
+  10xdev python -m app.api.main
+```
+
+## Roles and sign-in
+
+Answers are scoped to whoever is asking. Three roles, mapped from the `usertype` your data already
+carries (`1` customer, `2` vendor, `3` operator — an account that can sign in and that neither
+data domain can see):
+
+| | orders | customers | vendors |
+|---|---|---|---|
+| **admin** | all | all | all |
+| **vendor** | their own | the customers who ordered from them | their own record |
+| **customer** | their own | their own record | the directory |
+
+**The default is deny** — an unauthenticated request reads nothing. The filter is merged into the
+generated query in code, so there is no phrasing that gets around it.
+
+The gateway authenticates nobody in production: your application proves who someone is and asserts a role when
+it mints a chat session. For applications that have no login of their own,
+[examples/supabase-app](examples/supabase-app) ships a complete **email one-time-code** sign-in
+(~150 lines, no dependencies) that resolves an address to an id and role through the gateway's
+`/v1/identity/lookup`, and it runs with no email provider at all in console mode.
+
+Limits are per-role too — `RATE_LIMIT_BY_ROLE`, `USER_DAILY_QUESTION_LIMIT` (a slow drain that
+per-minute limits never notice), and `REPORT_MAX_ROWS_BY_ROLE`. And `REPORT_INCLUDE_CONTACTS`
+lets a **report** carry contact columns for rows the asker was already authorized to see — a
+vendor exporting their own customer list — while the model itself is still never shown those
+fields, so no question can produce a contact list.
+
+See [docs/authorization.md](docs/authorization.md) for the full policy, the sign-in sequence, the
+limits table, and what a one-time code has to get right.
+
+## Running more than one instance
+
+Every stateful guardrail — the answer cache, the conversation caches, the rate limiter, the daily
+Gemini budget, the circuit breaker, generated reports, `/login` sessions — keeps its state in
+`app/state/`. In-process by default; one variable moves it to Redis:
+
+```bash
+STATE_BACKEND=redis
+REDIS_URL=redis://localhost:6379/0
+```
+
+Do this **before** running a second replica, not after. With per-replica state a "10 per minute"
+rate limit across four replicas admits 40, the daily Gemini budget is spent four times over, and a
+report download only works on the replica that generated it — while every limit still reports
+itself as enforced. Startup logs a warning naming exactly what isn't shared.
+
+See [docs/scaling.md](docs/scaling.md) for what breaks, why the primitives are what they are, and
+the deployment checklist.
 
 ## Running in a container
 
@@ -416,11 +548,27 @@ Before opening a PR, confirm:
 
 ## Status
 
-Core pipeline, Slack handlers, and tests are implemented and verified end-to-end against live
-Gemini (`gemini-3-flash-preview`) and a seeded `orders` collection — count questions, calculations
-over the `payby` breakdown, and out-of-scope questions all produced correct/graceful answers.
+Both adapters, the role policy, one-time-code sign-in, streaming, and the shared-state layer are
+implemented and covered by 1046 tests (1059 with a Redis available). The core pipeline has been
+verified end to end against live Gemini (`gemini-3-flash-preview`) and a seeded `orders`
+collection — count questions, calculations over the `payby` breakdown, and out-of-scope questions
+all produced correct or gracefully-refused answers.
 
-Remaining before production use:
-- Point `MONGODB_ALLOWED_COLLECTIONS` at real collections (currently seeded demo data in
-  `orders`) and re-run `app.db.introspect` + review `schema_annotations.json` for your actual schema.
-- Run a real end-to-end test in a Slack channel (see task checklist, task #9).
+See [feature_list.md](feature_list.md) for what's shipped and what's next.
+
+Before production use:
+
+- Point `MONGODB_ALLOWED_COLLECTIONS` at real collections (the defaults are seeded demo data),
+  re-run `python -m app.db.introspect`, and review `schema_annotations.json` for your schema.
+- **Populate `users.email`** if you want one-time-code sign-in — `python -m app.db.seed_users`
+  creates them for demo data, and the field policy keeps them invisible to the model either way.
+  `users.password_hash` is only used by the development playground's own sign-in form; real host
+  applications authenticate their own users and never send a password here.
+- Set `WIDGET_ALLOWED_ORIGINS`, terminate TLS in front of the gateway, and work through the
+  checklist in [docs/web-plugin.md](docs/web-plugin.md#before-production).
+- Set `STATE_BACKEND=redis` before running more than one instance — see
+  [docs/scaling.md](docs/scaling.md).
+- Decide `SLACK_DEFAULT_ROLE`. It defaults to `admin`, which preserves the behaviour Slack users
+  have always had; set it to `anonymous` if the people in your allow-listed channels are not all
+  trusted as operators.
+- Run a real end-to-end test in a Slack channel and in a browser.

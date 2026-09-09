@@ -1,6 +1,17 @@
 from app.agents.classifier import Classification
 from app.agents.graph import build_graph
 from app.rag.query_spec import GeoNear, QueryError, QuerySpec
+from app.security.roles import ANONYMOUS, Principal, Role, admin
+
+
+def vendor(user_id: str):
+    """A signed-in vendor, as `/login` and a vendor session token produce."""
+    return Principal(role=Role.VENDOR, user_id=user_id)
+
+
+def customer(user_id: str):
+    """A signed-in customer."""
+    return Principal(role=Role.CUSTOMER, user_id=user_id)
 
 
 class _FakeCursor(list):
@@ -25,7 +36,19 @@ class _FakeDb(dict):
 
 
 def _base_state(question, **extra):
-    return {"question": question, "user_id": "U1", "channel_id": "C1", **extra}
+    """Graph state for a question, run as an operator unless a test says otherwise.
+
+    The principal is explicit because the graph refuses an ANONYMOUS one outright -- these tests
+    are about routing, fan-out and synthesis, and would otherwise all assert the same refusal.
+    The RBAC tests further down pass their own.
+    """
+    return {
+        "question": question,
+        "user_id": "U1",
+        "channel_id": "C1",
+        "principal": admin(),
+        **extra,
+    }
 
 
 def test_single_domain_question_returns_a_synthesized_answer(monkeypatch):
@@ -689,7 +712,7 @@ def test_an_authenticated_vendor_only_sees_their_own_orders(monkeypatch):
     )
 
     build_graph(_capture_spec_gemini(["orders"])).invoke(
-        _base_state("how many orders do i have?", authenticated_vendor_id="USR-42")
+        _base_state("how many orders do i have?", principal=vendor("USR-42"))
     )
 
     assert "USR-42" in str(captured["filter"]), captured["filter"]
@@ -718,14 +741,12 @@ def test_an_authenticated_vendor_only_sees_their_own_vendor_record(monkeypatch):
         def generate_answer(self, question, rows_by_domain, skipped_domains=None):
             return "answered"
 
-    build_graph(StubGemini()).invoke(
-        _base_state("what's my rating?", authenticated_vendor_id="USR-42")
-    )
+    build_graph(StubGemini()).invoke(_base_state("what's my rating?", principal=vendor("USR-42")))
 
     assert "USR-42" in str(captured["filter"]), captured["filter"]
 
 
-def test_an_unauthenticated_question_is_not_vendor_scoped(monkeypatch):
+def test_an_admin_question_is_not_scoped_to_anyone(monkeypatch):
     captured = {}
 
     class _CapturingCollection(_FakeCollection):
@@ -741,6 +762,205 @@ def test_an_unauthenticated_question_is_not_vendor_scoped(monkeypatch):
     build_graph(_capture_spec_gemini(["orders"])).invoke(_base_state("how many orders?"))
 
     assert "vendor_id" not in str(captured["filter"])
+    assert "customer_id" not in str(captured["filter"])
+
+
+# --- role-based access: every one of these fails silently if it regresses ------------------------
+#
+# Nothing raises when a forced filter goes missing. The query runs, the answer is fluent, and it
+# is built from rows the asker was never entitled to see -- which is why each of these asserts the
+# *effect* on the query that reached the database, not that some function was called.
+
+
+def _flat(filter_):
+    """Flatten the `$and` that merge_forced_filter builds.
+
+    A forced filter is combined with the domain's own `usertype` clause rather than merged into
+    one dict -- two clauses on the same field must both hold, and flattening them at write time
+    would let one silently overwrite the other. Tests assert on the flattened view.
+    """
+    flat = {}
+    for clause in filter_.get("$and", [filter_]):
+        flat.update(clause)
+    return flat
+
+
+def _capture_orders(monkeypatch, rows=None):
+    captured = {}
+
+    class _CapturingCollection(_FakeCollection):
+        def find(self, filter_=None, *args, **kwargs):
+            captured["filter"] = filter_
+            return _FakeCursor(self._rows)
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(orders=_CapturingCollection(rows or [{"order_id": "ORD-1"}])),
+    )
+    return captured
+
+
+def _capture_users(monkeypatch, rows=None, orders=None):
+    captured = {}
+
+    class _CapturingUsers(_FakeCollection):
+        def find(self, filter_=None, *args, **kwargs):
+            captured["filter"] = filter_
+            return _FakeCursor(self._rows)
+
+    class _OrdersWithCustomers(_FakeCollection):
+        def aggregate(self, pipeline, **kwargs):
+            captured["orders_pipeline"] = pipeline
+            return iter(orders or [])
+
+    monkeypatch.setattr(
+        "app.agents.graph.get_db",
+        lambda: _FakeDb(
+            users=_CapturingUsers(rows or [{"user_id": "USR-C1"}]),
+            orders=_OrdersWithCustomers([]),
+        ),
+    )
+    return captured
+
+
+def _users_gemini(domain):
+    class StubGemini:
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=[domain], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            return QuerySpec(collection="users", operation="find")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            return "answered"
+
+    return StubGemini()
+
+
+def test_a_customer_only_sees_their_own_orders(monkeypatch):
+    captured = _capture_orders(monkeypatch)
+
+    build_graph(_capture_spec_gemini(["orders"])).invoke(
+        _base_state("how many orders do i have?", principal=customer("USR-C9"))
+    )
+
+    assert _flat(captured["filter"]).get("customer_id") == "USR-C9"
+
+
+def test_a_customer_cannot_list_other_customers(monkeypatch):
+    """The customers domain has no natural restriction of its own -- before roles there was no
+    filter on it at all, so any authenticated caller could enumerate every customer."""
+    captured = _capture_users(monkeypatch)
+
+    build_graph(_users_gemini("customers")).invoke(
+        _base_state("show me all customers", principal=customer("USR-C9"))
+    )
+
+    assert _flat(captured["filter"]).get("user_id") == "USR-C9"
+
+
+def test_a_vendor_sees_only_the_customers_who_ordered_from_them(monkeypatch):
+    """Resolved from their own orders in code, before the fan-out -- never by asking the model to
+    remember to filter."""
+    captured = _capture_users(monkeypatch, orders=[{"_id": "USR-C1"}, {"_id": "USR-C2"}])
+
+    build_graph(_users_gemini("customers")).invoke(
+        _base_state("who are my customers?", principal=vendor("USR-V1"))
+    )
+
+    assert _flat(captured["filter"]).get("user_id") == {"$in": ["USR-C1", "USR-C2"]}
+    # And the lookup that produced it was scoped to this vendor's own orders.
+    assert captured["orders_pipeline"][0] == {"$match": {"vendor_id": "USR-V1"}}
+
+
+def test_a_vendor_with_no_customers_matches_nothing_rather_than_everything(monkeypatch):
+    """The failure direction that matters. An empty resolved set must stay an empty result, not
+    collapse into an unfiltered query over every customer in the database."""
+    captured = _capture_users(monkeypatch, orders=[])
+
+    build_graph(_users_gemini("customers")).invoke(
+        _base_state("who are my customers?", principal=vendor("USR-V1"))
+    )
+
+    assert _flat(captured["filter"]).get("user_id") == {"$in": []}
+
+
+def test_too_many_customers_refuses_instead_of_truncating(monkeypatch):
+    """A truncated scope would answer "your customers in Karachi" from an arbitrary subset while
+    looking complete -- worse than refusing, because nothing about it looks wrong."""
+    monkeypatch.setattr("app.config.settings.rbac_max_authorized_ids", 2)
+    captured = _capture_users(monkeypatch, orders=[{"_id": f"USR-C{i}"} for i in range(3)])
+
+    answer = build_graph(_users_gemini("customers")).invoke(
+        _base_state("who are my customers?", principal=vendor("USR-V1"))
+    )["answer"]
+
+    assert "narrow" in answer.lower() or "date range" in answer.lower()
+    assert "filter" not in captured, "a refused domain was queried anyway"
+
+
+def test_an_anonymous_question_is_refused_without_touching_gemini_or_mongo(monkeypatch):
+    """Refused at routing, before a query is generated: a question this principal may not have
+    answered should cost nothing at all."""
+
+    def _explode():
+        raise AssertionError("an anonymous question reached the database")
+
+    monkeypatch.setattr("app.agents.graph.get_db", _explode)
+
+    class StubGemini:
+        def __init__(self):
+            self.generate_calls = 0
+
+        def generate_structured(self, prompt, schema):
+            return Classification(domains=["orders"], needs_geo=False, confidence=0.9)
+
+        def generate_structured_or_error(self, prompt, schema):
+            self.generate_calls += 1
+            raise AssertionError("an anonymous question generated a query")
+
+        def generate_answer(self, question, rows_by_domain, skipped_domains=None):
+            raise AssertionError("an anonymous question was synthesized")
+
+    gemini = StubGemini()
+    result = build_graph(gemini).invoke(_base_state("how many orders?", principal=ANONYMOUS))
+
+    assert result["not_authorized"] is True
+    assert "signed-in" in result["answer"]
+    assert gemini.generate_calls == 0
+
+
+def test_a_partly_refused_question_still_answers_the_authorized_half(monkeypatch):
+    """A two-domain question where one domain is off-limits should answer the other and say so,
+    rather than refusing wholesale or silently answering half."""
+
+    monkeypatch.setattr("app.agents.graph.may_query", lambda principal, domain: domain != "vendors")
+    captured = _capture_orders(monkeypatch)
+
+    result = build_graph(_capture_spec_gemini(["orders", "vendors"])).invoke(
+        _base_state("my orders and nearby vendors", principal=customer("USR-C9"))
+    )
+
+    assert "orders" in result["rows_by_domain"]
+    assert "vendors" in result["out_of_scope_by_domain"]
+    assert _flat(captured["filter"]).get("customer_id") == "USR-C9"
+
+
+def test_an_authorization_filter_is_not_widened_by_a_geo_anchor(monkeypatch):
+    """A vendor asking "which of my customers are nearby?" must be limited to their own orders
+    *and* the anchor. Letting the anchor overwrite the authorization filter would answer a
+    different, much broader question."""
+    captured = _capture_orders(monkeypatch)
+
+    build_graph(_capture_spec_gemini(["orders"])).invoke(
+        _base_state(
+            "my orders near those vendors",
+            principal=vendor("USR-V1"),
+            resolved_vendor_ids=["USR-V2", "USR-V3"],
+        )
+    )
+
+    assert _flat(captured["filter"]).get("vendor_id") == "USR-V1"
 
 
 def test_multiple_out_of_scope_domains_are_all_named(monkeypatch):

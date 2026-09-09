@@ -37,6 +37,40 @@ jobs:
           MONGODB_URI: mongodb://localhost:27017
           MONGODB_DB_NAME: ci_test_db
 
+  redis-integration:
+    name: Shared state (real Redis)
+    runs-on: ubuntu-latest
+    # tests/test_redis_integration.py skips itself unless REDIS_TEST_URL is set, so the main Tests
+    # job stays hermetic. This job is where the two Lua scripts in app/state/redis_backend.py --
+    # the atomic counter and the sliding window -- are actually executed. A fake client can prove
+    # they were called with the right arguments and nothing more, and those scripts are exactly
+    # where the cross-replica guarantees live.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -r requirements-dev.txt redis
+      - run: pytest tests/test_redis_integration.py -v
+        env:
+          REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          # Same placeholders as the Tests job: app/config.py _require()s these at import time.
+          SLACK_BOT_TOKEN: ci-placeholder-not-a-real-token
+          SLACK_APP_TOKEN: ci-placeholder-not-a-real-token
+          SLACK_SIGNING_SECRET: ci-placeholder-not-a-real-secret
+          GEMINI_API_KEY: ci-placeholder-not-a-real-key
+          MONGODB_URI: mongodb://localhost:27017
+          MONGODB_DB_NAME: ci_test_db
+
   lint:
     name: Lint & format
     runs-on: ubuntu-latest

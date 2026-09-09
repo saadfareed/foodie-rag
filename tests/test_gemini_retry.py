@@ -199,7 +199,7 @@ def test_call_with_retry_records_a_single_failure_per_call_not_per_internal_atte
     with pytest.raises(errors.ClientError):
         client._call_with_retry(always_503)
 
-    assert breaker._consecutive_failures == 1
+    assert breaker.failure_count() == 1
 
 
 def test_call_with_retry_raises_circuit_breaker_open_without_calling_fn(monkeypatch):
@@ -228,4 +228,132 @@ def test_call_with_retry_records_success_and_clears_prior_failures(monkeypatch):
     client = _make_client(max_retries=0, retry_base_delay_seconds=0)
 
     assert client._call_with_retry(lambda: "ok") == "ok"
-    assert breaker._consecutive_failures == 0
+    assert breaker.failure_count() == 0
+
+
+# --- slow failures ------------------------------------------------------------------------------
+#
+# Every test above makes its failures instantaneous, which is what let a real bug through: the
+# retry budget is measured from the start of the *first attempt*, so it is spent by the attempt
+# itself, and the failures most worth retrying (a 504, our own timeout) are exactly the slow ones.
+# With a 15s request timeout and an 8s budget, a production 504 arriving at 12.1s was refused a
+# retry it was classified as deserving. These tests give the failure a duration.
+
+
+class _Clock:
+    """A monotonic clock the test drives. `attempt_seconds` is how long each failure takes --
+    in production that is bounded by GEMINI_REQUEST_TIMEOUT_MS."""
+
+    def __init__(self, attempt_seconds: float = 8.0):
+        self.t = 1000.0
+        self.attempt_seconds = attempt_seconds
+        self.slept = []
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.t += seconds
+
+    def spend_an_attempt(self) -> None:
+        self.t += self.attempt_seconds
+
+
+def _with_clock(monkeypatch, clock: _Clock) -> None:
+    monkeypatch.setattr("app.llm.gemini_client.time.monotonic", clock.now)
+    monkeypatch.setattr("app.llm.gemini_client.time.sleep", clock.sleep)
+    monkeypatch.setattr("app.llm.gemini_client.random.uniform", lambda _a, _b: 0)
+
+
+def test_a_slow_failure_is_still_retried(monkeypatch):
+    """The regression. An 8s failure inside a 16s budget leaves room for a second attempt; the
+    shipped defaults are chosen so this holds."""
+    clock = _Clock(attempt_seconds=8.0)
+    _with_clock(monkeypatch, clock)
+    client = _make_client(max_retries=3, retry_base_delay_seconds=1, max_retry_seconds=16)
+
+    calls = {"count": 0}
+
+    def slow_504():
+        calls["count"] += 1
+        clock.spend_an_attempt()
+        if calls["count"] < 2:
+            raise _client_error(504)
+        return "recovered"
+
+    assert client._call_with_retry(slow_504) == "recovered"
+    assert calls["count"] == 2
+
+
+def test_a_budget_below_the_attempt_timeout_retries_nothing(monkeypatch):
+    """The bug, pinned as behaviour so the two settings can't drift back into disagreeing
+    silently. settings.retry_budget_warning() is what says this out loud at startup."""
+    clock = _Clock(attempt_seconds=12.1)  # the 504 in the production audit log
+    _with_clock(monkeypatch, clock)
+    client = _make_client(max_retries=3, retry_base_delay_seconds=1, max_retry_seconds=8)
+
+    calls = {"count": 0}
+
+    def slow_504():
+        calls["count"] += 1
+        clock.spend_an_attempt()
+        raise _client_error(504)
+
+    with pytest.raises(errors.APIError):
+        client._call_with_retry(slow_504)
+
+    assert calls["count"] == 1, "the first attempt spends the whole budget before a retry is due"
+
+
+def test_a_slow_client_side_timeout_is_retried_too(monkeypatch):
+    """_is_retryable was extended to cover httpx timeouts precisely so this happens. It never did
+    with the shipped settings, because a timeout takes the full request timeout to raise."""
+    clock = _Clock(attempt_seconds=8.0)
+    _with_clock(monkeypatch, clock)
+    client = _make_client(max_retries=3, retry_base_delay_seconds=1, max_retry_seconds=16)
+
+    calls = {"count": 0}
+
+    def slow_timeout():
+        calls["count"] += 1
+        clock.spend_an_attempt()
+        if calls["count"] < 2:
+            raise httpx.ReadTimeout("The read operation timed out")
+        return "recovered"
+
+    assert client._call_with_retry(slow_timeout) == "recovered"
+    assert calls["count"] == 2
+
+
+def test_the_retry_budget_is_shared_across_fallback_models(monkeypatch):
+    """One budget for the whole sweep, so *retrying* isn't multiplied by the number of models
+    configured -- but a model that never gets one attempt is not a fallback, so past the deadline
+    each still gets exactly one. The honest worst case is therefore the budget plus one attempt
+    per fallback, which is why GEMINI_FALLBACK_MODELS is a list an operator sizes deliberately."""
+    clock = _Clock(attempt_seconds=8.0)
+    _with_clock(monkeypatch, clock)
+    client = _make_client(max_retries=3, retry_base_delay_seconds=1, max_retry_seconds=16)
+    client.model_name = "primary"
+    client.fallback_models = ["second", "third"]
+    client._breakers = {}
+
+    attempts = []
+
+    def attempt(model):
+        attempts.append(model)
+        clock.spend_an_attempt()
+        raise _client_error(504)
+
+    with pytest.raises(errors.APIError):
+        client._for_each_model(attempt)
+
+    # primary retries once inside the budget; by then it is spent, so the other two get one each.
+    assert attempts == ["primary", "primary", "second", "third"]
+    # The budget bounds when the last attempt may *start*; every attempt still runs for as long
+    # as the request timeout allows. So the sweep's true bound is the budget plus one attempt for
+    # each model that can still be entered -- worth stating as arithmetic, because reading the
+    # ceiling as "the most this can take" is the exact mistake that produced the original bug.
+    budget, attempt_seconds, models = 16, 8, 3
+    assert clock.t - 1000.0 <= budget + attempt_seconds * models
+    assert clock.slept == [1], "one backoff for the whole sweep, not one per model"

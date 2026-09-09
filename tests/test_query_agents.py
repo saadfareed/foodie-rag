@@ -56,3 +56,38 @@ def test_non_geo_domain_prompt_omits_geo_rule():
     gemini = _StubGemini(QuerySpec(collection="orders", operation="find"))
     generate_domain_query_spec(gemini, DOMAINS["orders"], "pending orders")
     assert "geo_near" not in gemini.prompts[0]
+
+
+def test_the_orders_prompt_names_the_columns_attached_after_the_query():
+    """The orders agent used to refuse "orders with customer details", correctly by its own
+    lights: user fields aren't in the orders schema. It refuses no longer because the prompt now
+    says those columns arrive afterwards -- and the list comes from the domain, so the prompt and
+    the report cannot disagree about what exists."""
+    gemini = _StubGemini(QuerySpec(collection="orders", operation="find"))
+
+    generate_domain_query_spec(gemini, DOMAINS["orders"], "incomplete orders with customer details")
+
+    prompt = gemini.prompts[0]
+    for column in DOMAINS["orders"].enriched_columns:
+        assert column in prompt
+    assert "do NOT refuse" in prompt
+
+
+def test_the_prompt_tells_the_agent_not_to_query_the_attached_columns():
+    """They don't exist in the collection, so a filter on one returns nothing -- silently, which
+    is the worst way for it to be wrong."""
+    gemini = _StubGemini(QuerySpec(collection="orders", operation="find"))
+
+    generate_domain_query_spec(gemini, DOMAINS["orders"], "orders with customer details")
+
+    assert "do NOT try to filter, project or group by them" in gemini.prompts[0]
+
+
+def test_a_domain_with_nothing_attached_gets_no_such_rule():
+    """`customers` and `vendors` read the collection those columns come *from*; telling them
+    about an enrichment they don't receive would be noise in the most quota-sensitive prompt."""
+    gemini = _StubGemini(QuerySpec(collection="users", operation="find"))
+
+    generate_domain_query_spec(gemini, DOMAINS["customers"], "active customers")
+
+    assert "attached to every row automatically" not in gemini.prompts[0]

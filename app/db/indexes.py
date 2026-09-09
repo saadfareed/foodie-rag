@@ -49,3 +49,14 @@ def ensure_indexes(db: Database) -> None:
     # A 2dsphere key must lead its compound index, so the usertype filter cannot be folded in
     # ahead of it -- Mongo applies the geo index first and filters the (already small) result.
     users.create_index([("location", "2dsphere")])
+    # Sign-in looks a user up by exact email (app/db/identity.py). Sparse because only accounts
+    # that can sign in carry the field, and unique because two accounts sharing an address would
+    # make "which identity did this person prove?" ambiguous -- the one question authentication
+    # exists to answer. Partial rather than plain-sparse-unique so that many documents without an
+    # email don't collide on null.
+    users.create_index(
+        "email",
+        unique=True,
+        partialFilterExpression={"email": {"$type": "string"}},
+        name="email_unique_when_present",
+    )

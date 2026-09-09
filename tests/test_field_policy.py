@@ -35,6 +35,9 @@ def test_business_identifiers_are_not_internal(field):
         "credit_card",
         "cvv",
         "password",
+        # The stored sign-in credential (app/security/passwords.py). A PBKDF2 digest is not
+        # directly usable, and it is still the thing an offline cracking run starts from.
+        "password_hash",
         "api_key",
         "secret_key",
         "ssn",

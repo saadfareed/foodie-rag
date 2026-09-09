@@ -1,8 +1,11 @@
-"""Insert sample users covering both usertypes (1=customer, 2=vendor).
+"""Insert sample users covering every usertype (1=customer, 2=vendor, 3=operator/admin).
 
 usertype discriminator:
     1 -> customer
     2 -> vendor
+    3 -> operator (admin). One account, so somebody can sign in to the playground as an admin.
+         It is deliberately not a data domain: `app/agents/domains.py` scopes `customers` to
+         usertype 1 and `vendors` to usertype 2, so this row is invisible to every question.
 
 Both usertypes share the same collection and location schema (GeoJSON Point,
 so $near/$geoWithin work identically for "nearby customers" and "nearby
@@ -11,8 +14,17 @@ customer-only fields (loyalty_tier) are simply absent on the other usertype's
 documents rather than null, matching how the demo `orders` data models
 optional fields.
 
+Each user also gets an `email`, a `phone` and a `password_hash`, which exist only so a person can
+prove who they are (app/db/identity.py). The first two are dropped from every query result by the
+field policy and the third is redacted, so the bot cannot be asked for any of them -- see
+app/security/field_policy.py.
+
+Every seeded account shares one password (`--password`, default `test123`) because these are
+throwaway demo rows on a reserved TLD. Each one is hashed separately, with its own salt, so the
+stored shape is the real thing rather than a shortcut that would teach the wrong lesson.
+
 Usage:
-    python -m app.db.seed_users [--customers 30 --vendors 20]
+    python -m app.db.seed_users [--customers 30 --vendors 20] [--password test123]
 """
 
 import argparse
@@ -21,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.db.indexes import ensure_indexes
 from app.db.mongo import get_db
+from app.security.passwords import hash_password
 
 # (city label, center lng, center lat) -- users are scattered within ~0.15 degrees
 # (roughly 15km) of these centers so "nearby X" geo queries have realistic clusters.
@@ -29,6 +42,14 @@ CITIES = [
     ("Lahore", 74.3587, 31.5204),
     ("Islamabad", 73.0479, 33.6844),
 ]
+
+#: The password every seeded account signs in with. Demo data on a reserved TLD, printed by the
+#: seeder so it is discoverable rather than guessed -- and useless anywhere real, because these
+#: rows are.
+DEFAULT_SEED_PASSWORD = "test123"  # nosec B105 - demo credential for throwaway seed rows
+#: The one operator account, at a memorable address: an admin id nobody can guess is an admin
+#: nobody can sign in as.
+ADMIN_EMAIL = "admin@example.test"
 
 VENDOR_CATEGORIES = ["restaurant", "grocery", "pharmacy", "electronics", "clothing"]
 LOYALTY_TIERS = ["bronze", "silver", "gold"]
@@ -122,7 +143,10 @@ def _scatter(rng: random.Random, center_lng: float, center_lat: float) -> dict:
 
 
 def generate_sample_users(
-    customers: int = 30, vendors: int = 20, seed: int | None = 42
+    customers: int = 30,
+    vendors: int = 20,
+    seed: int | None = 42,
+    password: str = DEFAULT_SEED_PASSWORD,
 ) -> list[dict]:
     rng = random.Random(seed)  # nosec B311 - non-cryptographic demo data, seeded for reproducibility
     now = datetime.now(timezone.utc)
@@ -140,9 +164,22 @@ def generate_sample_users(
             # within the last few days, producing last_active_at < created_at.
             span_seconds = (now - created_at).total_seconds()
             last_active_at = created_at + timedelta(seconds=rng.uniform(0, span_seconds))
+        user_id = f"USR-{seq:05d}"
         doc = {
-            "user_id": f"USR-{seq:05d}",
+            "user_id": user_id,
             "name": f"{rng.choice(FIRST_NAMES)} {rng.choice(LAST_NAMES)}",
+            # Sign-in address. Derived from the id rather than the name so it is predictable
+            # enough to actually log in with while demoing (USR-00031 -> usr-00031@example.test),
+            # and on a reserved TLD so nothing here can ever reach a real inbox.
+            #
+            # The field policy drops `email`/`phone` from every row before anything downstream
+            # sees them (app/security/field_policy.py), so seeding them does not make them
+            # answerable -- app/db/identity.py is the one code path allowed to read them.
+            "email": f"{user_id.lower()}@example.test",
+            "phone": f"+92300{seq:07d}",
+            # Hashed per user rather than once and copied, so each row carries its own salt --
+            # the shape a real deployment has. app/security/passwords.py owns the format.
+            "password_hash": hash_password(password),
             "usertype": usertype,
             "status": rng.choice(STATUSES),
             "city": city,
@@ -170,14 +207,27 @@ def generate_sample_users(
         doc["rating"] = round(rng.uniform(3.0, 5.0), 1)
         users.append(doc)
 
+    # One operator. `status` is forced active rather than drawn from STATUSES: a suspended admin
+    # cannot sign in, and a demo whose admin account randomly doesn't work is a bug report.
+    admin = base_doc(3)
+    admin["name"] = "Operator"
+    admin["email"] = ADMIN_EMAIL
+    admin["status"] = "active"
+    users.append(admin)
+
     return users
 
 
-def seed_users(customers: int = 30, vendors: int = 20, clear_existing: bool = True) -> int:
+def seed_users(
+    customers: int = 30,
+    vendors: int = 20,
+    clear_existing: bool = True,
+    password: str = DEFAULT_SEED_PASSWORD,
+) -> int:
     db = get_db()
     if clear_existing:
         db["users"].delete_many({})
-    users = generate_sample_users(customers, vendors)
+    users = generate_sample_users(customers, vendors, password=password)
     result = db["users"].insert_many(users)
     # Covers the 2dsphere geo index plus user_id/usertype -- see app/db/indexes.py.
     ensure_indexes(db)
@@ -189,7 +239,19 @@ if __name__ == "__main__":
     parser.add_argument("--customers", type=int, default=30)
     parser.add_argument("--vendors", type=int, default=20)
     parser.add_argument("--keep-existing", action="store_true")
+    parser.add_argument("--password", default=DEFAULT_SEED_PASSWORD)
     args = parser.parse_args()
 
-    inserted = seed_users(args.customers, args.vendors, clear_existing=not args.keep_existing)
+    inserted = seed_users(
+        args.customers,
+        args.vendors,
+        clear_existing=not args.keep_existing,
+        password=args.password,
+    )
     print(f"Inserted {inserted} sample users into 'users' (indexes ensured).")
+    # Printed, not documented elsewhere: the addresses are derived from generated ids, so without
+    # this the only way to find one to sign in with is to query the database by hand.
+    print(f"Every account signs in with the password: {args.password}")
+    print(f"  customer  usr-00001@example.test  (through usr-{args.customers:05d}@example.test)")
+    print(f"  vendor    usr-{args.customers + 1:05d}@example.test")
+    print(f"  admin     {ADMIN_EMAIL}")

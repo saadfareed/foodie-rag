@@ -18,7 +18,9 @@ def test_entry_expires_after_ttl(monkeypatch):
     cache = AnswerCache(ttl_seconds=10, max_entries=10)
     cache.set(("C1", "hi"), CachedResult(answer="hello"))
     future = time.monotonic() + 11  # captured before patching to avoid self-referential recursion
-    monkeypatch.setattr("app.rag.answer_cache.time.monotonic", lambda: future)
+    # The TTL clock lives in the state backend now, not in the cache module -- that is the
+    # one place expiry is decided for every guardrail (see app/state/memory.py).
+    monkeypatch.setattr("app.state.memory.time.monotonic", lambda: future)
     assert cache.get(("C1", "hi")) is None
 
 
@@ -43,13 +45,13 @@ def test_make_key_normalizes_question_and_defaults_channel():
     assert AnswerCache.make_key(None, "hi") == ("", "", "text", "hi")
 
 
-def test_make_key_separates_vendor_scopes():
+def test_make_key_separates_principal_scopes():
     """A vendor-authenticated answer contains only that vendor's rows. Sharing a cache entry
     across identities would replay one vendor's data to another -- a cross-tenant leak, not a
     stale-answer annoyance."""
     shared_question = "how many orders do i have?"
-    vendor_a = AnswerCache.make_key("C1", shared_question, vendor_scope="USR-1")
-    vendor_b = AnswerCache.make_key("C1", shared_question, vendor_scope="USR-2")
+    vendor_a = AnswerCache.make_key("C1", shared_question, principal_scope="vendor:USR-1")
+    vendor_b = AnswerCache.make_key("C1", shared_question, principal_scope="vendor:USR-2")
     anonymous = AnswerCache.make_key("C1", shared_question)
 
     assert vendor_a != vendor_b != anonymous
